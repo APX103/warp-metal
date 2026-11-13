@@ -43,6 +43,51 @@ const char *wmm_device_name(void) {
 
 // ---- buffers (storageModeShared: one allocation, CPU+GPU same memory) ----
 
+// Metal residency for address-referenced buffers: a buffer that never appears
+// in an encoder's binding list but is dereferenced through a raw device
+// address (the host-built mesh table today; BVH nodes from M2.1) is owed no
+// residency by the driver, and reads through a non-resident address silently
+// return zeros on Apple Silicon. Keep every allocation in one residency set
+// and mark it used on every command buffer ([cb useResidencySet:], macOS
+// 15+; older systems have no residency API — their shared-buffer contract
+// predates driver paging, so address indirection is safe there).
+static id<MTLResidencySet> _residency = nil;
+
+static void _residency_ensure(id<MTLDevice> dev) {
+    if (_residency != nil) return;
+    if (![dev respondsToSelector:@selector(newResidencySetWithDescriptor:error:)]) return;
+    MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+    desc.label = @"warp-metal allocations";
+    NSError *err = nil;
+    id<MTLResidencySet> rs = [dev newResidencySetWithDescriptor:desc error:&err];
+    if (!rs) {
+        _set_error([NSString stringWithFormat:@"residency set creation failed: %@",
+                    err.localizedDescription ?: @"unknown error"]);
+        return;
+    }
+    _residency = rs;
+}
+
+static void _residency_add(id<MTLDevice> dev, void *alloc_handle) {
+    _residency_ensure(dev);
+    if (_residency == nil) return;
+    [_residency addAllocation:(__bridge id<MTLAllocation>)alloc_handle];
+    [_residency commit];
+}
+
+static void _residency_remove(void *alloc_handle) {
+    if (_residency == nil) return;
+    [_residency removeAllocation:(__bridge id<MTLAllocation>)alloc_handle];
+    [_residency commit];
+}
+
+// mark the set used on a command buffer (no-op pre-macOS 15)
+static void _residency_use(id<MTLCommandBuffer> cb) {
+    if (_residency != nil && [cb respondsToSelector:@selector(useResidencySet:)]) {
+        [cb useResidencySet:_residency];
+    }
+}
+
 void *wmm_buffer_create(uint64_t bytes) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) {
@@ -56,6 +101,7 @@ void *wmm_buffer_create(uint64_t bytes) {
         _set_error(@"buffer allocation failed");
         return NULL;
     }
+    _residency_add(dev, (__bridge void *)buf);
     return (__bridge_retained void *)buf;
 }
 
@@ -79,6 +125,7 @@ uint64_t wmm_buffer_length(void *handle) {
 
 void wmm_buffer_release(void *handle) {
     if (!handle) return;
+    _residency_remove(handle);
     id<MTLBuffer> buf = (__bridge_transfer id<MTLBuffer>)handle;
     (void)buf;  // release
 }
@@ -175,6 +222,7 @@ int wmm_dispatch(void *pso_handle, void **buffer_handles, uint32_t n_buffers,
 
     id<MTLCommandQueue> queue = [dev newCommandQueue];
     id<MTLCommandBuffer> cb = [queue commandBuffer];
+    _residency_use(cb);
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:pso];
 
@@ -188,6 +236,46 @@ int wmm_dispatch(void *pso_handle, void **buffer_handles, uint32_t n_buffers,
     if (tg > threads_x) tg = threads_x;
     MTLSize grid = MTLSizeMake(threads_x, 1, 1);
     MTLSize tgs = MTLSizeMake(tg, 1, 1);
+    [enc dispatchThreads:grid threadsPerThreadgroup:tgs];
+    [enc endEncoding];
+
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted || cb.error) {
+        _set_error(cb.error.localizedDescription ?: @"command buffer failed");
+        return -2;
+    }
+    return 0;
+}
+
+// tiled launch (wp.launch_tiled): the caller fixes the threadgroup size so
+// the kernel's block/lane tid mapping and threadgroup reductions are exact
+int wmm_dispatch_tiled(void *pso_handle, void **buffer_handles, uint32_t n_buffers,
+                       uint32_t threads_x, uint32_t tg_x) {
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pso_handle;
+    if (!dev || !pso) {
+        _set_error(@"dispatch_tiled: missing device or pso");
+        return -1;
+    }
+    if (tg_x == 0 || tg_x > pso.maxTotalThreadsPerThreadgroup) {
+        _set_error(@"dispatch_tiled: block_dim exceeds the PSO threadgroup limit");
+        return -3;
+    }
+
+    id<MTLCommandQueue> queue = [dev newCommandQueue];
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    _residency_use(cb);
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+
+    for (uint32_t i = 0; i < n_buffers; i++) {
+        id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer_handles[i];
+        [enc setBuffer:buf offset:0 atIndex:i];
+    }
+
+    MTLSize grid = MTLSizeMake(threads_x, 1, 1);
+    MTLSize tgs = MTLSizeMake(tg_x, 1, 1);
     [enc dispatchThreads:grid threadsPerThreadgroup:tgs];
     [enc endEncoding];
 

@@ -70,12 +70,13 @@ class Device:
     """A compute device.
 
     Mirrors the upstream ``warp.Device`` attributes Newton's device-string
-    threading reads: ``name``, ``ordinal``, ``is_cpu``, ``is_cuda``,
-    ``is_metal``, ``arch``, ``context``.
+    threading reads: ``name``, ``alias``, ``ordinal``, ``is_cpu``,
+    ``is_cuda``, ``is_metal``, ``arch``, ``context``.
     """
 
     def __init__(self, name: str, ordinal: int = 0, arch: int = 0):
         self.name = name
+        self.alias = name  # upstream warp.Device.alias (Newton cache keys read it)
         self.ordinal = ordinal
         self.is_cpu = name == "cpu"
         self.is_cuda = False  # warp-metal strips CUDA entirely (KEP-0001)
@@ -174,9 +175,46 @@ def get_preferred_device() -> Device:
         return _CPU_DEVICE
 
 
+def activate_preferred_device() -> None:
+    """Make the preferred GPU current, like upstream ``wp.init``.
+
+    Upstream warp selects ``cuda:0`` as the current device when CUDA is
+    present; Newton code (builder finalize, solver internals) launches on
+    the current device when no explicit device is passed, so the shim
+    activation must mirror that selection. Metal unavailable -> stays CPU.
+    """
+    global _CURRENT_DEVICE
+    try:
+        _CURRENT_DEVICE = get_device("metal")
+    except RuntimeError:
+        pass
+
+
 def is_cuda_available() -> bool:
     """Always False: warp-metal strips CUDA (KEP-0001 core goal)."""
     return False
+
+
+def get_cuda_device_count() -> int:
+    """Always 0: warp-metal strips CUDA (KEP-0001 core goal).
+
+    Upstream callers (Newton's test runner) only branch on ``> 1``.
+    """
+    return 0
+
+
+def get_cuda_devices() -> list[Device]:
+    """Always empty: warp-metal strips CUDA (KEP-0001 core goal).
+
+    Upstream helpers iterate this list to drive per-device sweeps and
+    mempool cleanup; an empty list degrades both to no-ops.
+    """
+    return []
+
+
+def get_devices() -> list[Device]:
+    """All registered devices (cpu + metal), like upstream ``wp.get_devices``."""
+    return list(_DEVICES.values())
 
 
 def get_stream(device=None) -> Stream:

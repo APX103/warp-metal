@@ -25,6 +25,18 @@ import sys
 _DONE = False
 
 
+def _activate_preferred_device() -> None:
+    """Select the current device like upstream wp.init (GPU when present).
+
+    Idempotent. Separated from the install tail because the package
+    self-installs its ``warp`` alias at import time (setdefault), which
+    makes install_as_warp() take the already-installed early return.
+    """
+    from .runtime.devices import activate_preferred_device
+
+    activate_preferred_device()
+
+
 def install_as_warp() -> None:
     """Plant ``sys.modules['warp'] = warp_metal`` plus submodule aliases.
 
@@ -36,6 +48,7 @@ def install_as_warp() -> None:
         import warp_metal
 
         if existing is warp_metal or getattr(existing, "__name__", "") == "warp_metal":
+            _activate_preferred_device()
             return  # already installed
         raise RuntimeError(
             "warp-metal shim: real warp-lang is already imported in this process; "
@@ -69,5 +82,10 @@ def install_as_warp() -> None:
     # warp._src -> the vendored frontend (Newton does `from warp._src import types`)
     sys.modules["warp._src"] = frontend
     warp_metal._src = frontend  # attribute chain: warp._src.types
+
+    # upstream wp.init makes the GPU current when one exists (cuda:0); the
+    # Metal backend's GPU is Metal — make it current so device-less launches
+    # (builder finalize, solver internals, Newton tests) dispatch on it
+    _activate_preferred_device()
 
     _DONE = True

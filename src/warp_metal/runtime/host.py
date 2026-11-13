@@ -105,9 +105,82 @@ _CTYPES_PTR = {
     np.bool_: ctypes.c_bool,
 }
 
+# matrix dtypes carry two trailing numpy axes in warp's host view
+_MAT_TRAILING = {
+    mat22f: (2, 2),
+    mat33f: (3, 3),
+    mat44f: (4, 4),
+}
+
+
+def _struct_np_layout(dtype):
+    """numpy structured dtype mirroring a warp @wp.struct's ctypes layout.
+
+    The vendored struct decorator exposes ``_ctype`` (a ctypes Structure
+    subclass) on instances. Field offsets are taken from ctypes itself and
+    given to numpy explicitly — numpy's own alignment rule does not mirror
+    ctypes padding (e.g. an 8-aligned array_t after an int32 field).
+    """
+    ctype_inst = getattr(dtype, "_ctype", None)
+    if not isinstance(ctype_inst, ctypes.Structure):
+        ctype_inst = getattr(dtype(), "_ctype", None)
+    if not isinstance(ctype_inst, ctypes.Structure):
+        raise NotImplementedError(f"dtype {dtype} not in spike subset")
+    ctype = type(ctype_inst)
+    names, formats, offsets = [], [], []
+    for name, ftype in ctype._fields_:
+        names.append(name)
+        formats.append(_field_np_format(ftype))
+        offsets.append(getattr(ctype, name).offset)
+    np_layout = np.dtype({"names": names, "formats": formats, "offsets": offsets,
+                          "itemsize": ctypes.sizeof(ctype)})
+    return np_layout, ctypes.sizeof(ctype), True
+
+
+def _field_np_format(ftype):
+    np_fmt = _CTYPES_NP.get(ftype)
+    if np_fmt is not None:
+        return np_fmt
+    if issubclass(ftype, ctypes.Structure):
+        return _ctype_to_np(ftype)
+    if issubclass(ftype, ctypes.Array):
+        elem = _CTYPES_NP.get(ftype._type_)
+        if elem is None:
+            raise NotImplementedError(f"struct field: {ftype} not mapped")
+        return (elem, (ftype._length_,))
+    raise NotImplementedError(f"struct field: {ftype} not mapped")
+
+
+def _ctype_to_np(ctype):
+    fields = []
+    for name, ftype in ctype._fields_:
+        fields.append((name, _field_np_format(ftype)))
+    return np.dtype(fields)
+
+
+_CTYPES_NP = {
+    ctypes.c_float: np.float32,
+    ctypes.c_double: np.float64,
+    ctypes.c_int8: np.int8,
+    ctypes.c_uint8: np.uint8,
+    ctypes.c_int16: np.int16,
+    ctypes.c_uint16: np.uint16,
+    ctypes.c_int32: np.int32,
+    ctypes.c_uint32: np.uint32,
+    ctypes.c_int64: np.int64,
+    ctypes.c_uint64: np.uint64,
+    ctypes.c_bool: np.bool_,
+}
+
 
 def _dtype_layout(dtype):
-    """(numpy scalar dtype, element size in bytes, is_composite)."""
+    """(numpy dtype, element size in bytes, is_composite)."""
+    if dtype is int:
+        dtype = int32  # upstream wp.array(dtype=int) alias
+    elif dtype is float:
+        dtype = float32
+    elif dtype is bool:
+        dtype = warp_bool  # vendored bool type (1 byte, warp convention)
     np_t = _SCALAR_NP.get(dtype)
     if np_t is not None:
         return np_t, np.dtype(np_t).itemsize, False
@@ -117,7 +190,25 @@ def _dtype_layout(dtype):
     n = _COMPOSITE_INTS.get(dtype)
     if n is not None:
         return np.int32, 4 * n, True
-    raise NotImplementedError(f"dtype {dtype} not in spike subset")
+    # generic wp.vector()/wp.matrix() type instances (e.g. vec3d): layout is
+    # scalar dtype × shape product (host-side allocation; kernels still fail
+    # loud at translation when the element type is not MSL-mappable)
+    scalar = getattr(dtype, "_wp_scalar_type_", None)
+    shape = getattr(dtype, "_shape_", None)
+    if scalar is not None and shape:
+        np_s = _SCALAR_NP.get(scalar)
+        if np_s is None:
+            raise NotImplementedError(f"dtype {dtype} not in spike subset")
+        comps = 1
+        for s in shape:
+            comps *= int(s)
+        return np_s, np.dtype(np_s).itemsize * comps, comps > 1
+    try:
+        return _struct_np_layout(dtype)
+    except NotImplementedError:
+        raise
+    except Exception as error:
+        raise NotImplementedError(f"dtype {dtype} not in spike subset") from error
 
 
 def _normalize_shape(shape) -> tuple[int, ...]:
@@ -126,6 +217,13 @@ def _normalize_shape(shape) -> tuple[int, ...]:
     if isinstance(shape, (int, np.integer)):
         return (int(shape),)
     return tuple(int(s) for s in shape)
+
+
+class _CallableArray(np.ndarray):
+    """ndarray that also answers ``.numpy()`` — real warp's method form."""
+
+    def __call__(self):
+        return self
 
 
 class WarpArray:
@@ -152,14 +250,11 @@ class WarpArray:
         for s in self.shape:
             self.n *= s
         self.np_dtype, self.item_bytes, self.is_composite = _dtype_layout(dtype)
+        self.offset_elems = 0
+        self._owns_buffer = True
         self._buffer = _mm.buffer_create(self.n * self.item_bytes)
         self._ptr = _mm.buffer_ptr(self._buffer)
-        c_t = _CTYPES_PTR[self.np_dtype]
-        count = self.n * self.item_bytes // np.dtype(self.np_dtype).itemsize
-        raw = np.ctypeslib.as_array(
-            ctypes.cast(self._ptr, ctypes.POINTER(c_t)), shape=(count,)
-        )
-        self.numpy = raw.view(self.np_dtype) if c_t is not raw.dtype else raw
+        self._build_numpy_view()
 
     @property
     def buffer(self):
@@ -184,6 +279,24 @@ class WarpArray:
             out.append(n)
         return tuple(out)
 
+    @property
+    def is_contiguous(self):
+        """Runtime arrays are always dense row-major (no strided views)."""
+        return True
+
+    @property
+    def size(self):
+        """Total element count (numpy-like), excluding composite sub-axes."""
+        n = 1
+        for s in self.shape:
+            n *= s
+        return n
+
+    @property
+    def ptr(self):
+        """CPU-side shared-storage pointer (unified memory device address)."""
+        return self._ptr
+
     def __ctype__(self):
         """C-representation for vendored frontend machinery (struct field
         setters, launch arg normalization). ``data`` is the CPU-side shared
@@ -201,16 +314,121 @@ class WarpArray:
         )
 
     def numpy_view(self):
-        """Zero-copy view: self.shape for scalar dtypes, (n, k) for composites."""
-        if not self.is_composite:
-            return self.numpy.reshape(self.shape)
-        return self.numpy.reshape(self.n, -1)
+        """Zero-copy host view: ``self.shape`` for scalars, ``self.shape +
+        (comps,)`` for vec/quat/mat (mirrors real warp's shaped numpy data)."""
+        return self.numpy
+
+    def _build_numpy_view(self):
+        """Recreate ``self.numpy`` over the current (possibly offset) pointer.
+
+        Shaped like real warp's host view: ``self.shape`` for scalar dtypes,
+        ``self.shape + (comps,)`` for vec/quat/mat, ``(n,)`` for structs.
+        """
+        np_t = np.dtype(self.np_dtype)
+        total = self.n * self.item_bytes
+        if np_t.names:
+            raw = np.ctypeslib.as_array(
+                ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_uint8)), shape=(total,)
+            )
+            self.numpy = raw.view(self.np_dtype).view(_CallableArray)
+            return
+        c_t = _CTYPES_PTR[self.np_dtype]
+        count = total // np_t.itemsize
+        raw = np.ctypeslib.as_array(
+            ctypes.cast(self._ptr, ctypes.POINTER(c_t)), shape=(count,)
+        )
+        arr = raw if c_t is raw.dtype else raw.view(self.np_dtype)
+        if self.is_composite:
+            comps = self.item_bytes // np_t.itemsize
+            # warp host-view semantics: vec/quat → trailing comps axis;
+            # matrices → two trailing axes (mat33: (n, 3, 3), so np.trace etc.
+            # work on element reads)
+            mshape = _MAT_TRAILING.get(self.dtype)
+            target = tuple(self.shape) + (mshape if mshape else (comps,)) if self.n else ((0,) + (mshape if mshape else (comps,)))
+            arr = arr.reshape(target)
+        elif len(self.shape) > 1:
+            arr = arr.reshape(self.shape) if self.n else arr.reshape(0)
+        self.numpy = arr.view(_CallableArray)
+
+    def _slice_view(self, start: int, length: int) -> "WarpArray":
+        """Host-side array view (warp slicing): shares the base buffer at an
+        element offset; the offset reaches device code via wp_arr_meta.offset."""
+        view = WarpArray.__new__(WarpArray)
+        view.device = self.device
+        view.dtype = self.dtype
+        view.shape = (length,) + tuple(self.shape[1:])
+        view.n = 1
+        for s in view.shape:
+            view.n *= s
+        view.np_dtype = self.np_dtype
+        view.item_bytes = self.item_bytes
+        view.is_composite = self.is_composite
+        view.offset_elems = self.offset_elems + start
+        view._buffer = self._buffer  # shared: release is owned by the base
+        view._owns_buffer = False
+        view._ptr = self._ptr + start * self.item_bytes
+        view._build_numpy_view()
+        return view
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            if len(self.shape) == 0:
+                raise TypeError("scalar array is not sliceable")
+            start, stop, step = key.indices(self.shape[0])
+            if step != 1:
+                raise NotImplementedError("strided array slices are outside the warp-metal closure")
+            if start < 0 or stop < start:
+                raise IndexError(f"invalid array slice [{start}:{stop}] for shape {self.shape}")
+            return self._slice_view(start, stop - start)
+        if isinstance(key, tuple):
+            # multi-dim element read (host copy via the numpy view)
+            return self.numpy_view()[key]
+        if isinstance(key, (int, np.integer)):
+            if len(self.shape) > 1:
+                return self.numpy_view()[key]
+            return self.numpy[key]
+        raise TypeError(f"unsupported array index {key!r}")
+
+    def __setitem__(self, key, value):
+        if isinstance(key, (int, np.integer)) and len(self.shape) == 1:
+            self.numpy[key] = value
+            return
+        self.numpy_view()[key] = value
+
+    def zero_(self):
+        """In-place zero fill (warp convention method).
+
+        Upstream this is a stream memset — captured by graph recording. The
+        host memset here is likewise recorded so replay re-runs it (SolverXPBD
+        re-zeros its atomic-accumulation deltas every iteration).
+        """
+        self.numpy[...] = 0
+        _record_fill(self, 0.0)
+        return self
+
+    def fill_(self, value):
+        """In-place constant fill (warp convention method; recorded like zero_)."""
+        self.numpy[...] = value
+        _record_fill(self, value)
+        return self
+
+    def assign(self, value) -> None:
+        """Copy host data into the array (upstream ``array.assign``).
+
+        Accepts another WarpArray or any host array-like; ``numpy.copyto``
+        checks shape and casts dtype the same way upstream does. Storage is
+        shared memory, so the write is immediately visible to in-flight and
+        captured dispatches.
+        """
+        if isinstance(value, WarpArray):
+            value = value.numpy
+        np.copyto(self.numpy, value)
 
     def to_numpy(self):
         return self.numpy_view().copy()
 
     def release(self) -> None:
-        if getattr(self, "_buffer", None):
+        if getattr(self, "_buffer", None) and getattr(self, "_owns_buffer", True):
             _mm.buffer_release(self._buffer)
             self._buffer = None
 
@@ -257,10 +475,27 @@ def ones(shape, dtype=float32, device=None, requires_grad=False, pinned=False, r
     return arr
 
 
-def full(shape, value, dtype=float32, device=None, requires_grad=False, pinned=False, retain_grad=False, **kwargs):
+def full(shape, value, dtype=None, device=None, requires_grad=False, pinned=False, retain_grad=False, **kwargs):
+    if dtype is None:
+        # upstream infers the element type from the fill value (wp.full(n,
+        # wp.vec3(...)) allocates a vec3 array); scalars default to float32
+        dtype = type(value) if hasattr(value, "__len__") and not isinstance(value, (bytes, str)) else float32
+        if dtype in (int,):
+            dtype = int32
+        elif dtype in (float,):
+            dtype = float32
     arr = zeros(shape, dtype, device, requires_grad, pinned, retain_grad)
     if arr.is_composite:
-        arr.numpy_view()[:] = np.asarray(value, dtype=np.float32)
+        # vec/quat/mat fill: flatten the vector-protocol value componentwise
+        # (scalar values broadcast over the components, like upstream)
+        comps = arr.item_bytes // np.dtype(arr.np_dtype).itemsize
+        if hasattr(value, "__len__"):
+            row = np.asarray([value[j] for j in range(len(value))], dtype=arr.np_dtype)
+        else:
+            row = np.full(comps, value, dtype=arr.np_dtype)
+        if len(row) != comps:
+            raise ValueError(f"full: {len(row)} components for a {comps}-component dtype")
+        arr.numpy_view()[...] = row
     else:
         arr.numpy.fill(value)
     return arr
@@ -293,7 +528,12 @@ def full_like(src, value, device=None, requires_grad=False, pinned=False, retain
 
 def clone(src, device=None, requires_grad=False, pinned=False, retain_grad=False):
     arr = _allocate(*_like_kwargs(src, device, requires_grad, pinned, retain_grad))
-    arr.numpy[:] = src.numpy
+    if _CAPTURE_RECORDS is not None:
+        # upstream stream memcpy: recorded, executed at replay (the record
+        # holds both arrays, so neither buffer dies under the graph)
+        _CAPTURE_RECORDS.append(("copy", arr, src, 0, 0, None))
+    else:
+        arr.numpy[:] = src.numpy
     return arr
 
 
@@ -304,6 +544,9 @@ def copy(dest, src, dest_offset=0, src_offset=0, count=None, stream=None):
     n = src.n - src_offset if count is None else int(count)
     if n < 0 or dest_offset + n > dest.n or src_offset + n > src.n:
         raise ValueError(f"copy out of bounds: count={n}, dest_offset={dest_offset}, src_offset={src_offset}")
+    if _CAPTURE_RECORDS is not None:
+        _CAPTURE_RECORDS.append(("copy", dest, src, dest_offset, src_offset, n))
+        return
     dest.numpy[dest_offset : dest_offset + n] = src.numpy[src_offset : src_offset + n]
 
 
@@ -328,13 +571,36 @@ def from_numpy(arr, dtype=None, shape=None, device=None, requires_grad=False, re
     if shape is None:
         _np_t, item_bytes_probe, composite_probe = _dtype_layout(dtype)
         if composite_probe and np_arr.ndim > 1:
-            probe_comps = item_bytes_probe // np.dtype(_np_t).itemsize
-            if np_arr.shape[-1] == probe_comps:
-                # 2-D numpy + composite dtype: trailing axis is the component
-                # axis (warp semantics: wp.array(np((4,3)), dtype=wp.vec3))
-                target_shape = tuple(np_arr.shape[:-1])
+            comps = item_bytes_probe // np.dtype(_np_t).itemsize
+            # trailing numpy axes are the element components (vec3: (n, 3);
+            # mat33: (n, 3, 3)) — collapse them (warp semantics)
+            product, k = 1, 0
+            for ax in reversed(np_arr.shape):
+                product *= int(ax)
+                k += 1
+                if product >= comps:
+                    break
+            if product == comps:
+                target_shape = tuple(np_arr.shape[: np_arr.ndim - k])
     out = _allocate(target_shape or (1,), dtype, device)
-    np_itemsize = np.dtype(out.np_dtype).itemsize
+    np_t = np.dtype(out.np_dtype)
+    if np_t.names:
+        # struct element: each source element is a warp struct instance whose
+        # ``_ctype`` is a ctypes structure mirroring the numpy layout byte for
+        # byte — copy records verbatim (embedded wp.array fields keep their
+        # shared-storage pointers, which are the device addresses)
+        elements = arr if isinstance(arr, (list, tuple)) else None
+        if elements is None:
+            raise NotImplementedError("struct-dtype wp.array needs a list of struct instances")
+        if len(elements) != out.n:
+            raise ValueError(f"struct wp.array: {len(elements)} elements for shape {out.shape}")
+        for i, inst in enumerate(elements):
+            src = getattr(inst, "_ctype", None)
+            if not isinstance(src, ctypes.Structure):
+                raise TypeError(f"struct wp.array element {i}: not a warp struct instance")
+            ctypes.memmove(out._ptr + i * out.item_bytes, ctypes.addressof(src), out.item_bytes)
+        return out
+    np_itemsize = np_t.itemsize
     comps = max(1, out.item_bytes // np_itemsize)
     total_scalars = out.n * comps
     flat = np_arr.reshape(-1)
@@ -343,12 +609,94 @@ def from_numpy(arr, dtype=None, shape=None, device=None, requires_grad=False, re
             f"from_numpy shape mismatch: numpy has {flat.size} scalars, "
             f"target {out.shape} of {getattr(dtype, '__name__', dtype)} needs {total_scalars}"
         )
-    out.numpy[:total_scalars] = flat
+    out.numpy[:total_scalars] = flat.reshape(out.numpy.shape)
     return out
 
 
 def synchronize() -> None:
     _mm.synchronize()
+
+
+class array:
+    """Public ``wp.array``: runtime-backed construction (KEP-0001 M1.6).
+
+    Newton's builder creates arrays host-side with data; the runtime
+    WarpArray is the native Metal allocation (shared storage). Subscripting
+    yields the vendored annotations and ``isinstance`` accepts both runtime
+    and vendored instances, so kernel annotations and struct fields behave
+    identically to upstream. ``ptr``/``capacity`` aliasing needs a native
+    ``buffer_from_ptr`` (Phase 2) and fails loud; ``copy=False`` lands as a
+    copy (Metal cannot alias non-page-aligned host memory — see __new__);
+    grad/pinned flags stay Non-Goals.
+    """
+
+    def __new__(
+        cls,
+        data=None,
+        dtype=None,
+        shape=None,
+        device=None,
+        copy=True,
+        pinned=False,
+        requires_grad=False,
+        retain_grad=False,
+        grad=None,
+        ptr=None,
+        capacity=None,
+        deleter=None,
+        ndim=None,
+    ):
+        from ..frontend.types import array as _vendored_array
+
+        if requires_grad or retain_grad or grad is not None or pinned:
+            raise RuntimeError(
+                "warp-metal does not support requires_grad/pinned/retain_grad allocation flags "
+                "(adjoint codegen is a KEP-0001 Non-Goal)"
+            )
+        if ptr is not None or capacity is not None or deleter is not None:
+            raise NotImplementedError(
+                "wp.array ptr/capacity/deleter aliasing needs native buffer_from_ptr (Phase 2)"
+            )
+        if not copy:
+            # Metal cannot alias arbitrary host memory (newBufferWithBytesNoCopy
+            # requires page alignment), so copy=False lands as a copy. Newton's
+            # copy=False sites hand freshly-built host arrays to the model and
+            # never write through the source afterwards, so the data flow is
+            # identical; divergence would require a post-wrap write through the
+            # original numpy object, which none of the call sites do.
+            pass
+        if dtype is int:
+            dtype = int32
+        elif dtype is float:
+            dtype = float32
+        if data is None and shape is None:
+            # annotation mode: wp.array(dtype=..., ndim=...) yields the vendored
+            # type descriptor used in kernel/func signatures
+            return _vendored_array(
+                dtype=dtype if dtype is not None else float32,
+                device=device,
+                ndim=ndim,
+            )
+        if data is not None:
+            return from_numpy(data, dtype=dtype, shape=shape, device=device)
+        if shape is None:
+            raise TypeError("wp.array() needs either data or shape")
+        return zeros(shape, dtype=dtype if dtype is not None else float32, device=device)
+
+    def __class_getitem__(cls, params):
+        from ..frontend.types import _parse_array_subscript, array as _vendored_array
+
+        return _parse_array_subscript(_vendored_array, params)
+
+    def __instancecheck__(cls, instance):
+        from ..frontend.types import array as _vendored_array
+
+        return isinstance(instance, WarpArray) or isinstance(instance, _vendored_array)
+
+    def __subclasscheck__(cls, subclass):
+        from ..frontend.types import array as _vendored_array
+
+        return issubclass(subclass, (WarpArray, _vendored_array))
 
 
 def device_name() -> str:
@@ -425,6 +773,88 @@ class _ArrMeta(_ctypes.Structure):
         ("shape", _ctypes.c_int32 * 4),
         ("strides", _ctypes.c_int32 * 4),
     ]
+
+
+# wp_mesh mirrors the MSL struct (msl/prelude.py): {device vec3f* data;
+# wp_arr_meta m} for points + the int32 form for indices. Natural alignment
+# matches the MSL layout (ptr @0/48, meta @8/56; total 96 bytes).
+class _MeshArrayF(_ctypes.Structure):
+    _fields_ = [
+        ("data", _ctypes.c_uint64),
+        ("m", _ArrMeta),
+    ]
+
+
+class _MeshArrayI(_ctypes.Structure):
+    _fields_ = [
+        ("data", _ctypes.c_uint64),
+        ("m", _ArrMeta),
+    ]
+
+
+class _MeshEntry(_ctypes.Structure):
+    _fields_ = [
+        ("points", _MeshArrayF),
+        ("indices", _MeshArrayI),
+    ]
+
+
+assert _ctypes.sizeof(_MeshEntry) == 96, _ctypes.sizeof(_MeshEntry)
+
+
+# the device-side mesh table: one _MeshEntry per registered wp.Mesh (index ==
+# mesh id; entry 0 is the null mesh). Kernels reaching wp.mesh_get bind it as
+# `device wp_mesh* _wp_mesh_table`. Rebuilt (re-uploaded) whenever a mesh is
+# created or its points are replaced — build-time-only work.
+_MESH_TABLE: dict = {"handle": None, "size": 0}
+
+
+def _mesh_meta(arr) -> _ArrMeta:
+    """Meta for a WarpArray or a vendored frontend ``array_t`` (mesh data)."""
+    if hasattr(arr, "buffer"):  # runtime WarpArray
+        return _arr_meta(arr)
+    # vendored array_t ctypes struct: data = GPU address, byte strides
+    meta = _ArrMeta()
+    meta.offset = 0
+    meta.ndim = int(arr.ndim)
+    for i in range(4):
+        meta.shape[i] = int(arr.shape[i]) if i < arr.ndim else 0
+        meta.strides[i] = int(arr.strides[i]) if i < arr.ndim else 0
+    return meta
+
+
+def _mesh_data_addr(arr) -> int:
+    """GPU address for a WarpArray or a vendored frontend ``array_t``."""
+    if hasattr(arr, "buffer"):
+        return _mm.buffer_gpu_address(arr.buffer)
+    return int(arr.data)
+
+
+def _mesh_table_upload() -> int:
+    """(Re)build the device mesh table; returns the buffer handle."""
+    from ..frontend.registry import _CoreShim
+
+    meshes = _CoreShim._HOST_MESHES
+    n = _CoreShim._HOST_MESH_SEQ[0] + 1
+    entries = (_MeshEntry * n)()
+    for mid, rec in meshes.items():
+        entry = entries[mid]
+        points = rec["points"]
+        indices = rec["indices"]
+        if points is not None:
+            entry.points.data = _mesh_data_addr(points)
+            entry.points.m = _mesh_meta(points)
+        if indices is not None:
+            entry.indices.data = _mesh_data_addr(indices)
+            entry.indices.m = _mesh_meta(indices)
+    handle = _mm.buffer_create(_ctypes.sizeof(_MeshEntry) * n)
+    dst = (_ctypes.c_char * (_ctypes.sizeof(_MeshEntry) * n)).from_address(_mm.buffer_ptr(handle))
+    _ctypes.memmove(dst, _ctypes.byref(entries), _ctypes.sizeof(_MeshEntry) * n)
+    if _MESH_TABLE["handle"] is not None:
+        _mm.buffer_release(_MESH_TABLE["handle"])
+    _MESH_TABLE["handle"] = handle
+    _MESH_TABLE["size"] = n
+    return handle
 
 
 _CTYPE_OF_SCALAR = {
@@ -582,7 +1012,13 @@ def _pack_user_struct(dest, msl_t: str, value, unit: KernelUnit):
             raise RuntimeError(f"launch: struct field {label!r}: unsupported MSL type {f_msl!r}")
 
 
-def _arr_meta(arr: WarpArray) -> _ArrMeta:
+def _arr_meta(arr: WarpArray | None) -> _ArrMeta:
+    if arr is None:
+        # null array argument: zero shape/strides, ndim 0 (truthiness reads it)
+        meta = _ArrMeta()
+        meta.offset = 0
+        meta.ndim = 0
+        return meta
     shape = arr.shape or (1,)
     ndim = len(shape)
     item = arr.item_bytes
@@ -592,7 +1028,7 @@ def _arr_meta(arr: WarpArray) -> _ArrMeta:
         strides[i] = acc
         acc *= shape[i]
     meta = _ArrMeta()
-    meta.offset = 0
+    meta.offset = arr.offset_elems * item
     meta.ndim = ndim
     for i in range(4):
         meta.shape[i] = shape[i] if i < ndim else 0
@@ -600,13 +1036,18 @@ def _arr_meta(arr: WarpArray) -> _ArrMeta:
     return meta
 
 
-def _unit_for(kernel):
-    """Translate + compile + cache a PSO for a vendored Kernel."""
+def _unit_for(kernel, block_dim: int | None = None):
+    """Translate + compile + cache a PSO for a vendored Kernel.
+
+    ``block_dim`` keys the cache alongside the kernel: a tiled translation
+    bakes the block size into tid mapping and threadgroup reductions.
+    """
     with _PSO_LOCK:
-        cached = _PSO_CACHE.get(id(kernel))
+        cached = _PSO_CACHE.get((id(kernel), block_dim))
         if cached is not None:
             return cached
-        unit = translate_kernel(kernel)
+        opts = {"block_dim": block_dim} if block_dim is not None else None
+        unit = translate_kernel(kernel, opts)
         source = unit.source()
         lib = _mm.library_create(source)
         fn = _mm.function_get(lib, unit.kernel.name)
@@ -614,7 +1055,7 @@ def _unit_for(kernel):
         _mm.function_release(fn)
         _mm.library_release(lib)
         entry = (pso, unit)
-        _PSO_CACHE[id(kernel)] = entry
+        _PSO_CACHE[(id(kernel), block_dim)] = entry
         return entry
 
 
@@ -629,7 +1070,13 @@ def _concretize_generic_kernel(kernel, args):
     """
     from ..frontend.types import _ArrayAnnotation, type_to_warp
 
-    def _compiler_type(v):
+    declared = [a.type for a in kernel.adj.args]
+
+    def _compiler_type(v, decl):
+        if v is None:
+            # upstream allows passing None for array args: keep the declared
+            # annotation type (the kernel guards with `if arr:` at runtime)
+            return decl
         if isinstance(v, WarpArray):
             return _ArrayAnnotation(v.dtype, len(v.shape))
         if isinstance(v, bool):
@@ -642,18 +1089,54 @@ def _concretize_generic_kernel(kernel, args):
             return v._cls
         return type(v)  # vector/matrix value types pass as classes
 
-    fwd_types = [_compiler_type(v) for v in args]
+    fwd_types = [_compiler_type(v, d) for v, d in zip(args, declared)]
     return kernel._add_normalized_overload(fwd_types)
 
 
-def _launch_ssa(kernel, dim, merged) -> None:
+def _null_buffer() -> int:
+    """Shared 1-byte buffer standing in for None array arguments (upstream
+    binds a null device pointer; a real buffer keeps Metal bindings valid,
+    and array truthiness reads the meta's ndim==0 instead)."""
+    global _NULL_BUF
+    if _NULL_BUF is None:
+        _NULL_BUF = _mm.buffer_create(1)
+    return _NULL_BUF
+
+
+_NULL_BUF: int | None = None
+
+
+def _launch_ssa(kernel, dim, merged, block_dim: int | None = None) -> None:
     """Launch a vendored Kernel through the Adjoint-SSA MSL pipeline."""
     if getattr(kernel, "is_generic", False):
         kernel = _concretize_generic_kernel(kernel, merged)
-    pso, unit = _unit_for(kernel)
+    from .. import host_fallback
+
+    fb = host_fallback.get(kernel)
+    if fb is not None:
+        if block_dim is not None:
+            raise RuntimeError(
+                f"launch_tiled: kernel '{kernel.key}' has a CPU fallback registered but tiled "
+                "ports are not supported (fallback ports take a flat thread count)"
+            )
+        if _CAPTURE_RECORDS is not None:
+            # record the host port: replay re-runs it on the same buffers
+            _CAPTURE_RECORDS.append(("fallback", kernel, dim, list(merged), fb))
+            return
+        # closure-external kernel with an explicit verified CPU fallback
+        # (unified memory: same shared-storage buffers the device sees)
+        fb(kernel, dim, merged)
+        return
+    pso, unit = _unit_for(kernel, block_dim)
     Params = _params_struct(unit)
 
     handles: list[int] = []
+    # strong references to every WarpArray bound into this dispatch — under
+    # graph capture the dispatch outlives the launching Python scope, and a
+    # released buffer would leave the record reading freed memory (upstream
+    # CUDA graphs keep stream-capture pool allocations alive for the graph's
+    # lifetime; this is the equivalent guarantee)
+    array_refs: list = []
     # device-pointer bindings in emitter order (name, buffer handle); when the
     # kernel uses the argument-buffer form these become GPU addresses in a
     # single shared buffer, in exactly the emitter's binding order
@@ -667,9 +1150,11 @@ def _launch_ssa(kernel, dim, merged) -> None:
     for a in unit.args:
         value = values.pop(0)
         if a.kind == "array":
-            if not isinstance(value, WarpArray):
+            if value is not None and not isinstance(value, WarpArray):
                 raise TypeError(f"kernel array parameter '{a.name}' got {type(value).__name__}, expected WarpArray")
-            device_bindings.append((f"{a.name}_data", value.buffer))
+            device_bindings.append((f"{a.name}_data", value.buffer if value is not None else _null_buffer()))
+            if value is not None:
+                array_refs.append(value)
             meta = _arr_meta(value)
             setattr(params, f"{a.name}_m", meta)
         elif a.kind == "scalar":
@@ -682,12 +1167,16 @@ def _launch_ssa(kernel, dim, merged) -> None:
             # split array fields: one buffer binding + one Params meta each
             for field, _elem_ctype in unit.struct_array_fields.get(a.ctype, []):
                 field_arr = getattr(value, field)
-                if not isinstance(field_arr, WarpArray):
+                if field_arr is not None and not isinstance(field_arr, WarpArray):
                     raise TypeError(
                         f"kernel struct parameter '{a.name}' field '{field}' got "
                         f"{type(field_arr).__name__}, expected WarpArray"
                     )
-                device_bindings.append((f"{a.name}__{field}_data", field_arr.buffer))
+                device_bindings.append(
+                    (f"{a.name}__{field}_data", field_arr.buffer if field_arr is not None else _null_buffer())
+                )
+                if field_arr is not None:
+                    array_refs.append(field_arr)
                 setattr(params, f"{a.name}__{field}_m", _arr_meta(field_arr))
         else:
             raise RuntimeError(f"launch: unknown arg kind {a.kind!r}")
@@ -717,6 +1206,10 @@ def _launch_ssa(kernel, dim, merged) -> None:
     threads = 1
     for d in dims:
         threads *= d
+    if block_dim is not None:
+        # tiled launch: `threads` is the BLOCK count — the grid is
+        # threads*block_dim threads in block_dim-sized threadgroups
+        threads *= block_dim
     params._dims.offset = 0
     params._dims.ndim = len(dims)
     for i in range(4):
@@ -729,12 +1222,42 @@ def _launch_ssa(kernel, dim, merged) -> None:
     _ctypes.memmove(dst, _ctypes.byref(params), _ctypes.sizeof(params))
     handles.append(handle)
 
+    # per-thread arena for in-device wp.zeros() (fixedarray stack arrays):
+    # one slice per thread, bound LAST to match the emitter's buffer index.
+    # Fresh zeros every launch — the kernel's zero-fill loop handles init.
+    arena_handle = None
+    if unit.arena_bytes_per_thread > 0:
+        arena_handle = _mm.buffer_create(unit.arena_bytes_per_thread * threads)
+        handles.append(arena_handle)
+
+    # host-built mesh table for wp.mesh_get users (bound after the arena,
+    # matching the emitter's buffer index; the handle is global and never
+    # released, so graph records can reference it safely)
+    if getattr(unit, "needs_mesh", False):
+        handles.append(_mesh_table_upload() if _MESH_TABLE["handle"] is None else _MESH_TABLE["handle"])
+
     try:
-        _mm.dispatch(pso, handles, threads)
+        if _CAPTURE_RECORDS is not None:
+            # graph recording: keep the dispatch alive for replay — the
+            # params/argbuf temporaries are owned by the Graph now, and the
+            # bound arrays are referenced by the record so their buffers
+            # cannot be released under it
+            owned = [handle] + ([argbuf_handle] if argbuf_handle is not None else [])
+            if arena_handle is not None:
+                owned.append(arena_handle)
+            _CAPTURE_RECORDS.append(("metal", pso, list(handles), threads, block_dim, owned, array_refs))
+            return
+        if block_dim is not None:
+            _mm.dispatch_tiled(pso, handles, threads, block_dim)
+        else:
+            _mm.dispatch(pso, handles, threads)
     finally:
-        _mm.buffer_release(handle)
-        if argbuf_handle is not None:
-            _mm.buffer_release(argbuf_handle)
+        if _CAPTURE_RECORDS is None:
+            _mm.buffer_release(handle)
+            if argbuf_handle is not None:
+                _mm.buffer_release(argbuf_handle)
+            if arena_handle is not None:
+                _mm.buffer_release(arena_handle)
 
 
 def _scalar_buffer(value) -> int:
@@ -747,6 +1270,64 @@ def _scalar_buffer(value) -> int:
     )
     dst[:] = packed
     return handle
+
+
+
+def launch_tiled(
+    kernel,
+    dim=None,
+    inputs=None,
+    outputs=None,
+    block_dim=None,
+    device=None,
+    stream=None,
+    record_cmd=None,
+    max_blocks=None,
+    record_tape=None,
+    adjoint=None,
+):
+    """Tiled launch (upstream-compatible signature, forward-only).
+
+    ``dim`` is the BLOCK count (int, or a length-1 sequence); the kernel
+    reads ``wp.tid()`` as ``(block_index, lane)`` with ``wp.block_dim()``
+    folding to ``block_dim`` (default 256, matching upstream's default).
+    The vendored parse consumes ``block_dim`` for tile shapes, and the
+    emitter lowers tile_reduce to a barriered threadgroup tree reduction —
+    which requires a power-of-two ``block_dim`` (upstream warp makes the
+    same assumption for its register-tile layout).
+    """
+    if adjoint or record_tape:
+        raise RuntimeError(
+            "warp-metal does not support adjoint launches (adjoint codegen is a KEP-0001 Non-Goal)"
+        )
+    if device is not None and get_device(device).name != "metal":
+        raise RuntimeError(
+            f"launch_tiled device={device!r} is not available: the Metal backend dispatches on 'metal'"
+        )
+    if stream is not None or record_cmd is not None or max_blocks is not None:
+        # accepted-for-parity in launch(); there is no batching here at all,
+        # so tiled variants fail loud instead of ignoring silently
+        raise RuntimeError("launch_tiled does not accept stream/record_cmd/max_blocks (synchronous dispatch)")
+    if dim is None:
+        raise TypeError("launch_tiled() missing required argument 'dim'")
+
+    if block_dim is None:
+        block_dim = 256  # upstream default (warp.config block dim)
+    block_dim = int(block_dim)
+    if block_dim & (block_dim - 1):
+        raise ValueError(f"launch_tiled block_dim must be a power of two, got {block_dim}")
+
+    if isinstance(dim, (tuple, list)):
+        if len(dim) != 1:
+            raise ValueError(
+                f"launch_tiled dim must be an int or length-1 sequence (block count), got {dim!r}"
+            )
+        dim = int(dim[0])
+    else:
+        dim = int(dim)
+
+    merged = list(inputs or []) + list(outputs or [])
+    _launch_ssa(kernel, dim, merged, block_dim=block_dim)
 
 
 def launch(
@@ -793,10 +1374,12 @@ def launch(
     merged = list(inputs or []) + list(outputs or [])
 
     if hasattr(kernel, "adj"):  # vendored Kernel (M1.2+): Adjoint-SSA pipeline
-        _launch_ssa(kernel, dim, merged)
+        _launch_ssa(kernel, dim, merged, block_dim=block_dim)
         return
 
     # legacy spike path (M0.4 plain-function kernels)
+    if _CAPTURE_RECORDS is not None:
+        raise RuntimeError("capture of legacy spike-path kernels is not supported (record the SSA path)")
     if isinstance(dim, (tuple, list)):
         dim = int(np.prod([int(d) for d in dim]))
     dim = int(dim)
@@ -831,52 +1414,169 @@ def launch(
 
 
 class Graph:
-    """Opaque capture record.
+    """Replayable capture record.
 
-    With synchronous passthrough capture, launches between capture_begin and
-    capture_end have already executed, so the record is legitimately empty
-    and replay is a no-op — never silently wrong results.
+    Capture records each launch (Metal dispatch or CPU-fallback port) in
+    order; ``capture_launch`` re-dispatches every record synchronously.
+    Recorded param/arg-buffer temporaries are owned (and released) by the
+    graph, and each record holds strong references to the arrays it binds —
+    their buffers stay alive for the graph's lifetime even if the launching
+    scope's temporaries die (upstream stream-capture pool semantics).
     """
 
     def __init__(self, device=None, n_ops: int = 0):
         self.device = device
         self.n_ops = n_ops
+        self._records: list = []
+        self._owned: list[int] = []
+
+    def __del__(self):
+        try:
+            for record in getattr(self, "_records", []):
+                if record[0] == "metal":
+                    for h in record[5]:
+                        _mm.buffer_release(h)
+            self._records = []
+        except Exception:
+            pass
 
     def __repr__(self):
         return f"warp_metal.Graph(device={self.device!r}, n_ops={self.n_ops})"
 
 
+class ScopedTimer:
+    """Upstream-compatible host timing context (wall-clock only).
+
+    Warp's profiler plumbing (CUDA events, async timers) is out of scope;
+    timing lands on this process's wall clock, which is exact for the
+    synchronous Metal dispatch model.
+    """
+
+    def __init__(self, name=None, silent=False, show_module=True, show_gpu=False, dict_output=None, **kwargs):
+        self.name = name or "unnamed"
+        self.silent = silent
+        # upstream: active=False disables the timer entirely (no print, no
+        # dict entry) — Newton passes it for cold-path instrumentation
+        self.active = bool(kwargs.pop("active", True))
+        if kwargs:
+            raise RuntimeError(f"ScopedTimer does not support {sorted(kwargs)}")
+        self.dict_output = dict_output
+        self._start = None
+
+    def __enter__(self):
+        if not self.active:
+            return self
+        import time as _time
+
+        self._start = _time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.active or self._start is None:
+            return False
+        import time as _time
+
+        elapsed = _time.perf_counter() - self._start
+        self.elapsed = elapsed
+        if self.dict_output is not None:
+            self.dict_output[self.name] = elapsed * 1000.0
+        if not self.silent:
+            print(f"{self.name} took {elapsed * 1000.0:.2f} ms")
+        return False
+
+
+class ScopedCapture:
+    """Context manager mirroring upstream: ``with wp.ScopedCapture() as c:``.
+
+    Passthrough (KEP-0001 MVP): the captured launches run immediately and
+    ``capture.graph`` is an empty record; ``capture_launch`` replays nothing.
+    """
+
+    def __init__(self, device=None, stream=None, force_module_load=False, **kwargs):
+        if kwargs:
+            raise RuntimeError(f"ScopedCapture does not support {sorted(kwargs)} (KEP-0001 passthrough capture)")
+        self.device = device
+        self.stream = stream
+        self.force_module_load = force_module_load
+        self.graph = None
+
+    def __enter__(self):
+        capture_begin(device=self.device, stream=self.stream, force_module_load=self.force_module_load)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.graph = capture_end(device=self.device, stream=self.stream)
+        return False
+
+
 _CAPTURE_LOCK = threading.Lock()
 _CAPTURE_DEPTH = 0
+# active record list while capturing; None outside capture
+_CAPTURE_RECORDS: list | None = None
+
+
+def _record_fill(arr, value) -> None:
+    """Record an in-place fill as a graph op (upstream stream-memset semantics).
+
+    The record holds the array itself, so its buffer stays alive for the
+    graph's lifetime. Host-only fills skipped outside capture.
+    """
+    if _CAPTURE_RECORDS is not None:
+        _CAPTURE_RECORDS.append(("fill", arr, value))
 
 
 def capture_begin(device=None, stream=None, force_module_load=False, external=None, apic=None, capture_mode=None):
-    """Begin capture (passthrough: kernels run immediately)."""
-    global _CAPTURE_DEPTH
+    """Begin capture: launches are RECORDED, not executed (upstream graph
+    semantics). Replay re-dispatches each recorded op synchronously."""
+    global _CAPTURE_DEPTH, _CAPTURE_RECORDS
     if external is not None or apic:
         raise RuntimeError("warp-metal does not support external/apic capture (CUDA-graph machinery)")
     with _CAPTURE_LOCK:
+        if _CAPTURE_DEPTH == 0:
+            _CAPTURE_RECORDS = []
+        else:
+            raise RuntimeError("nested capture is not supported by warp-metal")
         _CAPTURE_DEPTH += 1
 
 
 def capture_end(device=None, stream=None) -> Graph:
-    """End capture; returns an empty graph record (ops already executed)."""
-    global _CAPTURE_DEPTH
+    """End capture; returns the recorded graph."""
+    global _CAPTURE_DEPTH, _CAPTURE_RECORDS
     with _CAPTURE_LOCK:
         _CAPTURE_DEPTH = max(0, _CAPTURE_DEPTH - 1)
-    return Graph(get_device(device).name if device is not None else None, n_ops=0)
+        records = _CAPTURE_RECORDS
+        _CAPTURE_RECORDS = None
+    graph = Graph(get_device(device).name if device is not None else None, n_ops=len(records) if records else 0)
+    graph._records = records or []
+    return graph
 
 
 def capture_launch(graph, stream=None):
-    """Replay a captured graph.
-
-    The passthrough capture model executes kernels eagerly, so the captured
-    graph is empty and replay is an honest no-op. Replaying a foreign graph
-    object fails loudly.
-    """
+    """Replay a captured graph: re-dispatch every recorded operation in
+    order (synchronous, like the original launches)."""
     if isinstance(graph, Graph):
+        for record in getattr(graph, "_records", []):
+            kind = record[0]
+            if kind == "metal":
+                _, pso, handles, threads, block_dim, _owned, _refs = record
+                if block_dim is not None:
+                    _mm.dispatch_tiled(pso, handles, threads, block_dim)
+                else:
+                    _mm.dispatch(pso, handles, threads)
+            elif kind == "fill":
+                _, arr, value = record
+                arr.numpy[...] = value
+            elif kind == "copy":
+                _, dest, src, dest_offset, src_offset, count = record
+                n = src.n - src_offset if count is None else int(count)
+                dest.numpy[dest_offset : dest_offset + n] = src.numpy[src_offset : src_offset + n]
+            elif kind == "fallback":
+                _, kernel, dim, merged, fb = record
+                fb(kernel, dim, merged)
+            else:
+                raise RuntimeError(f"capture_launch: unknown record kind {kind!r}")
         return
-    raise RuntimeError(f"capture_launch: cannot replay {type(graph).__name__} (warp-metal graphs are capture-passthrough records)")
+    raise RuntimeError(f"capture_launch: cannot replay {type(graph).__name__}")
 
 
 def capture_if(condition, on_true=None, on_false=None, stream=None, **kwargs):

@@ -50,7 +50,11 @@ from .types import (
 
 # used as a globally accessible copy
 # of current compile options (block_dim) etc
-options = {}
+# block_dim: parse-time default for tile shapes (upstream resolve_options
+# seeds it per module). Newton's launch_tiled call sites pass matching
+# values (e.g. SHAPE_BOUNDS_BLOCK_DIM = 256); a mismatch fails loud in the
+# MSL emitter (M2.4 completes per-load block_dim variants).
+options = {"block_dim": 256}
 
 # wp.tid() coordinates are signed 32-bit integers. An extent of 2**31 is
 # valid because its largest coordinate is 2**31 - 1.

@@ -117,6 +117,9 @@ def _get_host_module_or_none():
     return host
 
 
+from . import config as _config  # noqa: F401 — extract_return_value legacy flag
+
+
 class _CoreShim:
     """Dormant-CUDA stand-in for the warp native core (warp.so).
 
@@ -141,6 +144,67 @@ class _CoreShim:
     @staticmethod
     def wp_bfloat16_bits_to_float(bits) -> float:
         return float(np.frombuffer(np.uint32([int(bits) << 16]).tobytes(), dtype=np.float32)[0])
+
+    # -- host mesh bookkeeping (wp.Mesh) ----------------------------------
+    #
+    # warp-metal keeps every buffer in shared storage, so the cpu/device core
+    # split collapses to one host path. The handle is bookkeeping only on the
+    # M1 closure: device-side mesh queries (mesh_query_point_*) arrive with
+    # the M2.1 query family and fail loud at kernel translation until then.
+
+    _HOST_MESHES: dict = {}
+    _HOST_MESH_SEQ = [0]
+
+    @classmethod
+    def wp_mesh_create_host(
+        cls, points, velocities, indices, num_points, num_tris, support_winding_number, bvh_constructor, groups, bvh_leaf_size
+    ):
+        cls._HOST_MESH_SEQ[0] += 1
+        mid = cls._HOST_MESH_SEQ[0]
+        cls._HOST_MESHES[mid] = {
+            "points": points,
+            "velocities": velocities,
+            "indices": indices,
+            "num_points": int(num_points),
+            "num_tris": int(num_tris),
+            "support_winding_number": int(support_winding_number),
+            "bvh_constructor": bvh_constructor,
+            "groups": groups,
+            "bvh_leaf_size": bvh_leaf_size,
+        }
+        cls._sync_mesh_table()
+        return mid
+
+    @classmethod
+    def _sync_mesh_table(cls) -> None:
+        """Re-upload the device mesh table (build-time only; see host.py)."""
+        from ..runtime.host import _mesh_table_upload
+
+        _mesh_table_upload()
+
+    @classmethod
+    def wp_mesh_destroy_host(cls, mid) -> None:
+        cls._HOST_MESHES.pop(int(mid), None)
+        cls._sync_mesh_table()
+
+    @classmethod
+    def wp_mesh_refit_host(cls, mid) -> None:
+        # no cached host BVH to refit yet (query family is M2.1)
+        if int(mid) not in cls._HOST_MESHES:
+            raise RuntimeError(f"wp_mesh_refit_host: unknown mesh id {mid}")
+
+    @classmethod
+    def wp_mesh_set_points_host(cls, mid, points) -> None:
+        if int(mid) not in cls._HOST_MESHES:
+            raise RuntimeError(f"wp_mesh_set_points_host: unknown mesh id {mid}")
+        cls._HOST_MESHES[mid]["points"] = points
+        cls._sync_mesh_table()
+
+    @classmethod
+    def wp_mesh_set_velocities_host(cls, mid, velocities) -> None:
+        if int(mid) not in cls._HOST_MESHES:
+            raise RuntimeError(f"wp_mesh_set_velocities_host: unknown mesh id {mid}")
+        cls._HOST_MESHES[mid]["velocities"] = velocities
 
     # -- host transform builtins (ctypes float-array conventions) ----------
 
@@ -226,6 +290,376 @@ class _CoreShim:
     @classmethod
     def wp_builtin_transform_identity_float32(cls, out_ref) -> None:
         cls._as_f32(out_ref, 7)[:] = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
+
+    # -- host math builtins (Newton host code calls wp.* outside kernels) --
+    # symbol names = cached mangled_name of each vendored builtin instantiation
+
+    @classmethod
+    def wp_builtin_normalize_vec3f(cls, v, out_ref) -> None:
+        vec = cls._as_f32(v, 3)
+        cls._as_f32(out_ref, 3)[:] = (vec / np.linalg.norm(vec)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_normalize_vec2f(cls, v, out_ref) -> None:
+        vec = cls._as_f32(v, 2)
+        cls._as_f32(out_ref, 2)[:] = (vec / np.linalg.norm(vec)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_normalize_vec4f(cls, v, out_ref) -> None:
+        vec = cls._as_f32(v, 4)
+        cls._as_f32(out_ref, 4)[:] = (vec / np.linalg.norm(vec)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_normalize_quatf(cls, q, out_ref) -> None:
+        q4 = cls._as_f32(q, 4)
+        cls._as_f32(out_ref, 4)[:] = (q4 / np.linalg.norm(q4)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_length_vec2f(cls, v, out_ref) -> None:
+        cls._as_f32(out_ref, 1)[:] = np.float32(np.linalg.norm(cls._as_f32(v, 2)))
+
+    @classmethod
+    def wp_builtin_length_vec3f(cls, v, out_ref) -> None:
+        cls._as_f32(out_ref, 1)[:] = np.float32(np.linalg.norm(cls._as_f32(v, 3)))
+
+    @classmethod
+    def wp_builtin_length_vec4f(cls, v, out_ref) -> None:
+        cls._as_f32(out_ref, 1)[:] = np.float32(np.linalg.norm(cls._as_f32(v, 4)))
+
+    @classmethod
+    def wp_builtin_dot_vec2f_vec2f(cls, a, b, out_ref) -> None:
+        cls._as_f32(out_ref, 1)[:] = np.float32(np.dot(cls._as_f32(a, 2), cls._as_f32(b, 2)))
+
+    @classmethod
+    def wp_builtin_dot_vec3f_vec3f(cls, a, b, out_ref) -> None:
+        cls._as_f32(out_ref, 1)[:] = np.float32(np.dot(cls._as_f32(a, 3), cls._as_f32(b, 3)))
+
+    @classmethod
+    def wp_builtin_dot_vec4f_vec4f(cls, a, b, out_ref) -> None:
+        cls._as_f32(out_ref, 1)[:] = np.float32(np.dot(cls._as_f32(a, 4), cls._as_f32(b, 4)))
+
+    @classmethod
+    def wp_builtin_dot_quatf_quatf(cls, a, b, out_ref) -> None:
+        cls._as_f32(out_ref, 1)[:] = np.float32(np.dot(cls._as_f32(a, 4), cls._as_f32(b, 4)))
+
+    @classmethod
+    def wp_builtin_cross_vec3f_vec3f(cls, a, b, out_ref) -> None:
+        cls._as_f32(out_ref, 3)[:] = np.cross(cls._as_f32(a, 3), cls._as_f32(b, 3)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_cw_mul_vec3f_vec3f(cls, a, b, out_ref) -> None:
+        # component-wise multiply (mat.h cw_mul — host-side shape scaling)
+        cls._as_f32(out_ref, 3)[:] = (cls._as_f32(a, 3) * cls._as_f32(b, 3)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_cw_div_vec3f_vec3f(cls, a, b, out_ref) -> None:
+        cls._as_f32(out_ref, 3)[:] = (cls._as_f32(a, 3) / cls._as_f32(b, 3)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_quat_identity_float32(cls, out_ref) -> None:
+        cls._as_f32(out_ref, 4)[:] = np.array([0, 0, 0, 1], dtype=np.float32)
+
+    @classmethod
+    def wp_builtin_quat_conjugate_qf32f32(cls, q, out_ref) -> None:
+        q4 = cls._as_f32(q, 4)
+        cls._as_f32(out_ref, 4)[:] = np.asarray([-q4[0], -q4[1], -q4[2], q4[3]], dtype=np.float32)
+
+    @classmethod
+    def wp_builtin_quat_inverse_quatf(cls, q, out_ref) -> None:
+        q4 = cls._as_f32(q, 4)
+        qi = np.asarray([-q4[0], -q4[1], -q4[2], q4[3]], dtype=np.float32) / np.dot(q4, q4)
+        cls._as_f32(out_ref, 4)[:] = qi.astype(np.float32)
+
+    @classmethod
+    def wp_builtin_quat_rotate_quatf_vec3f(cls, q, v, out_ref) -> None:
+        cls._as_f32(out_ref, 3)[:] = cls._quat_rotate_xyzw(cls._as_f32(q, 4), cls._as_f32(v, 3)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_quat_rotate_inv_quatf_vec3f(cls, q, v, out_ref) -> None:
+        q4 = cls._as_f32(q, 4)
+        qi = np.asarray([-q4[0], -q4[1], -q4[2], q4[3]], dtype=np.float32)
+        cls._as_f32(out_ref, 3)[:] = cls._quat_rotate_xyzw(qi, cls._as_f32(v, 3)).astype(np.float32)
+
+    @classmethod
+    def _quat_to_mat_rows(cls, q4: np.ndarray) -> np.ndarray:
+        """xyzw quaternion -> 3x3 rows (warp mat33 layout c[row][col])."""
+        x, y, z, w = (float(a) for a in q4)
+        return np.asarray(
+            [
+                1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z), 2.0 * (x * z + w * y),
+                2.0 * (x * y + w * z), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x),
+                2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y),
+            ],
+            dtype=np.float32,
+        )
+
+    @classmethod
+    def wp_builtin_quat_to_matrix_quatf(cls, q, out_ref) -> None:
+        cls._as_f32(out_ref, 9)[:] = cls._quat_to_mat_rows(cls._as_f32(q, 4))
+
+    @classmethod
+    def wp_builtin_quat_from_matrix_mat33f(cls, m, out_ref) -> None:
+        # row-major 3x3 -> xyzw quaternion (standard Shepperd method)
+        m33 = cls._as_f32(m, 9).reshape(3, 3)
+        tr = float(m33[0, 0] + m33[1, 1] + m33[2, 2])
+        if tr > 0.0:
+            s = np.sqrt(tr + 1.0) * 2.0
+            w = 0.25 * s
+            x = (m33[2, 1] - m33[1, 2]) / s
+            y = (m33[0, 2] - m33[2, 0]) / s
+            z = (m33[1, 0] - m33[0, 1]) / s
+        elif m33[0, 0] > m33[1, 1] and m33[0, 0] > m33[2, 2]:
+            s = np.sqrt(1.0 + m33[0, 0] - m33[1, 1] - m33[2, 2]) * 2.0
+            w = (m33[2, 1] - m33[1, 2]) / s
+            x = 0.25 * s
+            y = (m33[0, 1] + m33[1, 0]) / s
+            z = (m33[0, 2] + m33[2, 0]) / s
+        elif m33[1, 1] > m33[2, 2]:
+            s = np.sqrt(1.0 + m33[1, 1] - m33[0, 0] - m33[2, 2]) * 2.0
+            w = (m33[0, 2] - m33[2, 0]) / s
+            x = (m33[0, 1] + m33[1, 0]) / s
+            y = 0.25 * s
+            z = (m33[1, 2] + m33[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + m33[2, 2] - m33[0, 0] - m33[1, 1]) * 2.0
+            w = (m33[1, 0] - m33[0, 1]) / s
+            x = (m33[0, 2] + m33[2, 0]) / s
+            y = (m33[1, 2] + m33[2, 1]) / s
+            z = 0.25 * s
+        q = np.asarray([x, y, z, w], dtype=np.float32)
+        cls._as_f32(out_ref, 4)[:] = (q / np.linalg.norm(q)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_quat_from_axis_angle_vec3f_float32(cls, axis, angle, out_ref) -> None:
+        a = cls._as_f32(axis, 3)
+        half = cls._as_scalar(angle) * 0.5
+        s = np.sin(half)
+        cls._as_f32(out_ref, 4)[:] = np.asarray([a[0] * s, a[1] * s, a[2] * s, np.cos(half)], dtype=np.float32)
+
+    # -- host arithmetic builtins (vec/mat/quat operators on the host side) --
+
+    @classmethod
+    def _as_scalar(cls, s) -> float:
+        # scalar params arrive as ctypes instances (call_builtin_from_desc)
+        return float(s.value) if hasattr(s, "value") else float(s)
+
+    @classmethod
+    def _mul_comps(cls, comps, s, out_ref, n: int) -> None:
+        cls._as_f32(out_ref, n)[:] = (comps * s).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_mul_vec2f_float32(cls, v, s, out_ref) -> None:
+        cls._mul_comps(cls._as_f32(v, 2), cls._as_scalar(s), out_ref, 2)
+
+    @classmethod
+    def wp_builtin_mul_vec3f_float32(cls, v, s, out_ref) -> None:
+        cls._mul_comps(cls._as_f32(v, 3), cls._as_scalar(s), out_ref, 3)
+
+    @classmethod
+    def wp_builtin_mul_vec4f_float32(cls, v, s, out_ref) -> None:
+        cls._mul_comps(cls._as_f32(v, 4), cls._as_scalar(s), out_ref, 4)
+
+    @classmethod
+    def wp_builtin_mul_float32_vec2f(cls, s, v, out_ref) -> None:
+        cls._mul_comps(cls._as_f32(v, 2), cls._as_scalar(s), out_ref, 2)
+
+    @classmethod
+    def wp_builtin_mul_float32_vec3f(cls, s, v, out_ref) -> None:
+        cls._mul_comps(cls._as_f32(v, 3), cls._as_scalar(s), out_ref, 3)
+
+    @classmethod
+    def wp_builtin_mul_float32_vec4f(cls, s, v, out_ref) -> None:
+        cls._mul_comps(cls._as_f32(v, 4), cls._as_scalar(s), out_ref, 4)
+
+    @classmethod
+    def wp_builtin_div_vec2f_float32(cls, v, s, out_ref) -> None:
+        cls._mul_comps(cls._as_f32(v, 2), 1.0 / cls._as_scalar(s), out_ref, 2)
+
+    @classmethod
+    def wp_builtin_div_vec3f_float32(cls, v, s, out_ref) -> None:
+        cls._mul_comps(cls._as_f32(v, 3), 1.0 / cls._as_scalar(s), out_ref, 3)
+
+    @classmethod
+    def wp_builtin_div_vec4f_float32(cls, v, s, out_ref) -> None:
+        cls._mul_comps(cls._as_f32(v, 4), 1.0 / cls._as_scalar(s), out_ref, 4)
+
+    @classmethod
+    def wp_builtin_sqrt_float32(cls, v, out_ref) -> None:
+        cls._as_f32(out_ref, 1)[:] = np.float32(np.sqrt(cls._as_scalar(v)))
+
+    @classmethod
+    def wp_builtin_mul_float32_float32(cls, a, b, out_ref) -> None:
+        cls._as_f32(out_ref, 1)[:] = np.float32(cls._as_scalar(a) * cls._as_scalar(b))
+
+    @classmethod
+    def wp_builtin_length_sq_vec2f(cls, v, out_ref) -> None:
+        c = cls._as_f32(v, 2)
+        cls._as_f32(out_ref, 1)[:] = np.float32(c @ c)
+
+    @classmethod
+    def wp_builtin_length_sq_vec3f(cls, v, out_ref) -> None:
+        c = cls._as_f32(v, 3)
+        cls._as_f32(out_ref, 1)[:] = np.float32(c @ c)
+
+    @classmethod
+    def wp_builtin_length_sq_vec4f(cls, v, out_ref) -> None:
+        c = cls._as_f32(v, 4)
+        cls._as_f32(out_ref, 1)[:] = np.float32(c @ c)
+
+    @classmethod
+    def wp_builtin_spatial_bottom_spatial_vectorf(cls, v, out_ref) -> None:
+        # spatial vector = (top 3, bottom 3); bottom is the angular part
+        cls._as_f32(out_ref, 3)[:] = cls._as_f32(v, 6)[3:]
+
+    @classmethod
+    def wp_builtin_spatial_top_spatial_vectorf(cls, v, out_ref) -> None:
+        cls._as_f32(out_ref, 3)[:] = cls._as_f32(v, 6)[:3]
+
+    @classmethod
+    def wp_builtin_add_int64_int64(cls, a, b, out_ref) -> None:
+        # out_ref arrives as a c_void_p to the caller's int64 result slot
+        addr = out_ref.value if isinstance(out_ref, ctypes.c_void_p) else ctypes.addressof(out_ref)
+        (ctypes.c_int64 * 1).from_address(addr)[0] = int(cls._as_scalar(a)) + int(cls._as_scalar(b))
+
+    @classmethod
+    def wp_builtin_quat_rpy_float32_float32_float32(cls, roll, pitch, yaw, out_ref) -> None:
+        # q = qz(yaw) * qy(pitch) * qx(roll), half-angle formulas (upstream
+        # quat_rpy; extrinsic x-y-z == intrinsic z-y'-x'')
+        r, p, y = cls._as_scalar(roll) * 0.5, cls._as_scalar(pitch) * 0.5, cls._as_scalar(yaw) * 0.5
+        cr, sr = math.cos(r), math.sin(r)
+        cp, sp = math.cos(p), math.sin(p)
+        cy, sy = math.cos(y), math.sin(y)
+        out = cls._as_f32(out_ref, 4)
+        out[0] = np.float32(cy * cp * sr - sy * sp * cr)
+        out[1] = np.float32(cy * sp * cr + sy * cp * sr)
+        out[2] = np.float32(sy * cp * cr - cy * sp * sr)
+        out[3] = np.float32(cy * cp * cr + sy * sp * sr)
+
+    @classmethod
+    def _add_sub_comps(cls, a, b, out_ref, n: int, sign: float) -> None:
+        cls._as_f32(out_ref, n)[:] = (cls._as_f32(a, n) + sign * cls._as_f32(b, n)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_add_vec2f_vec2f(cls, a, b, out_ref) -> None:
+        cls._add_sub_comps(a, b, out_ref, 2, 1.0)
+
+    @classmethod
+    def wp_builtin_add_vec3f_vec3f(cls, a, b, out_ref) -> None:
+        cls._add_sub_comps(a, b, out_ref, 3, 1.0)
+
+    @classmethod
+    def wp_builtin_add_vec4f_vec4f(cls, a, b, out_ref) -> None:
+        cls._add_sub_comps(a, b, out_ref, 4, 1.0)
+
+    @classmethod
+    def wp_builtin_sub_vec2f_vec2f(cls, a, b, out_ref) -> None:
+        cls._add_sub_comps(a, b, out_ref, 2, -1.0)
+
+    @classmethod
+    def wp_builtin_sub_vec3f_vec3f(cls, a, b, out_ref) -> None:
+        cls._add_sub_comps(a, b, out_ref, 3, -1.0)
+
+    @classmethod
+    def wp_builtin_sub_vec4f_vec4f(cls, a, b, out_ref) -> None:
+        cls._add_sub_comps(a, b, out_ref, 4, -1.0)
+
+    @classmethod
+    def wp_builtin_neg_vec2f(cls, v, out_ref) -> None:
+        cls._as_f32(out_ref, 2)[:] = -cls._as_f32(v, 2)
+
+    @classmethod
+    def wp_builtin_neg_vec3f(cls, v, out_ref) -> None:
+        cls._as_f32(out_ref, 3)[:] = -cls._as_f32(v, 3)
+
+    @classmethod
+    def wp_builtin_neg_vec4f(cls, v, out_ref) -> None:
+        cls._as_f32(out_ref, 4)[:] = -cls._as_f32(v, 4)
+
+    @classmethod
+    def wp_builtin_mul_quatf_quatf(cls, a, b, out_ref) -> None:
+        # Hamilton product (xyzw layout): (a*b).xyz = aw*bx + ax*bw + ayz x byz
+        a4, b4 = cls._as_f32(a, 4), cls._as_f32(b, 4)
+        ax, ay, az, aw = (float(x) for x in a4)
+        bx, by, bz, bw = (float(x) for x in b4)
+        cls._as_f32(out_ref, 4)[:] = np.asarray(
+            [
+                aw * bx + ax * bw + ay * bz - az * by,
+                aw * by - ax * bz + ay * bw + az * bx,
+                aw * bz + ax * by - ay * bx + az * bw,
+                aw * bw - ax * bx - ay * by - az * bz,
+            ],
+            dtype=np.float32,
+        )
+
+    @classmethod
+    def wp_builtin_mul_mat33f_vec3f(cls, m, v, out_ref) -> None:
+        m33 = cls._as_f32(m, 9).reshape(3, 3)
+        cls._as_f32(out_ref, 3)[:] = (m33 @ cls._as_f32(v, 3)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_mul_mat33f_mat33f(cls, a, b, out_ref) -> None:
+        a33 = cls._as_f32(a, 9).reshape(3, 3)
+        b33 = cls._as_f32(b, 9).reshape(3, 3)
+        cls._as_f32(out_ref, 9)[:] = (a33 @ b33).reshape(-1).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_mul_mat44f_vec4f(cls, m, v, out_ref) -> None:
+        m44 = cls._as_f32(m, 16).reshape(4, 4)
+        cls._as_f32(out_ref, 4)[:] = (m44 @ cls._as_f32(v, 4)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_transpose_mat33f(cls, m, out_ref) -> None:
+        cls._as_f32(out_ref, 9)[:] = cls._as_f32(m, 9).reshape(3, 3).T.reshape(-1).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_transpose_mat44f(cls, m, out_ref) -> None:
+        cls._as_f32(out_ref, 16)[:] = cls._as_f32(m, 16).reshape(4, 4).T.reshape(-1).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_diag_vec3f(cls, v, out_ref) -> None:
+        out = np.zeros(9, dtype=np.float32)
+        out[0] = cls._as_f32(v, 3)[0]
+        out[4] = cls._as_f32(v, 3)[1]
+        out[8] = cls._as_f32(v, 3)[2]
+        cls._as_f32(out_ref, 9)[:] = out
+
+    @classmethod
+    def wp_builtin_inverse_mat33f(cls, m, out_ref) -> None:
+        # verbatim port of warp native mat.h inverse_impl<3,3> shape: adjugate
+        # then unified reciprocal scale (see M0 prelude; same numerics)
+        m33 = cls._as_f32(m, 9).reshape(3, 3)
+        inv = np.linalg.inv(m33).astype(np.float32)
+        cls._as_f32(out_ref, 9)[:] = inv.reshape(-1)
+
+    @classmethod
+    def wp_builtin_determinant_mat33f(cls, m, out_ref) -> None:
+        m33 = cls._as_f32(m, 9).reshape(3, 3)
+        cls._as_f32(out_ref, 1)[:] = np.float32(np.linalg.det(m33))
+
+    @classmethod
+    def wp_builtin_trace_mat33f(cls, m, out_ref) -> None:
+        m33 = cls._as_f32(m, 9).reshape(3, 3)
+        cls._as_f32(out_ref, 1)[:] = np.float32(m33[0, 0] + m33[1, 1] + m33[2, 2])
+
+    @classmethod
+    def wp_builtin_add_mat33f_mat33f(cls, a, b, out_ref) -> None:
+        cls._as_f32(out_ref, 9)[:] = (cls._as_f32(a, 9) + cls._as_f32(b, 9)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_sub_mat33f_mat33f(cls, a, b, out_ref) -> None:
+        cls._as_f32(out_ref, 9)[:] = (cls._as_f32(a, 9) - cls._as_f32(b, 9)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_mul_mat33f_float32(cls, m, s, out_ref) -> None:
+        cls._as_f32(out_ref, 9)[:] = (cls._as_f32(m, 9) * cls._as_scalar(s)).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_outer_vec3f_vec3f(cls, a, b, out_ref) -> None:
+        cls._as_f32(out_ref, 9)[:] = np.outer(cls._as_f32(a, 3), cls._as_f32(b, 3)).reshape(-1).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_mul_float32_mat33f(cls, s, m, out_ref) -> None:
+        cls._as_f32(out_ref, 9)[:] = (cls._as_f32(m, 9) * cls._as_scalar(s)).astype(np.float32)
 
 
 class _RuntimeShim:

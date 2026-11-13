@@ -6142,89 +6142,14 @@ class Bvh:
         groups: array | None = None,
         leaf_size: int = 1,
     ):
-        """Class representing a bounding volume hierarchy.
+        """warp-metal host BVH (upstream bvh.cpp port — see runtime/bvh.py).
 
-        Depending on which device the input bounds live, it can be either a CPU tree or a GPU tree.
-
-        Attributes:
-            id: Unique identifier for this BVH object, can be passed to kernels.
-            device: Device this object lives on, all buffers must live on the same device.
-
-        Args:
-            lowers: Array of lower bounds of data type :class:`vec3`.
-            uppers: Array of upper bounds of data type :class:`vec3`.
-              ``lowers`` and ``uppers`` must live on the same device.
-            constructor: The construction algorithm used to build the tree.
-              Valid choices are ``"sah"``, ``"median"``, ``"lbvh"``, ``"cubql"``, or ``None``.
-              When ``None``, the default constructor will be used (see the note).
-            groups: Optional array of group indices of data type :class:`int32`.
-            leaf_size: The number of primitives (AABBs) stored in each leaf node. The optimal value depends on the primary
-              use case. For intersection queries (e.g., AABB query), a small value like 1 (the default) is generally
-              recommended for optimal performance. For closest point queries, a larger value like 4 or 8 can be more
-              performant. This is an intrinsic parameter which does not impact the return value of the query method.
-
-        Note:
-            **Explanation of BVH constructors:**
-
-            - ``"sah"``: A CPU-based top-down constructor where the AABBs are split based on Surface Area
-              Heuristics (SAH). Construction takes slightly longer than others but has the best query
-              performance.
-            - ``"median"``: A CPU-based top-down constructor where the AABBs are split based on the median
-              of centroids of primitives in an AABB. This constructor is faster than SAH but offers
-              inferior query performance.
-            - ``"lbvh"``: A GPU-based bottom-up constructor which maximizes parallelism. Construction is very
-              fast, especially for large models. Query performance is slightly slower than ``"sah"``.
-            - ``"cubql"``: An experimental cuBQL constructor. It builds a temporary cuBQL BVH and converts
-              it into Warp's native BVH layout for traversal. Grouped BVHs are not supported with this
-              constructor.
-            - ``None``: The constructor will be automatically chosen based on the device where the tree
-              lives. For a GPU tree, the ``"lbvh"`` constructor will be selected; for a CPU tree, the ``"sah"``
-              constructor will be selected.
-
-            All constructors are supported for GPU trees when Warp is compiled with cuBQL support. When a
-            CPU-based constructor is selected for a GPU tree, bounds will be copied back to the CPU to run
-            the CPU-based constructor. After construction, the CPU tree will be copied to the GPU.
-
-            ``"sah"``, ``"median"``, and ``"cubql"`` are supported for CPU trees when Warp is compiled with cuBQL
-            support. If ``"lbvh"`` is selected for a CPU tree, a warning message will be issued, and the constructor
-            will automatically fall back to ``"sah"``.
-
-            The ``leaf_size`` parameter controls the number of primitives (AABBs) stored in each leaf node of the BVH.
-            This parameter can have a considerable impact on query performance, and the optimal value depends on the
-            types of queries that will be performed:
-
-            - For intersection queries (such as ray or AABB queries), smaller ``leaf_size`` values (e.g., 1) are generally
-              preferred, as they reduce the number of unnecessary primitive checks and can improve traversal speed.
-            - For closest point queries, larger ``leaf_size`` values (e.g., 4 or more) may be beneficial, as they allow
-              more primitives to be checked together, potentially reducing traversal overhead.
-
-            The default value is 1, which is optimal for intersection queries. For use cases that involve both intersection
-            and closest point queries (such as mesh queries), a moderate value (e.g., 4) may provide a good balance.
-            Users are encouraged to experiment with this parameter to find the best value for their specific workload.
-
-            **Concept of Grouped BVH:**
-
-            A Grouped BVH extends the traditional Bounding Volume Hierarchy to efficiently handle multiple independent
-            groups of objects—such as distinct environments in parallel robot simulations—within a single BVH structure.
-
-            In a standard BVH, all objects share one global tree, so queries must traverse the entire hierarchy and filter
-            results in user space. Grouped BVH introduces a group identifier for each object and makes sure that objects
-            from the same group occupy an entire subtree whose root can be quickly identified by calling
-            :func:`~_pkg.lang.bvh_get_group_root`.
-
-            By starting traversal directly from a group's root node, queries are confined to that group's objects only,
-            avoiding unnecessary intersection tests with other groups. This design significantly reduces query overhead
-            for large multi-environment workloads, improves memory coherence, and eliminates the need for spatial
-            separation between groups.
-
-            The grouped BVH thus allows Warp to perform environment-specific queries—such as collision detection,
-            sensor simulation, or rendering—within a unified BVH framework, maintaining compatibility with existing APIs
-            and near-identical performance for non-grouped use cases.
-
-        Note:
-            For grouped BVHs built with ``"sah"`` or ``"median"``, the traversal depth limit applies separately
-            to each group subtree. Start queries at the desired group's root to stay within this limit.
-            Traversal from the global root is not guaranteed to fit the query stack for deep grouped trees.
+        The tree is built on the host over the caller's shared-storage
+        bound arrays (unified memory, zero-copy) in the exact upstream
+        device layout; ``id`` is the context buffer's GPU address that
+        device kernels dereference. SAH/MEDIAN constructors are ported;
+        LBVH (a GPU algorithm) falls back to SAH with a warning, matching
+        upstream CPU-tree semantics.
         """
         if len(lowers) != len(uppers):
             raise RuntimeError("The same number of lower and upper bounds must be provided")
@@ -6251,169 +6176,62 @@ class Bvh:
         self.uppers = uppers
         self.groups = groups
 
-        def get_data(array):
-            if array:
-                return ctypes.c_void_p(array.ptr)
-            else:
-                return ctypes.c_void_p(0)
-
-        self.runtime = _pkg.registry.runtime
+        from ..runtime.host import get_device as _get_device
 
         if constructor is None:
-            if self.device.is_cpu:
+            if _get_device(lowers.device).name == "cpu":
                 constructor = BvhConstructor.SAH
             else:
+                # upstream picks LBVH for GPU trees; warp-metal builds on the
+                # host, so mirror upstream's CPU-tree LBVH fallback
                 constructor = BvhConstructor.LBVH
 
         if not isinstance(constructor, BvhConstructor):
             constructor = BvhConstructor.from_str(constructor)
-
-        if constructor == BvhConstructor.CUBQL:
-            if groups is not None:
-                raise RuntimeError("Grouped BVHs are not supported with constructor='cubql'")
 
         if leaf_size < 1:
             raise ValueError(f"leaf_size must be greater than or equal to 1, current value: {leaf_size}")
 
-        if self.device.is_cpu:
-            if constructor == BvhConstructor.LBVH:
-                log_warning(
-                    "LBVH constructor is not available for a CPU tree. Falling back to SAH constructor.", stacklevel=2
-                )
-                constructor = BvhConstructor.SAH
-
-            self.id = self.runtime.core.wp_bvh_create_host(
-                get_data(lowers),
-                get_data(uppers),
-                len(lowers),
-                constructor,
-                get_data(groups),
-                leaf_size,
+        if constructor == BvhConstructor.CUBQL:
+            raise RuntimeError("warp-metal does not ship cuBQL (constructor='cubql' is upstream-optional)")
+        if constructor == BvhConstructor.LBVH:
+            log_warning(
+                "LBVH constructor is not available for a warp-metal tree (host build). "
+                "Falling back to SAH constructor.",
+                stacklevel=2,
             )
-        else:
-            self.id = self.runtime.core.wp_bvh_create_device(
-                self.device.context,
-                get_data(lowers),
-                get_data(uppers),
-                len(lowers),
-                constructor,
-                get_data(groups),
-                leaf_size,
-            )
+            constructor = BvhConstructor.SAH
 
+        from ..runtime.bvh import HostBVH
+        from .. import native as _mm
+
+        self._host = HostBVH(lowers, uppers, groups, int(constructor), leaf_size, _mm)
+        self.id = self._host.id
         self._constructor = constructor
         if not self.id:
-            raise RuntimeError(f"Failed to create BVH: {self.runtime.get_error_string()}")
+            raise RuntimeError("Failed to create BVH")
 
     def __del__(self):
-        if not self.id:
-            return
-
-        try:
-            if self.device.is_cpu:
-                self.runtime.core.wp_bvh_destroy_host(self.id)
-            else:
-                # use CUDA context guard to avoid side effects during garbage collection
-                with self.device.context_guard:
-                    self.runtime.core.wp_bvh_destroy_device(self.id)
-        except (TypeError, AttributeError):
-            # Suppress TypeError and AttributeError when callables become None during shutdown
-            pass
+        # node/context buffers are released by the runtime's handle GC
+        pass
 
     def refit(self):
-        """Refit the BVH.
-
-        This should be called after users modify the ``lowers`` or ``uppers`` arrays.
-
-        Note:
-            Under a CPU graph capture the refit is recorded and re-run on replay against the
-            current ``lowers``/``uppers``. Such a graph is replay-only and cannot be serialized
-            with :func:`warp.capture_save`.
-        """
-
-        if self.device.is_cpu:
-            self.runtime.core.wp_bvh_refit_host(self.id)
-        else:
-            self.runtime.core.wp_bvh_refit_device(self.id)
-            self.runtime.verify_cuda_device(self.device)
+        """Refit the BVH (host port of bvh_refit_recursive — runtime/bvh.py)."""
+        self._host.refit()
 
     def rebuild(self, constructor: str | None = None):
-        """Rebuild the BVH hierarchy **in place** from the current ``lowers``/``uppers`` arrays.
-
-        This method does not allocate new memory; it reuses the existing BVH buffers.
-
-        Unlike :meth:`refit`, which only tightens parent AABBs while preserving the existing
-        tree topology, ``rebuild`` discards the old hierarchy and constructs a new one. Use
-        this when primitive distributions change significantly (large deformations,
-        insertions/removals, or reordered items), or when you want to switch construction
-        algorithms.
-
-        Args:
-            constructor (str | None): Construction algorithm to use. One of ``"sah"``,
-                ``"median"``, ``"lbvh"``, ``"cubql"``, or ``None``. If ``None``, the default is
-                chosen based on the device (CPU → ``"sah"``, CUDA → ``"lbvh"``), except for
-                cuBQL-constructed BVHs, which rebuild with cuBQL. On CPU, ``"sah"`` and
-                ``"median"`` are supported; requesting ``"lbvh"`` falls back to ``"sah"`` with a
-                warning. On CUDA, in-place rebuild supports ``"lbvh"`` only; other values fall
-                back to ``"lbvh"`` with a warning. In-place rebuild does not support switching to
-                or from ``"cubql"``; create a new BVH instead.
-
-        Notes:
-            - The native CUDA LBVH rebuild path is CUDA graph-capture safe: previously captured graphs
-              that include queries on this BVH remain valid after ``rebuild`` because buffers are reused.
-              This guarantee does not apply to cuBQL rebuilds.
-            - If you need a CPU top-down constructor (``"sah"``/``"median"``) for a GPU tree,
-              create a new BVH via the class constructor instead.
-            - Under a CPU graph capture the rebuild is recorded and re-run on replay against the
-              current ``lowers``/``uppers``. Such a graph is replay-only and cannot be serialized
-              with :func:`warp.capture_save`.
-
-        Raises:
-            ValueError: If an unknown constructor is provided.
-        """
-
-        if constructor is None and self._constructor == BvhConstructor.CUBQL:
-            constructor = BvhConstructor.CUBQL
-        elif constructor is None:
-            if self.device.is_cpu:
-                constructor = BvhConstructor.SAH
-            else:
-                constructor = BvhConstructor.LBVH
-
-        if not isinstance(constructor, BvhConstructor):
-            constructor = BvhConstructor.from_str(constructor)
-
-        if constructor == BvhConstructor.CUBQL:
-            if self._constructor != BvhConstructor.CUBQL:
-                raise ValueError("Cannot rebuild a non-cuBQL BVH with constructor='cubql'; create a new BVH instead")
-
-            if self.device.is_cpu:
-                self.runtime.core.wp_bvh_rebuild_host(self.id, constructor)
-            else:
-                self.runtime.core.wp_bvh_rebuild_device(self.id)
-                self.runtime.verify_cuda_device(self.device)
-            return
-
-        if self._constructor == BvhConstructor.CUBQL:
-            raise ValueError("Cannot rebuild a cuBQL BVH with a different constructor; create a new BVH instead")
-
-        if self.device.is_cpu:
-            if constructor == BvhConstructor.LBVH:
-                log_warning(
-                    "LBVH constructor is not available for a CPU tree. Falling back to SAH constructor.", stacklevel=2
-                )
-                constructor = BvhConstructor.SAH
-            self.runtime.core.wp_bvh_rebuild_host(self.id, constructor)
-            self._constructor = constructor
+        """Rebuild the tree in place from the current lowers/uppers arrays."""
+        if constructor is not None:
+            ctor = BvhConstructor.SAH if isinstance(constructor, str) and constructor.upper() == "SAH" else None
+            if ctor is None:
+                raise RuntimeError(f"warp-metal rebuild supports 'sah' only, got {constructor!r}")
         else:
-            if constructor != BvhConstructor.LBVH:
-                log_warning(
-                    "In-place rebuild method on the CUDA device only supports LBVH constructor. Falling back to LBVH constructor.",
-                    stacklevel=2,
-                )
-            self.runtime.core.wp_bvh_rebuild_device(self.id)
-            self.runtime.verify_cuda_device(self.device)
-            self._constructor = BvhConstructor.LBVH
+            ctor = self._constructor
+        from ..runtime.bvh import HostBVH
+        from .. import native as _mm
+
+        self._host = HostBVH(self.lowers, self.uppers, self.groups, int(ctor), self._host.leaf_size, _mm)
+        self.id = self._host.id
 
 
 class Mesh:
@@ -6490,7 +6308,13 @@ class Mesh:
             if len(groups) != len(indices) // 3:
                 raise RuntimeError("groups must have the same length as indices / 3")
 
-        self.device = points.device
+        if not hasattr(points.device, "is_cpu"):
+            from ..runtime.host import get_device as _get_device
+
+            points_device_obj = _get_device(points.device)
+        else:
+            points_device_obj = points.device
+        self.device = points_device_obj
         self._points = points
         self._velocities = velocities
         self.indices = indices
@@ -6505,6 +6329,16 @@ class Mesh:
                 bvh_constructor = BvhConstructor.SAH
             else:
                 bvh_constructor = BvhConstructor.LBVH
+
+        # warp-metal: BVHs build host-side over shared storage on every
+        # device (runtime/bvh.py), so the cpu/device core split collapses;
+        # LBVH is a GPU-construction algorithm and warns back to SAH
+        if bvh_constructor == BvhConstructor.LBVH:
+            log_warning(
+                "LBVH constructor is not available for a warp-metal tree (host build). Falling back to SAH constructor.",
+                stacklevel=2,
+            )
+            bvh_constructor = BvhConstructor.SAH
 
         if not isinstance(bvh_constructor, BvhConstructor):
             bvh_constructor = BvhConstructor.from_str(bvh_constructor)
@@ -6524,37 +6358,22 @@ class Mesh:
             elif bvh_leaf_size < 1:
                 raise ValueError(f"bvh_leaf_size must be greater than or equal to 1, current value: {bvh_leaf_size}")
 
-        if self.device.is_cpu:
-            if bvh_constructor == BvhConstructor.LBVH:
-                log_warning(
-                    "LBVH constructor is not available for a CPU tree. Falling back to SAH constructor.", stacklevel=2
-                )
-                bvh_constructor = BvhConstructor.SAH
-
-            self.id = self.runtime.core.wp_mesh_create_host(
-                points.__ctype__(),
-                velocities.__ctype__() if velocities else array().__ctype__(),
-                indices.__ctype__(),
-                len(points),
-                int(indices.size // 3),
-                int(support_winding_number),
-                bvh_constructor,
-                ctypes.c_void_p(groups.ptr) if groups else ctypes.c_void_p(0),
-                bvh_leaf_size,
-            )
-        else:
-            self.id = self.runtime.core.wp_mesh_create_device(
-                self.device.context,
-                points.__ctype__(),
-                velocities.__ctype__() if velocities else array().__ctype__(),
-                indices.__ctype__(),
-                len(points),
-                int(indices.size // 3),
-                int(support_winding_number),
-                bvh_constructor,
-                ctypes.c_void_p(groups.ptr) if groups else ctypes.c_void_p(0),
-                bvh_leaf_size,
-            )
+        # warp-metal: keep the ORIGINAL array objects (runtime WarpArrays with
+        # real device buffers) — the host shim records them for the device
+        # mesh table (runtime/host.py _mesh_table_upload). Upstream passes
+        # __ctype__() views here; their .data field has no GPU address
+        # meaning on Metal.
+        self.id = self.runtime.core.wp_mesh_create_host(
+            points,
+            velocities if velocities else array().__ctype__(),
+            indices,
+            len(points),
+            int(indices.size // 3),
+            int(support_winding_number),
+            bvh_constructor,
+            ctypes.c_void_p(groups.ptr) if groups else ctypes.c_void_p(0),
+            bvh_leaf_size,
+        )
 
         if not self.id:
             raise RuntimeError(f"Failed to create mesh: {self.runtime.get_error_string()}")

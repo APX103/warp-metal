@@ -18,6 +18,13 @@ Components (KEP-0001 "库形态与组件边界"):
 
 import sys as _sys
 
+# Vendored codegen recurses per SSA line and per emitted statement; Newton's
+# convex-contact function chains (GJK support maps, deep @wp.func call
+# graphs) exceed CPython's default 1000-frame ceiling during Adjoint builds.
+# Upstream warp's emitter is shallower per call; mirror the effect of
+# upstream's wp.config.recursive_limit by raising the ceiling once here.
+_sys.setrecursionlimit(max(_sys.getrecursionlimit(), 10000))
+
 from .compat import (
     EXPECTED_VENDORED_WARP_VERSION,
     VendoredVersionError,
@@ -86,6 +93,9 @@ from .runtime.devices import (  # noqa: F401
     synchronize_device,    synchronize_stream,
     record_event,
     get_event_elapsed_time,
+    get_cuda_device_count,
+    get_cuda_devices,
+    get_devices,
     is_cuda_available,
     is_metal_available,
     is_mempool_enabled,
@@ -116,9 +126,12 @@ from .runtime.host import (  # noqa: F401
     copy,
     from_numpy,
     launch,
+    launch_tiled,
     synchronize,
     capture_begin,
     capture_end,
+    ScopedCapture,
+    ScopedTimer,
     capture_launch,
     capture_if,
     capture_while,
@@ -135,6 +148,12 @@ DeviceLike = Device | str | None  # noqa: F401
 from .frontend import context as _frontend_context  # noqa: F401
 from .frontend import config as config  # noqa: F401
 from .frontend import utils as utils  # noqa: F401
+from .frontend.utils import quat_between_vectors  # noqa: F401
+
+# public wp.array: runtime-backed constructor (vendored class stays as
+# frontend.types.array for the internal machinery); must come after both the
+# star import (annotations) and the runtime host import (zeros/from_numpy)
+from .runtime.host import array as array  # noqa: F401
 from .frontend import types as types  # noqa: F401  (upstream: wp.types.vector(...))
 from .frontend.config import DeterministicMode  # noqa: F401  (newton module_options)
 from .frontend.builtins import static as static  # noqa: F401  (upstream: plain identity fn, wp.static(expr))
@@ -208,6 +227,7 @@ __all__ = [
     "VendoredVersionError",
     "check_vendored_version",
     "install_as_warp",
+    "quat_between_vectors",
     # decorators + type machinery
     "kernel",
     "func",
@@ -247,6 +267,9 @@ __all__ = [
     "synchronize_stream",
     "record_event",
     "get_event_elapsed_time",
+    "get_cuda_device_count",
+    "get_cuda_devices",
+    "get_devices",
     "is_cuda_available",
     "is_metal_available",
     "is_mempool_enabled",
@@ -273,9 +296,12 @@ __all__ = [
     "copy",
     "from_numpy",
     "launch",
+    "launch_tiled",
     "synchronize",
     "capture_begin",
     "capture_end",
+    "ScopedCapture",
+    "ScopedTimer",
     "capture_launch",
     "capture_if",
     "capture_while",

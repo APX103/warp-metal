@@ -45,7 +45,10 @@ class TestMetalRuntime(unittest.TestCase):
         v = arr.numpy_view()
         self.assertEqual(v.shape, (4, 3))
         v[:] = 1.5
-        self.assertAlmostEqual(float(arr.numpy[0]), 1.5)
+        # .numpy is shaped like numpy_view for composite dtypes (real warp
+        # returns shaped host data)
+        self.assertEqual(arr.numpy.shape, (4, 3))
+        self.assertAlmostEqual(float(arr.numpy[0][0]), 1.5)
 
     def test_launch_copy_scale(self):
         n = 32

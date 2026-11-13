@@ -66,6 +66,14 @@ def _load() -> ctypes.CDLL:
                     ctypes.c_uint32,
                     ctypes.c_uint32,
                 ]
+                lib.wmm_dispatch_tiled.restype = ctypes.c_int
+                lib.wmm_dispatch_tiled.argtypes = [
+                    ctypes.c_void_p,
+                    ctypes.POINTER(ctypes.c_void_p),
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                ]
                 lib.wmm_synchronize.restype = None
                 lib.wmm_synchronize.argtypes = []
                 _LIB = lib
@@ -140,6 +148,14 @@ def pso_max_threads_per_group(pso_handle) -> int:
 def dispatch(pso_handle, buffer_handles, threads_x: int) -> None:
     arr = (ctypes.c_void_p * len(buffer_handles))(*buffer_handles)
     rc = _load().wmm_dispatch(pso_handle, arr, len(buffer_handles), threads_x)
+    if rc != 0:
+        raise MetalError(_load().wmm_last_error().decode())
+
+
+def dispatch_tiled(pso_handle, buffer_handles, threads_x: int, tg_x: int) -> None:
+    """Tiled dispatch with an exact threadgroup size (wp.launch_tiled)."""
+    arr = (ctypes.c_void_p * len(buffer_handles))(*buffer_handles)
+    rc = _load().wmm_dispatch_tiled(pso_handle, arr, len(buffer_handles), threads_x, tg_x)
     if rc != 0:
         raise MetalError(_load().wmm_last_error().decode())
 

@@ -27,6 +27,7 @@ _STRUCTS = """\
 struct vec2f { float x, y; };
 struct vec3f { float x, y, z; };
 struct vec4f { float x, y, z, w; };
+struct vec5f { float x, y, z, w, u; };  // vec_t<5> (Newton vec5 contact samples)
 struct quatf { float x, y, z, w; };  // imaginary xyz, real w (quat.h)
 struct mat22f { float c[2][2]; };    // c[row][col], row-major (mat.h data)
 struct mat33f { float c[3][3]; };
@@ -66,19 +67,9 @@ static inline wp_range wp_range_3(int start, int stop, int step) {
     r.i = start; return r;
 }
 
-// ---- wp.Mesh Phase-1 stub (KEP-0001: real mesh path is Phase 2, M2.1/M2.2)
-// The only Phase-1 mesh reference in the Newton closure is narrow-phase
-// vertex counting (points.shape[0]) under a `mesh_id != 0` guard. Phase 1
-// has no mesh registration (wp.Mesh construction fails loudly on the host),
-// so shape_source is all-zero and wp_mesh_get is provably never executed;
-// zero shapes keep the unreachable branch a no-op.
-struct wp_mesh_array_stub { int4 shape; };
-struct wp_mesh { wp_mesh_array_stub points; };
-static inline wp_mesh wp_mesh_get(uint64_t id) {
-    wp_mesh m = {};
-    (void)id;
-    return m;
-}
+// wp.untile: each thread holds its own tile element value in this lowering —
+// identity for every type
+template <typename T> static inline T wp_untile(T v) { return v; }
 
 // ---- array binding: host-side metadata + device data pointer ----
 // Mirrors warp native array_t (data/offset/shape/strides); strides are in
@@ -90,18 +81,39 @@ struct wp_arr_meta {
     int strides[4];
 };
 
+// wp.Mesh: real device data (points/indices) fetched from a per-launch mesh
+// table (`device wp_mesh* _wp_mesh_table`, host-built; see runtime/host.py).
+// Entry 0 is the null mesh; ids index the table directly.
+struct wp_mesh_array { device vec3f* data; wp_arr_meta m; };
+struct wp_mesh_array_i { device int* data; wp_arr_meta m; };
+struct wp_mesh { wp_mesh_array points; wp_mesh_array_i indices; };
+
+// tiled mesh AABB query (Newton tile_mesh_query_aabb): Phase-1 stub — the
+// query returns state=0 so the `while wp.tile_query_valid(query)` loop never
+// iterates (mesh-vs-convex mid phase pairs cannot exist without real BVH
+// queries, which arrive with M2.1/M2.2)
+struct wp_mesh_query_stub { int state; };
+static inline wp_mesh_query_stub wp_tile_mesh_query_aabb(uint64_t id, vec3f lo, vec3f hi) {
+    wp_mesh_query_stub q;
+    q.state = 0;
+    (void)id; (void)lo; (void)hi;
+    return q;
+}
+static inline bool wp_tile_query_valid(wp_mesh_query_stub q) { return q.state != 0; }
+static inline int wp_tile_mesh_query_aabb_next(wp_mesh_query_stub q) { (void)q; return -1; }
+
 // multi-dim tid decomposition (builtin.h launch_coord: last dim fastest)
-static inline void wp_tid2(thread int& i, thread int& j, int idx, constant wp_arr_meta& m) {
+static inline void wp_tid2(thread int& i, thread int& j, int idx, wp_arr_meta m) {
     j = idx % m.shape[1];
     i = idx / m.shape[1];
 }
-static inline void wp_tid3(thread int& i, thread int& j, thread int& k, int idx, constant wp_arr_meta& m) {
+static inline void wp_tid3(thread int& i, thread int& j, thread int& k, int idx, wp_arr_meta m) {
     k = idx % m.shape[2];
     idx /= m.shape[2];
     j = idx % m.shape[1];
     i = idx / m.shape[1];
 }
-static inline void wp_tid4(thread int& i, thread int& j, thread int& k, thread int& l, int idx, constant wp_arr_meta& m) {
+static inline void wp_tid4(thread int& i, thread int& j, thread int& k, thread int& l, int idx, wp_arr_meta m) {
     l = idx % m.shape[3];
     idx /= m.shape[3];
     k = idx % m.shape[2];
@@ -113,19 +125,19 @@ static inline void wp_tid4(thread int& i, thread int& j, thread int& k, thread i
 // ---- array addressing (warp native array.h index(): strides in BYTES,
 // byte_offset arithmetic through char*, negative indices wrap Python-style) ----
 template <typename T>
-static inline device T* wp_address(device T* data, constant wp_arr_meta& m, int i) {
+static inline device T* wp_address(device T* data, wp_arr_meta m, int i) {
     if (i < 0) i += m.shape[0];
     return (device T*)((device char*)data + (size_t)m.offset + (size_t)(i * m.strides[0]));
 }
 template <typename T>
-static inline device T* wp_address(device T* data, constant wp_arr_meta& m, int i, int j) {
+static inline device T* wp_address(device T* data, wp_arr_meta m, int i, int j) {
     if (i < 0) i += m.shape[0];
     if (j < 0) j += m.shape[1];
     return (device T*)((device char*)data + (size_t)m.offset
         + (size_t)(i * m.strides[0]) + (size_t)(j * m.strides[1]));
 }
 template <typename T>
-static inline device T* wp_address(device T* data, constant wp_arr_meta& m, int i, int j, int k) {
+static inline device T* wp_address(device T* data, wp_arr_meta m, int i, int j, int k) {
     if (i < 0) i += m.shape[0];
     if (j < 0) j += m.shape[1];
     if (k < 0) k += m.shape[2];
@@ -133,7 +145,7 @@ static inline device T* wp_address(device T* data, constant wp_arr_meta& m, int 
         + (size_t)(i * m.strides[0]) + (size_t)(j * m.strides[1]) + (size_t)(k * m.strides[2]));
 }
 template <typename T>
-static inline device T* wp_address(device T* data, constant wp_arr_meta& m, int i, int j, int k, int l) {
+static inline device T* wp_address(device T* data, wp_arr_meta m, int i, int j, int k, int l) {
     if (i < 0) i += m.shape[0];
     if (j < 0) j += m.shape[1];
     if (k < 0) k += m.shape[2];
@@ -142,7 +154,7 @@ static inline device T* wp_address(device T* data, constant wp_arr_meta& m, int 
         + (size_t)(i * m.strides[0]) + (size_t)(j * m.strides[1])
         + (size_t)(k * m.strides[2]) + (size_t)(l * m.strides[3]));
 }
-static inline int wp_extract_shape(constant wp_arr_meta& m, int i) { return m.shape[i]; }
+static inline int wp_extract_shape(wp_arr_meta m, int i) { return m.shape[i]; }
 """
 
 # ---------------------------------------------------------------------------
@@ -168,6 +180,9 @@ static inline spatial_vectorf make_spatial_vectorf(float wx, float wy, float wz,
 static inline vec2f make_vec2f(float x, float y) { vec2f v; v.x = x; v.y = y; return v; }
 static inline vec3f make_vec3f(float x, float y, float z) { vec3f v; v.x = x; v.y = y; v.z = z; return v; }
 static inline vec4f make_vec4f(float x, float y, float z, float w) { vec4f v; v.x = x; v.y = y; v.z = z; v.w = w; return v; }
+static inline vec5f make_vec5f(float x, float y, float z, float w, float u) { vec5f v; v.x = x; v.y = y; v.z = z; v.w = w; v.u = u; return v; }
+static inline vec5f make_vec5f(float s) { return make_vec5f(s, s, s, s, s); }
+static inline vec5f make_vec5f() { return make_vec5f(0.0f); }
 static inline quatf make_quatf(float x, float y, float z, float w) { quatf v; v.x = x; v.y = y; v.z = z; v.w = w; return v; }
 static inline quatf make_quatf(vec3f v, float w) { quatf q; q.x = v.x; q.y = v.y; q.z = v.z; q.w = w; return q; }  // quat.h quat_t(vec_t<3>, Type)
 // fill constructors: wp.vec3(s) (vec.h operator vec_t(Type s) broadcast)
@@ -222,6 +237,33 @@ static inline float wp_extract(vec3f v, int i) { return i == 0 ? v.x : (i == 1 ?
 static inline float wp_extract(vec4f v, int i) { return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : v.w)); }
 static inline float wp_extract(quatf q, int i) { return i == 0 ? q.x : (i == 1 ? q.y : (i == 2 ? q.z : q.w)); }
 static inline float wp_extract(transformf t, int i) { return i < 3 ? wp_extract(t.p, i) : wp_extract(t.q, i - 3); }
+static inline float wp_extract(spatial_vectorf s, int i) { return i < 3 ? wp_extract(s.w, i) : wp_extract(s.v, i - 3); }
+static inline float wp_extract(vec5f v, int i) {
+    return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : (i == 3 ? v.w : v.u)));
+}
+// register-vector element store (codegen "store" builtin: wp::store(v, i, x))
+static inline vec2f wp_vec_insert(vec2f v, int i, float x) { vec2f r = v; if (i == 0) r.x = x; else r.y = x; return r; }
+static inline vec3f wp_vec_insert(vec3f v, int i, float x) { vec3f r = v; if (i == 0) r.x = x; else if (i == 1) r.y = x; else r.z = x; return r; }
+static inline vec4f wp_vec_insert(vec4f v, int i, float x) { vec4f r = v; if (i == 0) r.x = x; else if (i == 1) r.y = x; else if (i == 2) r.z = x; else r.w = x; return r; }
+static inline vec5f wp_vec_insert(vec5f v, int i, float x) { vec5f r = v; if (i == 0) r.x = x; else if (i == 1) r.y = x; else if (i == 2) r.z = x; else if (i == 3) r.w = x; else r.u = x; return r; }
+static inline void wp_assign_inplace(thread vec5f& v, int i, float x) {
+    if (i < 0) i += 5;
+    if (i == 0) v.x = x; else if (i == 1) v.y = x; else if (i == 2) v.z = x; else if (i == 3) v.w = x; else v.u = x;
+}
+static inline quatf wp_vec_insert(quatf q, int i, float x) { quatf r = q; if (i == 0) r.x = x; else if (i == 1) r.y = x; else if (i == 2) r.z = x; else r.w = x; return r; }
+static inline vec2i wp_vec_insert(vec2i v, int i, int x) { vec2i r = v; if (i == 0) r.x = x; else r.y = x; return r; }
+static inline vec3i wp_vec_insert(vec3i v, int i, int x) { vec3i r = v; if (i == 0) r.x = x; else if (i == 1) r.y = x; else r.z = x; return r; }
+static inline vec4i wp_vec_insert(vec4i v, int i, int x) { vec4i r = v; if (i == 0) r.x = x; else if (i == 1) r.y = x; else if (i == 2) r.z = x; else r.w = x; return r; }
+static inline spatial_vectorf wp_vec_insert(spatial_vectorf s, int i, float x) {
+    spatial_vectorf r = s;
+    if (i < 3) { r.w = wp_vec_insert(r.w, i, x); } else { r.v = wp_vec_insert(r.v, i - 3, x); }
+    return r;
+}
+static inline transformf wp_vec_insert(transformf t, int i, float x) {
+    transformf r = t;
+    if (i < 3) { r.p = wp_vec_insert(r.p, i, x); } else { r.q = wp_vec_insert(r.q, i - 3, x); }
+    return r;
+}
 // rows of matrices (mat.h extract(mat, row))
 static inline vec2f wp_extract(mat22f m, int r) { return make_vec2f(m.c[r][0], m.c[r][1]); }
 static inline vec3f wp_extract(mat33f m, int r) { return make_vec3f(m.c[r][0], m.c[r][1], m.c[r][2]); }
@@ -254,6 +296,30 @@ static inline void wp_assign_inplace(thread mat44f& m, int i, float x) {
     if (i < 0) i += 16;
     m.c[i / 4][i % 4] = x;
 }
+// row assign (`m[i] = v` on fixed mats, matching the generic matNxM form)
+static inline void wp_assign_inplace(thread mat22f& m, int i, vec2f v) {
+    if (i < 0) i += 2;
+    m.c[i][0] = v.x; m.c[i][1] = v.y;
+}
+static inline void wp_assign_inplace(thread mat33f& m, int i, vec3f v) {
+    if (i < 0) i += 3;
+    m.c[i][0] = v.x; m.c[i][1] = v.y; m.c[i][2] = v.z;
+}
+static inline void wp_assign_inplace(thread mat44f& m, int i, vec4f v) {
+    if (i < 0) i += 4;
+    m.c[i][0] = v.x; m.c[i][1] = v.y; m.c[i][2] = v.z; m.c[i][3] = v.w;
+}
+
+// lvalue element access (wp::indexref lowering: `&v[i]` on plain structs,// which carry no operator[]); returns a thread reference so stores/loads
+// through the pointer alias hit the underlying variable
+static inline thread float& wp_vec_ref(thread vec2f& v, int i) { if (i < 0) i += 2; return i == 0 ? v.x : v.y; }
+static inline thread float& wp_vec_ref(thread vec3f& v, int i) { if (i < 0) i += 3; return i == 0 ? v.x : (i == 1 ? v.y : v.z); }
+static inline thread float& wp_vec_ref(thread vec4f& v, int i) { if (i < 0) i += 4; return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : v.w)); }
+static inline thread float& wp_vec_ref(thread vec5f& v, int i) { if (i < 0) i += 5; return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : (i == 3 ? v.w : v.u))); }
+static inline thread int& wp_vec_ref(thread vec2i& v, int i) { if (i < 0) i += 2; return i == 0 ? v.x : v.y; }
+static inline thread int& wp_vec_ref(thread vec3i& v, int i) { if (i < 0) i += 3; return i == 0 ? v.x : (i == 1 ? v.y : v.z); }
+static inline thread int& wp_vec_ref(thread vec4i& v, int i) { if (i < 0) i += 4; return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : v.w)); }
+static inline thread float& wp_vec_ref(thread quatf& q, int i) { if (i < 0) i += 4; return i == 0 ? q.x : (i == 1 ? q.y : (i == 2 ? q.z : q.w)); }
 
 // ---- componentwise operators (vec.h operator overloads) ----
 static inline vec2f operator+(vec2f a, vec2f b) { return make_vec2f(a.x+b.x, a.y+b.y); }
@@ -339,6 +405,13 @@ static inline vec3f wp_min(vec3f a, vec3f b) { return make_vec3f(min(a.x,b.x), m
 static inline vec3f wp_max(vec3f a, vec3f b) { return make_vec3f(max(a.x,b.x), max(a.y,b.y), max(a.z,b.z)); }
 static inline vec4f wp_min(vec4f a, vec4f b) { return make_vec4f(min(a.x,b.x), min(a.y,b.y), min(a.z,b.z), min(a.w,b.w)); }
 static inline vec4f wp_max(vec4f a, vec4f b) { return make_vec4f(max(a.x,b.x), max(a.y,b.y), max(a.z,b.z), max(a.w,b.w)); }
+// single-arg component reductions (wp.min(vec) / wp.max(vec))
+static inline float wp_min(vec2f a) { return min(a.x, a.y); }
+static inline float wp_min(vec3f a) { return min(min(a.x, a.y), a.z); }
+static inline float wp_min(vec4f a) { return min(min(a.x, a.y), min(a.z, a.w)); }
+static inline float wp_max(vec2f a) { return max(a.x, a.y); }
+static inline float wp_max(vec3f a) { return max(max(a.x, a.y), a.z); }
+static inline float wp_max(vec4f a) { return max(max(a.x, a.y), max(a.z, a.w)); }
 static inline vec2f wp_abs(vec2f a) { return make_vec2f(abs(a.x), abs(a.y)); }
 static inline vec3f wp_abs(vec3f a) { return make_vec3f(abs(a.x), abs(a.y), abs(a.z)); }
 static inline vec4f wp_abs(vec4f a) { return make_vec4f(abs(a.x), abs(a.y), abs(a.z), abs(a.w)); }
@@ -367,6 +440,10 @@ static inline vec4i wp_where(bool c, vec4i a, vec4i b) { return c ? a : b; }
 static inline uint wp_where(bool c, uint a, uint b) { return c ? a : b; }
 static inline uint64_t wp_where(bool c, uint64_t a, uint64_t b) { return c ? a : b; }
 static inline int64_t wp_where(bool c, int64_t a, int64_t b) { return c ? a : b; }
+// generic fallback: user structs (Vert_hash, ContactData_hash ...) phi-merge
+// through wp_where too — the template covers every type at once (exact
+// non-template overloads above win when present, same semantics)
+template <typename T> static inline T wp_where(bool c, T a, T b) { return c ? a : b; }
 """
 
 # quat assign_inplace needs care: quat is distinct type from vec4f.
@@ -673,6 +750,8 @@ static inline float wp_sin(float x) { return precise::sin(x); }     // align CPU
 static inline float wp_cos(float x) { return precise::cos(x); }
 static inline float wp_tan(float x) { return precise::tan(x); }
 static inline float wp_sqrt(float x) { return sqrt(x); }
+static inline float wp_log(float x) { return precise::log(x); }     // align CPU numeric path
+static inline float wp_exp(float x) { return precise::exp(x); }     // align CPU numeric path
 static inline bool wp_isfinite(float x) { return isfinite(x); }
 static inline bool wp_isfinite(int x) { return true; }
 static inline float wp_nan() { return NAN; }
@@ -737,6 +816,43 @@ static inline int wp_atomic_sub_ret(device atomic_int* addr, int value) {
 }
 static inline uint wp_atomic_sub_ret(device atomic_uint* addr, uint value) {
     return atomic_fetch_sub_explicit(addr, value, memory_order_relaxed);
+}
+// bitwise atomics (Newton uses or/and on mask/flag words; xor for parity)
+static inline void wp_atomic_or(device atomic_int* addr, int value) {
+    atomic_fetch_or_explicit(addr, value, memory_order_relaxed);
+}
+static inline void wp_atomic_or(device atomic_uint* addr, uint value) {
+    atomic_fetch_or_explicit(addr, value, memory_order_relaxed);
+}
+static inline int wp_atomic_or_ret(device atomic_int* addr, int value) {
+    return atomic_fetch_or_explicit(addr, value, memory_order_relaxed);
+}
+static inline uint wp_atomic_or_ret(device atomic_uint* addr, uint value) {
+    return atomic_fetch_or_explicit(addr, value, memory_order_relaxed);
+}
+static inline void wp_atomic_and(device atomic_int* addr, int value) {
+    atomic_fetch_and_explicit(addr, value, memory_order_relaxed);
+}
+static inline void wp_atomic_and(device atomic_uint* addr, uint value) {
+    atomic_fetch_and_explicit(addr, value, memory_order_relaxed);
+}
+static inline int wp_atomic_and_ret(device atomic_int* addr, int value) {
+    return atomic_fetch_and_explicit(addr, value, memory_order_relaxed);
+}
+static inline uint wp_atomic_and_ret(device atomic_uint* addr, uint value) {
+    return atomic_fetch_and_explicit(addr, value, memory_order_relaxed);
+}
+static inline void wp_atomic_xor(device atomic_int* addr, int value) {
+    atomic_fetch_xor_explicit(addr, value, memory_order_relaxed);
+}
+static inline void wp_atomic_xor(device atomic_uint* addr, uint value) {
+    atomic_fetch_xor_explicit(addr, value, memory_order_relaxed);
+}
+static inline int wp_atomic_xor_ret(device atomic_int* addr, int value) {
+    return atomic_fetch_xor_explicit(addr, value, memory_order_relaxed);
+}
+static inline uint wp_atomic_xor_ret(device atomic_uint* addr, uint value) {
+    return atomic_fetch_xor_explicit(addr, value, memory_order_relaxed);
 }
 static inline int wp_atomic_min_ret(device atomic_int* addr, int value) {
     int old = atomic_load_explicit(addr, memory_order_relaxed);
@@ -842,18 +958,18 @@ static inline int wp_atomic_cas_ret(device atomic_int* addr, int expected, int d
     atomic_compare_exchange_weak_explicit(addr, &expected, desired, memory_order_relaxed, memory_order_relaxed);
     return expected;
 }
-static inline uint64_t wp_atomic_cas_ret_at(device uint64_t* d, constant wp_arr_meta& m, int i, uint64_t expected, uint64_t desired) {
+static inline uint64_t wp_atomic_cas_ret_at(device uint64_t* d, wp_arr_meta m, int i, uint64_t expected, uint64_t desired) {
     return wp_atomic_cas_ret((device atomic_ulong*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), expected, desired);
 }
-static inline int wp_atomic_cas_ret_at(device int* d, constant wp_arr_meta& m, int i, int expected, int desired) {
+static inline int wp_atomic_cas_ret_at(device int* d, wp_arr_meta m, int i, int expected, int desired) {
     return wp_atomic_cas_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), expected, desired);
 }
-static inline uint64_t wp_atomic_max_ret_at(device uint64_t* d, constant wp_arr_meta& m, int i, uint64_t v) {
+static inline uint64_t wp_atomic_max_ret_at(device uint64_t* d, wp_arr_meta m, int i, uint64_t v) {
     device atomic_uint* halves = (device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
     wp_atomic_max_u64(halves, v);
     return wp_atomic_u64_load(halves);
 }
-static inline uint64_t wp_atomic_min_ret_at(device uint64_t* d, constant wp_arr_meta& m, int i, uint64_t v) {
+static inline uint64_t wp_atomic_min_ret_at(device uint64_t* d, wp_arr_meta m, int i, uint64_t v) {
     device atomic_uint* halves = (device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
     wp_atomic_min_u64(halves, v);
     return wp_atomic_u64_load(halves);
@@ -861,109 +977,145 @@ static inline uint64_t wp_atomic_min_ret_at(device uint64_t* d, constant wp_arr_
 // ---- wp_*_at: array-indexed atomic entry points (translator emits these) ----
 // exact-match overloads only: calling on an unsupported element type is a
 // compile error (fail loud), never a silent non-atomic path.
-static inline void wp_atomic_add_at(device float* d, constant wp_arr_meta& m, int i, float v) {
+static inline void wp_atomic_add_at(device float* d, wp_arr_meta m, int i, float v) {
     wp_atomic_add((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline void wp_atomic_add_at(device int* d, constant wp_arr_meta& m, int i, int v) {
+static inline void wp_atomic_or_at(device int* d, wp_arr_meta m, int i, int v) {
+    wp_atomic_or((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline void wp_atomic_or_at(device uint* d, wp_arr_meta m, int i, uint v) {
+    wp_atomic_or((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline int wp_atomic_or_ret_at(device int* d, wp_arr_meta m, int i, int v) {
+    return wp_atomic_or_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline uint wp_atomic_or_ret_at(device uint* d, wp_arr_meta m, int i, uint v) {
+    return wp_atomic_or_ret((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline void wp_atomic_and_at(device int* d, wp_arr_meta m, int i, int v) {
+    wp_atomic_and((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline void wp_atomic_and_at(device uint* d, wp_arr_meta m, int i, uint v) {
+    wp_atomic_and((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline int wp_atomic_and_ret_at(device int* d, wp_arr_meta m, int i, int v) {
+    return wp_atomic_and_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline uint wp_atomic_and_ret_at(device uint* d, wp_arr_meta m, int i, uint v) {
+    return wp_atomic_and_ret((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline void wp_atomic_xor_at(device int* d, wp_arr_meta m, int i, int v) {
+    wp_atomic_xor((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline void wp_atomic_xor_at(device uint* d, wp_arr_meta m, int i, uint v) {
+    wp_atomic_xor((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline int wp_atomic_xor_ret_at(device int* d, wp_arr_meta m, int i, int v) {
+    return wp_atomic_xor_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline uint wp_atomic_xor_ret_at(device uint* d, wp_arr_meta m, int i, uint v) {
+    return wp_atomic_xor_ret((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
+}
+static inline void wp_atomic_add_at(device int* d, wp_arr_meta m, int i, int v) {
     wp_atomic_add((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline void wp_atomic_add_at(device uint* d, constant wp_arr_meta& m, int i, uint v) {
+static inline void wp_atomic_add_at(device uint* d, wp_arr_meta m, int i, uint v) {
     wp_atomic_add((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline int wp_atomic_add_ret_at(device int* d, constant wp_arr_meta& m, int i, int v) {
+static inline int wp_atomic_add_ret_at(device int* d, wp_arr_meta m, int i, int v) {
     return wp_atomic_add_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline uint wp_atomic_add_ret_at(device uint* d, constant wp_arr_meta& m, int i, uint v) {
+static inline uint wp_atomic_add_ret_at(device uint* d, wp_arr_meta m, int i, uint v) {
     return wp_atomic_add_ret((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline void wp_atomic_sub_at(device int* d, constant wp_arr_meta& m, int i, int v) {
+static inline void wp_atomic_sub_at(device int* d, wp_arr_meta m, int i, int v) {
     wp_atomic_sub((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline void wp_atomic_sub_at(device uint* d, constant wp_arr_meta& m, int i, uint v) {
+static inline void wp_atomic_sub_at(device uint* d, wp_arr_meta m, int i, uint v) {
     wp_atomic_sub((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline void wp_atomic_min_at(device int* d, constant wp_arr_meta& m, int i, int v) {
+static inline void wp_atomic_min_at(device int* d, wp_arr_meta m, int i, int v) {
     wp_atomic_min((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline void wp_atomic_min_at(device uint* d, constant wp_arr_meta& m, int i, uint v) {
+static inline void wp_atomic_min_at(device uint* d, wp_arr_meta m, int i, uint v) {
     wp_atomic_min((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline void wp_atomic_min_at(device float* d, constant wp_arr_meta& m, int i, float v) {
+static inline void wp_atomic_min_at(device float* d, wp_arr_meta m, int i, float v) {
     wp_atomic_min((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline void wp_atomic_max_at(device int* d, constant wp_arr_meta& m, int i, int v) {
+static inline void wp_atomic_max_at(device int* d, wp_arr_meta m, int i, int v) {
     wp_atomic_max((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline void wp_atomic_max_at(device uint* d, constant wp_arr_meta& m, int i, uint v) {
+static inline void wp_atomic_max_at(device uint* d, wp_arr_meta m, int i, uint v) {
     wp_atomic_max((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline void wp_atomic_max_at(device float* d, constant wp_arr_meta& m, int i, float v) {
+static inline void wp_atomic_max_at(device float* d, wp_arr_meta m, int i, float v) {
     wp_atomic_max((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
 // 2D variants (array2d atomics)
-static inline void wp_atomic_add_at(device float* d, constant wp_arr_meta& m, int i, int j, float v) {
+static inline void wp_atomic_add_at(device float* d, wp_arr_meta m, int i, int j, float v) {
     wp_atomic_add((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
-static inline void wp_atomic_add_at(device int* d, constant wp_arr_meta& m, int i, int j, int v) {
+static inline void wp_atomic_add_at(device int* d, wp_arr_meta m, int i, int j, int v) {
     wp_atomic_add((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
-static inline void wp_atomic_min_at(device float* d, constant wp_arr_meta& m, int i, int j, float v) {
+static inline void wp_atomic_min_at(device float* d, wp_arr_meta m, int i, int j, float v) {
     wp_atomic_min((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
-static inline void wp_atomic_max_at(device float* d, constant wp_arr_meta& m, int i, int j, float v) {
+static inline void wp_atomic_max_at(device float* d, wp_arr_meta m, int i, int j, float v) {
     wp_atomic_max((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
 // _ret_at: captured-result atomics (upstream returns the old value)
-static inline float wp_atomic_add_ret_at(device float* d, constant wp_arr_meta& m, int i, float v) {
+static inline float wp_atomic_add_ret_at(device float* d, wp_arr_meta m, int i, float v) {
     return wp_atomic_add_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline int wp_atomic_sub_ret_at(device int* d, constant wp_arr_meta& m, int i, int v) {
+static inline int wp_atomic_sub_ret_at(device int* d, wp_arr_meta m, int i, int v) {
     return wp_atomic_sub_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline uint wp_atomic_sub_ret_at(device uint* d, constant wp_arr_meta& m, int i, uint v) {
+static inline uint wp_atomic_sub_ret_at(device uint* d, wp_arr_meta m, int i, uint v) {
     return wp_atomic_sub_ret((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline int wp_atomic_min_ret_at(device int* d, constant wp_arr_meta& m, int i, int v) {
+static inline int wp_atomic_min_ret_at(device int* d, wp_arr_meta m, int i, int v) {
     return wp_atomic_min_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline uint wp_atomic_min_ret_at(device uint* d, constant wp_arr_meta& m, int i, uint v) {
+static inline uint wp_atomic_min_ret_at(device uint* d, wp_arr_meta m, int i, uint v) {
     return wp_atomic_min_ret((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline float wp_atomic_min_ret_at(device float* d, constant wp_arr_meta& m, int i, float v) {
+static inline float wp_atomic_min_ret_at(device float* d, wp_arr_meta m, int i, float v) {
     return wp_atomic_min_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline int wp_atomic_max_ret_at(device int* d, constant wp_arr_meta& m, int i, int v) {
+static inline int wp_atomic_max_ret_at(device int* d, wp_arr_meta m, int i, int v) {
     return wp_atomic_max_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline uint wp_atomic_max_ret_at(device uint* d, constant wp_arr_meta& m, int i, uint v) {
+static inline uint wp_atomic_max_ret_at(device uint* d, wp_arr_meta m, int i, uint v) {
     return wp_atomic_max_ret((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
-static inline float wp_atomic_max_ret_at(device float* d, constant wp_arr_meta& m, int i, float v) {
+static inline float wp_atomic_max_ret_at(device float* d, wp_arr_meta m, int i, float v) {
     return wp_atomic_max_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
 // 2D _ret_at variants (array2d atomics, e.g. world extents reduction)
-static inline float wp_atomic_add_ret_at(device float* d, constant wp_arr_meta& m, int i, int j, float v) {
+static inline float wp_atomic_add_ret_at(device float* d, wp_arr_meta m, int i, int j, float v) {
     return wp_atomic_add_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
-static inline float wp_atomic_min_ret_at(device float* d, constant wp_arr_meta& m, int i, int j, float v) {
+static inline float wp_atomic_min_ret_at(device float* d, wp_arr_meta m, int i, int j, float v) {
     return wp_atomic_min_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
-static inline float wp_atomic_max_ret_at(device float* d, constant wp_arr_meta& m, int i, int j, float v) {
+static inline float wp_atomic_max_ret_at(device float* d, wp_arr_meta m, int i, int j, float v) {
     return wp_atomic_max_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
-static inline int wp_atomic_add_ret_at(device int* d, constant wp_arr_meta& m, int i, int j, int v) {
+static inline int wp_atomic_add_ret_at(device int* d, wp_arr_meta m, int i, int j, int v) {
     return wp_atomic_add_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
-static inline int wp_atomic_min_ret_at(device int* d, constant wp_arr_meta& m, int i, int j, int v) {
+static inline int wp_atomic_min_ret_at(device int* d, wp_arr_meta m, int i, int j, int v) {
     return wp_atomic_min_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
-static inline int wp_atomic_max_ret_at(device int* d, constant wp_arr_meta& m, int i, int j, int v) {
+static inline int wp_atomic_max_ret_at(device int* d, wp_arr_meta m, int i, int j, int v) {
     return wp_atomic_max_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
 
 // composite (spatial_vectorf) atomics: per-component fetch on the packed
 // 6-float layout (upstream lowers wp.atomic_add on vector dtypes the same way)
-static inline spatial_vectorf wp_atomic_add_ret_at(device spatial_vectorf* d, constant wp_arr_meta& m, int i, spatial_vectorf v) {
+static inline spatial_vectorf wp_atomic_add_ret_at(device spatial_vectorf* d, wp_arr_meta m, int i, spatial_vectorf v) {
     device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
     spatial_vectorf r;
     r.w.x = atomic_fetch_add_explicit((device atomic_float*)(base + 0), v.w.x, memory_order_relaxed);
@@ -974,7 +1126,7 @@ static inline spatial_vectorf wp_atomic_add_ret_at(device spatial_vectorf* d, co
     r.v.z = atomic_fetch_add_explicit((device atomic_float*)(base + 5), v.v.z, memory_order_relaxed);
     return r;
 }
-static inline spatial_vectorf wp_atomic_sub_ret_at(device spatial_vectorf* d, constant wp_arr_meta& m, int i, spatial_vectorf v) {
+static inline spatial_vectorf wp_atomic_sub_ret_at(device spatial_vectorf* d, wp_arr_meta m, int i, spatial_vectorf v) {
     device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
     spatial_vectorf r;
     r.w.x = atomic_fetch_sub_explicit((device atomic_float*)(base + 0), v.w.x, memory_order_relaxed);
@@ -1019,6 +1171,16 @@ static inline uint64_t wp_rshift(uint64_t a, uint64_t b) { return a >> b; }
 // ---- scalar sign / neg / div (builtin.h semantics) ----
 static inline float wp_sign(float x) { return x < 0.0f ? -1.0f : 1.0f; }  // upstream: -1 if x<0, else 1 (sign(0)=1)
 static inline int wp_sign(int x) { return x < 0 ? -1 : 1; }
+// rounding (metal_stdlib floor/ceil/round/trunc/step/pow resolve by name;
+// float-returning only — Newton wraps int() casts explicitly)
+static inline float wp_floor(float x) { return floor(x); }
+static inline float wp_ceil(float x) { return ceil(x); }
+static inline float wp_round(float x) { return round(x); }
+static inline float wp_trunc(float x) { return trunc(x); }
+static inline float wp_step(float x, float y) { return x < y ? 0.0f : 1.0f; }  // builtin.h: y < x ? 0 : 1
+static inline float wp_pow(float x, float y) { return pow(x, y); }
+static inline bool wp_isinf(float x) { return isinf(x) != 0; }
+static inline bool wp_isnan(float x) { return isnan(x) != 0; }
 static inline float wp_neg(float x) { return -x; }
 static inline int wp_neg(int x) { return -x; }
 static inline vec2f wp_neg(vec2f a) { return -a; }
@@ -1064,6 +1226,14 @@ static inline int wp_min(int a, int b) { return a < b ? a : b; }
 static inline int wp_max(int a, int b) { return a > b ? a : b; }
 static inline float wp_min(float a, float b) { return a < b ? a : b; }
 static inline float wp_max(float a, float b) { return a > b ? a : b; }
+// 32-bit unsigned (Newton contact_reduction float_flip returns wp.uint32)
+static inline uint wp_div(uint a, uint b) { return a / b; }
+static inline uint wp_add(uint a, uint b) { return a + b; }
+static inline uint wp_sub(uint a, uint b) { return a - b; }
+static inline uint wp_mul(uint a, uint b) { return a * b; }
+static inline uint wp_min(uint a, uint b) { return a < b ? a : b; }
+static inline uint wp_max(uint a, uint b) { return a > b ? a : b; }
+static inline uint wp_abs(uint a) { return a; }
 // 64-bit scalar arithmetic (warp supports int64/uint64 like int)
 static inline int64_t wp_add(int64_t a, int64_t b) { return a + b; }
 static inline int64_t wp_sub(int64_t a, int64_t b) { return a - b; }
@@ -1084,6 +1254,17 @@ static inline bool wp_isfinite(uint64_t x) { return true; }
 static inline float wp_dot(vec2f a, vec2f b) { return dot(a, b); }
 static inline float wp_dot(vec3f a, vec3f b) { return dot(a, b); }
 static inline float wp_dot(vec4f a, vec4f b) { return dot(a, b); }
+// outer products (mat.h outer(v, w): r[i][j] = v[i]*w[j], c[][] is row-major)
+static inline mat22f wp_outer(vec2f a, vec2f b) {
+    mat22f r;
+    for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) r.c[i][j] = wp_extract(a, i) * wp_extract(b, j);
+    return r;
+}
+static inline mat33f wp_outer(vec3f a, vec3f b) {
+    mat33f r;
+    for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) r.c[i][j] = wp_extract(a, i) * wp_extract(b, j);
+    return r;
+}
 static inline vec3f wp_cross(vec3f a, vec3f b) { return cross(a, b); }
 static inline float wp_length(vec2f a) { return length(a); }
 static inline float wp_length(vec3f a) { return length(a); }
@@ -1099,6 +1280,25 @@ static inline int wp_abs(int a) { return abs(a); }
 static inline vec2f wp_add(vec2f a, vec2f b) { return a + b; }
 static inline vec3f wp_add(vec3f a, vec3f b) { return a + b; }
 static inline vec4f wp_add(vec4f a, vec4f b) { return a + b; }
+// matrix element-wise add/sub (mat.h add(mat, mat) — e.g. inertia sums)
+static inline mat22f wp_add(mat22f a, mat22f b) {
+    mat22f r; for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) r.c[i][j] = a.c[i][j] + b.c[i][j]; return r;
+}
+static inline mat33f wp_add(mat33f a, mat33f b) {
+    mat33f r; for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) r.c[i][j] = a.c[i][j] + b.c[i][j]; return r;
+}
+static inline mat44f wp_add(mat44f a, mat44f b) {
+    mat44f r; for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) r.c[i][j] = a.c[i][j] + b.c[i][j]; return r;
+}
+static inline mat22f wp_sub(mat22f a, mat22f b) {
+    mat22f r; for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) r.c[i][j] = a.c[i][j] - b.c[i][j]; return r;
+}
+static inline mat33f wp_sub(mat33f a, mat33f b) {
+    mat33f r; for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) r.c[i][j] = a.c[i][j] - b.c[i][j]; return r;
+}
+static inline mat44f wp_sub(mat44f a, mat44f b) {
+    mat44f r; for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) r.c[i][j] = a.c[i][j] - b.c[i][j]; return r;
+}
 static inline vec2f wp_sub(vec2f a, vec2f b) { return a - b; }
 static inline vec3f wp_sub(vec3f a, vec3f b) { return a - b; }
 static inline vec4f wp_sub(vec4f a, vec4f b) { return a - b; }
@@ -1157,6 +1357,83 @@ static inline int wp_extract(int4 v, int i) {
 }
 """
 
+_BVH_OPS = """
+// ---- BVH (upstream warp/native/bvh.h layout; runtime/bvh.py builds it) ----
+// BVHPackedNodeHalf packs child/payload in i:31 + leaf flag in b:1; clang
+// lays the first declared bitfield member in the LOW bits, decoded here as
+// u & 0x7fffffff / u >> 31.
+struct wp_node_half_t { float x; float y; float z; uint u; };
+struct wp_bvh_t {
+    device wp_node_half_t* node_lowers;
+    device wp_node_half_t* node_uppers;
+    device int* node_parents;
+    device int* node_counts;
+    device int* primitive_indices;
+    device int* root;
+    device vec3f* item_lowers;
+    device vec3f* item_uppers;
+    device int* item_groups;
+    int max_depth;
+    int max_nodes;
+    int num_nodes;
+    int num_leaf_nodes;
+    int num_items;
+    int leaf_size;
+    int constructor_type;
+    int _pad0;
+    uint64_t context;
+};
+static inline wp_bvh_t wp_bvh_get(uint64_t id) { return *(device wp_bvh_t*)(id); }
+static inline int wp_bvh_get_leaf_group(const thread wp_bvh_t& bvh, int leaf) {
+    if (!bvh.item_groups) return 0;
+    return bvh.item_groups[bvh.primitive_indices[bvh.node_lowers[leaf].u & 0x7fffffffu]];
+}
+static inline int wp_bvh_lower_bound_group(const thread wp_bvh_t& bvh, int group) {
+    int lo = 0;
+    int hi = bvh.num_leaf_nodes;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (wp_bvh_get_leaf_group(bvh, mid) < group) lo = mid + 1; else hi = mid;
+    }
+    if (lo == bvh.num_leaf_nodes || wp_bvh_get_leaf_group(bvh, lo) != group) return -1;
+    return lo;
+}
+static inline int wp_bvh_upper_bound_group(const thread wp_bvh_t& bvh, int group) {
+    int lo = 0;
+    int hi = bvh.num_leaf_nodes;
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (wp_bvh_get_leaf_group(bvh, mid) <= group) lo = mid + 1; else hi = mid;
+    }
+    return lo;
+}
+static inline int wp_bvh_lca(device int* parent, int node_a, int node_b) {
+    int da = 0, db = 0;
+    for (int t = node_a; t != -1; t = parent[t]) ++da;
+    for (int t = node_b; t != -1; t = parent[t]) ++db;
+    if (da > db) {
+        int diff = da - db;
+        while (diff-- && node_a != -1) node_a = parent[node_a];
+    } else if (db > da) {
+        int diff = db - da;
+        while (diff-- && node_b != -1) node_b = parent[node_b];
+    }
+    while (node_a != node_b) {
+        if (node_a == -1 || node_b == -1) return -1;
+        node_a = parent[node_a];
+        node_b = parent[node_b];
+    }
+    return node_a;
+}
+static inline int wp_bvh_get_group_root(uint64_t id, int group_id) {
+    wp_bvh_t bvh = wp_bvh_get(id);
+    const int first = wp_bvh_lower_bound_group(bvh, group_id);
+    if (first < 0) return -1;
+    const int last = wp_bvh_upper_bound_group(bvh, group_id) - 1;
+    return wp_bvh_lca(bvh.node_parents, first, last);
+}
+"""
+
 _PRELUDE = (
     "#include <metal_stdlib>\n"
     "#include <metal_atomic>\n"
@@ -1173,6 +1450,8 @@ _PRELUDE = (
     + _QUAT_TRANSFORM_OPS
     + "\n"
     + _SCALAR_OPS
+    + "\n"
+    + _BVH_OPS
 )
 
 PRELUDE = _PRELUDE

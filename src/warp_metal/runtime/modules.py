@@ -50,18 +50,69 @@ class Module:
         self.kernels[kernel.key] = kernel
 
     def register_function(self, function, scope_locals=None, skip_adding_overload=False) -> None:
-        """Track a Function defined against this module (@wp.func).
+        """Track a Function defined against this module.
 
-        Overload semantics mirror upstream: functions sharing a key stack up
-        in insertion order; the most recently added overload is returned by
-        lookup so callers see the latest definition.
+        Overload semantics mirror upstream ``context.py`` exactly:
+
+        - functions from *different scopes* that share a key only replace the
+          module's top-level pointer — each keeps **private** overload
+          tables. This is what lets factory-composed generic functions
+          (Newton's ``shape_support`` / ``support_map`` chains) coexist: a
+          captured outer variant resolving a call to an inner variant must
+          find the inner variant's own template, never the outer one that is
+          currently building, or the build recurses forever.
+        - same-scope redefinition with an identical signature replaces the
+          top-level function and inherits the old tables (Python shadowing).
+        - different signatures become genuine overloads on the existing
+          function's tables.
         """
-        existing = self.functions.get(function.key)
-        if existing is not None and not skip_adding_overload:
-            existing.add_overload(function)
+        func_existing = None
+        if scope_locals is not None:
+            raw = getattr(function, "func", None)
+            obj = scope_locals.get(getattr(raw, "__name__", None))
+            if obj is not None and type(obj).__name__ == "Function":
+                func_existing = obj
+        self.functions[function.key] = func_existing or function
+        if func_existing is None:
+            return
+
+        from ..frontend.types import get_signature, is_generic_signature
+
+        sig = get_signature(
+            list(function.input_types.values()),
+            func_name=function.key,
+            arg_names=list(function.input_types.keys()),
+        )
+        sig_existing = get_signature(
+            list(func_existing.input_types.values()),
+            func_name=func_existing.key,
+            arg_names=list(func_existing.input_types.keys()),
+        )
+        if sig == sig_existing:
+            # same-scope redefinition with identical signature: the new
+            # function replaces the top-level one and inherits the old
+            # tables ("replace the top-level function, but keep existing
+            # overloads" upstream)
+            function.user_templates = dict(func_existing.user_templates)
+            if is_generic_signature(sig):
+                for k, v in func_existing.user_overloads.items():
+                    if getattr(v, "generic_parent", None) != func_existing:
+                        function.user_overloads[k] = v
+                function.user_templates[sig] = function
+            else:
+                function.user_overloads = dict(func_existing.user_overloads)
+                function.user_overloads[sig] = function
             self.functions[function.key] = function
-        else:
-            self.functions[function.key] = function
+        elif not skip_adding_overload:
+            # a generic overload replacing an existing generic purges the
+            # concrete specializations instantiated from the old one
+            if is_generic_signature(sig):
+                old_generic = func_existing.user_templates.get(sig)
+                if old_generic is not None:
+                    for k, v in list(func_existing.user_overloads.items()):
+                        if getattr(v, "generic_parent", None) == old_generic:
+                            del func_existing.user_overloads[k]
+            func_existing.add_overload(function)
 
 
 _MODULES: dict[str, Module] = {}
@@ -81,12 +132,24 @@ def _get_module(name: str, qualname: str | None = None) -> Module:
     return get_module(resolve_module_name(name, qualname))
 
 
+def _resolve_module_like(module):
+    """Accept a Module hub, a module name string, or a Python module object."""
+    if module is None or isinstance(module, Module) or isinstance(module, str):
+        return module
+    name = getattr(module, "__name__", None)
+    if isinstance(name, str):
+        return get_module(name)
+    return module
+
+
 def set_module_options(options: dict, module=None) -> None:
     """Set compilation options on a module (upstream-compatible signature).
 
-    ``module`` may be a :class:`Module`, a module name string, or ``None``
-    (sets the options on the calling Python module, mirroring upstream).
+    ``module`` may be a :class:`Module`, a module name string, a Python
+    module object, or ``None`` (sets the options on the calling Python
+    module, mirroring upstream).
     """
+    module = _resolve_module_like(module)
     if module is None:
         import inspect
 
@@ -100,6 +163,7 @@ def set_module_options(options: dict, module=None) -> None:
 
 def get_module_options(module) -> dict:
     """Return a copy of the module's compile options."""
+    module = _resolve_module_like(module)
     if isinstance(module, str):
         module = get_module(module)
     return dict(module.options)

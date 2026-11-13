@@ -61,7 +61,7 @@ _SCALAR_CTYPES = {
     "bool": "bool",
 }
 
-_VEC_SIZES = {2: "vec2f", 3: "vec3f", 4: "vec4f", 6: "spatial_vectorf"}
+_VEC_SIZES = {2: "vec2f", 3: "vec3f", 4: "vec4f", 5: "vec5f", 6: "spatial_vectorf"}
 _VECI_SIZES = {2: "vec2i", 3: "vec3i", 4: "vec4i"}
 _MAT_SIZES = {(2, 2): "mat22f", (3, 3): "mat33f", (4, 4): "mat44f"}
 
@@ -71,6 +71,12 @@ _RE_GEN_MAT = re.compile(r"^mat(\d+)x(\d+)f$")
 _RE_QUAT_T = re.compile(r"^wp::quat_t<wp::float32>$")
 _RE_TRANSFORM_T = re.compile(r"^wp::transform_t<wp::float32>$")
 _RE_ARRAY_T = re.compile(r"^wp::array_t<(.+)>$")
+# in-device wp.zeros(): a fixed-size stack array. Functions receiving one are
+# specialized with this param type; it lowers exactly like array_t — a
+# (device elem* data, wp_arr_meta meta) pair. The ALLOCATION itself (the
+# producing function's local) lowers to a per-thread arena slice; see the
+# fixedarray ctor hook in _BodyTranslator.stmt.
+_RE_FIXEDARRAY_T = re.compile(r"^wp::fixedarray_t<(\d+),\s*(.+)>$")
 
 
 def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
@@ -154,6 +160,8 @@ def msl_type(ctype: str) -> str:
         return "int4"  # loaded shape vectors index via wp_extract(int4, i)
     if ctype == "wp::Mesh":
         return "wp_mesh"  # Phase-1 stub (see prelude) — never executed
+    if ctype.startswith("wp::mesh_query"):
+        return "wp_mesh_query_stub"  # tiled AABB query handle stub (prelude)
     if ctype == "wp::spatial_vector_t<wp::float32>":
         return "spatial_vectorf"
     if m := _RE_ARRAY_T.match(ctype):
@@ -168,9 +176,26 @@ def msl_type(ctype: str) -> str:
     raise TranslationError(f"no MSL mapping for C++ type {ctype!r}")
 
 
+# sizeof an MSL elem type, for fixedarray arena accounting and view strides
+_ELEM_BYTES = {
+    "float": 4, "int": 4, "uint": 4, "uchar": 1, "char": 1, "bool": 1,
+    "uint64_t": 8, "int64_t": 8, "half": 2,
+    "vec2f": 8, "vec3f": 12, "vec4f": 16, "vec5f": 20,
+    "vec2i": 8, "vec3i": 12, "vec4i": 16,
+    "quatf": 16, "transformf": 28, "spatial_vectorf": 24,
+    "mat22f": 16, "mat33f": 36, "mat44f": 64,
+}
+
+
 def array_elem_msl(ctype: str) -> str:
-    """Elem MSL type of a ``wp::array_t<...>`` annotation (device pointer)."""
-    m = _RE_ARRAY_T.match(ctype.strip())
+    """Elem MSL type of a ``wp::array_t<...>`` / ``wp::fixedarray_t<...>``
+    annotation (device pointer)."""
+    ctype = ctype.strip()
+    m = _RE_ARRAY_T.match(ctype)
+    if not m:
+        m = _RE_FIXEDARRAY_T.match(ctype)
+        if m:
+            return msl_type(m.group(2))
     if not m:
         raise TranslationError(f"expected wp::array_t<...>, got {ctype!r}")
     return msl_type(m.group(1))
@@ -207,6 +232,8 @@ _CALL_TABLE = {
     "unot": "wp_unot",
     # rounding/trig/scalar
     "sqrt": "wp_sqrt",
+    "log": "wp_log",
+    "exp": "wp_exp",
     "sin": "wp_sin",
     "cos": "wp_cos",
     "tan": "wp_tan",
@@ -216,8 +243,17 @@ _CALL_TABLE = {
     "atan2": "wp_atan2",
     "isfinite": "wp_isfinite",
     "nan": "wp_nan",
+    "floor": "wp_floor",
+    "ceil": "wp_ceil",
+    "round": "wp_round",
+    "trunc": "wp_trunc",
+    "step": "wp_step",
+    "pow": "wp_pow",
+    "isinf": "wp_isinf",
+    "isnan": "wp_isnan",
     # vector
     "dot": "wp_dot",
+    "outer": "wp_outer",
     "cross": "wp_cross",
     "length": "wp_length",
     "length_sq": "wp_length_sq",
@@ -249,6 +285,11 @@ _CALL_TABLE = {
     # spatial
     "spatial_top": "wp_spatial_top",
     "spatial_bottom": "wp_spatial_bottom",
+    # tiled mesh AABB query (Phase-1 stubs, prelude — no meshes exist)
+    "tile_mesh_query_aabb": "wp_tile_mesh_query_aabb",
+    "tile_query_valid": "wp_tile_query_valid",
+    "tile_mesh_query_aabb_next": "wp_tile_mesh_query_aabb_next",
+    "untile": "wp_untile",
 }
 
 # scalar casts: wp::<scalar>(x) → ((T)(x))
@@ -268,6 +309,7 @@ _CTOR_TABLE = {
     "wp::vec_t<2, wp::float32>": "make_vec2f",
     "wp::vec_t<3, wp::float32>": "make_vec3f",
     "wp::vec_t<4, wp::float32>": "make_vec4f",
+    "wp::vec_t<5, wp::float32>": "make_vec5f",
     "wp::vec_t<6, wp::float32>": "make_spatial_vectorf",
     "wp::vec_t<2, wp::int32>": "make_vec2i",
     "wp::vec_t<3, wp::int32>": "make_vec3i",
@@ -350,6 +392,10 @@ class ArgSpec:
         # for kind == 'struct': [(field, elem ctype)] array fields split out
         # into their own buffer bindings (not part of the MSL struct value)
         self.array_fields = array_fields or []
+        # phi-materialized local binding (`a if c else b` over two arrays):
+        # the (data, meta) pair lives in locals `{name}_data` / `{name}_m`,
+        # not in the kernel's argument buffer
+        self.local = False
 
     @property
     def msl_elem(self) -> str:
@@ -380,6 +426,20 @@ class MSLFunction:
         self.ret_msl = ret_msl  # None → void
         self.params: list[Param] = []
         self.lines: list[str] = []
+        # tile-using function: takes a hidden trailing ``int _wp_lane``
+        # parameter plus one ``threadgroup elem* _wp_tile_shr_{k}`` per
+        # reduction slot (fn.params stays SSA-aligned; fn_src/_call_user add
+        # them). MSL forbids function-scope threadgroup storage in non-kernel
+        # functions, so the kernel owns the arrays and passes pointers.
+        self.needs_lane = False
+        self.shr_slots: list[tuple[int, str]] = []
+        # allocates wp::fixedarray_t stack arrays: takes a trailing
+        # `device uchar* _wp_arena` parameter (the kernel passes its own
+        # binding at every call site; kernel entry binds the arena buffer)
+        self.needs_arena = False
+        # reaches wp.mesh_get: takes a trailing `device wp_mesh*
+        # _wp_mesh_table` parameter (same call-site forwarding pattern)
+        self.needs_mesh = False
 
 
 class KernelUnit:
@@ -399,9 +459,38 @@ class KernelUnit:
         # argument buffer (Metal plain-buffer cap is 30)
         self.uses_argbuf = False
         self.device_bindings: list[tuple[str, str]] = []  # [(binding, elem msl)]
+        # tiled launch (wp.launch_tiled): threads-per-block the kernel was
+        # translated for, or None for plain 1-D launches. Parse-time tile
+        # shapes (vendored builtins read codegen.options["block_dim"]) and
+        # the emitted tid mapping both key off it.
+        self.block_dim: int | None = None
+        # [(elem msl, op msl)] per wp::tile_reduce site, in body order —
+        # kernel_src emits one threadgroup shared array per site
+        self.tile_reduces: list[tuple[str, str]] = []
+        # in-device wp.zeros() (wp::fixedarray_t) allocations: every site in
+        # the unit (kernel + all @wp.func bodies) claims a unique byte offset
+        # in the per-thread arena (`device uchar* _wp_arena`, bytes_per_thread
+        # × threads). Sites get disjoint static offsets, so nested live
+        # allocations (caller's buffer passed into a callee that allocates
+        # its own) can never overlap — unique-offset over-allocates vs true
+        # stack scoping but is always correct. kernel_src reads this to size
+        # the arena binding.
+        self.arena_next_off = 0
+        self.arena_bytes_per_thread = 0
+        # True when the kernel body or any transitively called @wp.func
+        # reaches wp.mesh_get: the kernel binds `device wp_mesh*
+        # _wp_mesh_table` (host-built mesh table; runtime/host.py) LAST
+        self.needs_mesh = False
 
     def source(self) -> str:
-        parts = ["// generated by warp-metal MSL translator (Adjoint SSA)\n", PRELUDE, "\n"]
+        parts = [
+            "// generated by warp-metal MSL translator (Adjoint SSA)\n",
+            PRELUDE,
+            "\n",
+            # zero meta bound by dead-branch struct-array element calls (see
+            # _call_user): never executed, keeps the reference param bindable
+            "constant wp_arr_meta _wp_dead_meta_g = {};\n\n",
+        ]
         for definition in self.structs.values():
             parts.append(definition + "\n")
         for fn in self.functions:
@@ -444,6 +533,18 @@ class KernelUnit:
             params.insert(0, f"    constant Args_{self.kernel.name}& _abuf [[buffer({idx})]]")
             idx += 1
         params.append(f"    constant Params_{self.kernel.name}& _wp_args [[buffer({idx})]]")
+        idx += 1
+        if self.arena_next_off > 0:
+            # in-device wp.zeros() (fixedarray) allocations: one per-thread
+            # arena slice. Every allocation site in the unit
+            # (kernel or @wp.func) holds a unique static offset.
+            self.arena_bytes_per_thread = (self.arena_next_off + 15) & ~15
+            params.append(f"    device uchar* _wp_arena [[buffer({idx})]]")
+            idx += 1
+        if self.needs_mesh:
+            # wp.mesh_get users read the host-built mesh table (last binding)
+            params.append(f"    device wp_mesh* _wp_mesh_table [[buffer({idx})]]")
+            idx += 1
         params.append("    uint3 _gid [[thread_position_in_grid]]")
         fields = []
         for a in self.args:
@@ -457,13 +558,22 @@ class KernelUnit:
                 fields.append(f"    wp_arr_meta {a.name}_m;")
         fields.append("    wp_arr_meta _dims;  // launch bounds for multi-dim tid")
         body = "\n".join(fn.lines) or "    ;"
+        # tiled launch support: one threadgroup shared array per tile_reduce
+        # site (function-scope threadgroup storage; sizes assume a
+        # power-of-two block_dim, enforced at launch)
+        preamble = "    const int _idx = (int)_gid.x;\n"
+        if self.block_dim is not None:
+            for k, (_elem, _combine) in enumerate(self.tile_reduces):
+                preamble += f"    threadgroup {_elem} _wp_tile_shr_{k}[{self.block_dim}];\n"
+            if self.tile_reduces:
+                preamble += f"    const int _wp_lane = _idx % {self.block_dim};\n"
         defines_text = "\n".join(defines) + "\n" if defines else ""
         return (
             self._argbuf_struct(use_argbuf) + "\n\n"
             + f"struct Params_{self.kernel.name} {{\n" + "\n".join(fields) + "\n};\n\n"
             + defines_text
             + f"kernel void {self.kernel.name}(\n" + ",\n".join(params) + ")\n{\n"
-            + "    const int _idx = (int)_gid.x;\n"
+            + preamble
             + body
             + "\n}\n"
         )
@@ -500,7 +610,7 @@ def fn_src(fn: MSLFunction) -> str:
     for p in fn.params:
         if p.kind == "array":
             params.append(f"    device {p.msl}* {p.name}_data")
-            params.append(f"    constant wp_arr_meta& {p.name}_m")
+            params.append(f"    wp_arr_meta {p.name}_m")
         elif p.kind == "ref":
             params.append(f"    thread {p.msl}& {p.name}")
         elif p.kind == "struct" and p.array_fields:
@@ -510,12 +620,21 @@ def fn_src(fn: MSLFunction) -> str:
             params.append(f"    {p.msl} {p.name}")
             for field, elem_ctype in p.array_fields:
                 params.append(f"    device {msl_type(elem_ctype)}* {p.name}__{field}_data")
-                params.append(f"    constant wp_arr_meta& {p.name}__{field}_m")
+                params.append(f"    wp_arr_meta {p.name}__{field}_m")
         else:
             params.append(f"    {p.msl} {p.name}")
     body = "\n".join(fn.lines) or "    ;"
     ret = "void" if fn.ret_msl is None else fn.ret_msl
-    return f"static {ret} {fn.name}(\n" + ",\n".join(params) + ")\n{\n" + body + "\n}\n"
+    params_text = ",\n".join(params)
+    if fn.needs_lane:
+        params_text += ",\n    int _wp_lane"
+        for k, elem in fn.shr_slots:
+            params_text += f",\n    threadgroup {elem}* _wp_tile_shr_{k}"
+    if fn.needs_arena:
+        params_text += ",\n    device uchar* _wp_arena"
+    if fn.needs_mesh:
+        params_text += ",\n    device wp_mesh* _wp_mesh_table"
+    return f"static {ret} {fn.name}(\n{params_text})\n" + "{\n" + body + "\n}\n"
 
 
 # ---------------------------------------------------------------------------
@@ -534,28 +653,94 @@ class _BodyTranslator:
         self.array_args = array_args
         self.user_funcs = user_funcs  # native name -> translation (param kinds)
         self.aliases: dict[str, tuple[bool, str]] = {}  # var -> (is_pointer, value expr)
+        # threadgroup slots this body uses, [(k, elem msl, combine)] — the
+        # kernel preamble / function preamble declare each slot's shared
+        # array in its own function scope
+        self.used_shr: list[tuple[int, str, str]] = []
         # `wp::Any var_N;` decls (wp.static temps) — typed at first assignment
         self.deferred_any: set[str] = set()
+        # tiled kernels: SSA tile var -> element msl type (tile_register_t /
+        # tile_shared_t vars are element-typed per-thread values here); and
+        # compile-time SSA constants (const var = literal) for tile_extract [0]
+        self.tile_vars: dict[str, str] = {}
+        self.const_vars: dict[str, str] = {}
+        self._shr_index = 0  # threadgroup shared-array slot per tile_reduce site
+        # SSA vars holding a loaded wp_mesh points stub (dead mesh branch —
+        # see _alias / the wp::load branch)
+        self.mesh_stub_vars: set[str] = set()
+        # set when a dead-branch struct call bound "_wp_dead_meta": the
+        # enclosing body then needs the zero-meta lvalue declared
+        self.dead_meta_emitted = False
+        # this body allocates wp::fixedarray_t stack arrays (needs the
+        # `_wp_arena` parameter threaded through)
+        self.used_arena = False
+        # a callee needs the arena: this body must take the parameter too so
+        # it can forward it (transitive propagation, like needs_lane)
+        self.callee_needs_arena = False
+        # a callee needs the lane + threadgroup arrays: merge its slots into
+        # used_shr so this body's signature forwards them transitively
+        self.callee_needs_lane = False
+        # this body reads wp.mesh_get (needs the `_wp_mesh_table` binding)
+        self.used_mesh = False
+        # a callee reaches wp.mesh_get: forward the table binding transitively
+        self.callee_needs_mesh = False
+        # SSA vars holding a wp.Mesh value (mesh_get results and their value
+        # copies): their `.points`/`.indices` members bind as real arrays
+        self.mesh_vars: set[str] = set()
+        # function-scope decls for local array bindings (fixedarray arena
+        # slices, wp.array views, where-phi merges): the SSA declares every
+        # var at function scope, but these materialize at their ASSIGN site —
+        # often inside a branch — so the decls hoist to the top and sites
+        # emit plain assignments (keeps downstream phis in scope)
+        self.hoisted: list[str] = []
 
     def _meta_ref(self, spec: ArgSpec) -> str:
         """wp_arr_meta reference for an array arg in the current scope."""
+        if getattr(spec, "local", False):
+            return f"{spec.name}_m"
+        mm = getattr(spec, "mesh_member", None)
+        if mm is not None:
+            # real wp.Mesh member array: meta lives inside the mesh struct
+            return f"({mm[0]}.{mm[1]}.m)"
         if self.scope == "kernel":
             return f"_wp_args.{spec.name}_m"
-        return f"{spec.name}_m"  # fn_src emits `constant wp_arr_meta& {name}_m`
+        return f"{spec.name}_m"  # fn_src emits a by-value `wp_arr_meta {name}_m`
+
+    def _data_expr(self, spec: ArgSpec) -> str:
+        """Device data-pointer expression for an array binding."""
+        mm = getattr(spec, "mesh_member", None)
+        if mm is not None:
+            return f"{mm[0]}.{mm[1]}.data"
+        return f"{spec.name}_data"
 
     # -- expressions ---------------------------------------------------------
 
     def expr(self, src: str) -> str:
         src = src.strip()
+        if "builtin_block_dim()" in src:
+            # wp.block_dim() folds to the tiled launch's compile-time size
+            if self.unit.block_dim is None:
+                raise TranslationError("wp.block_dim() outside a tiled launch")
+            src = src.replace("builtin_block_dim()", str(self.unit.block_dim))
         m = re.match(r"^builtin_tid([1234])d\s*\((.*)\)$", src)
         if m:
             tid_src = self._builtin_tid(m.group(1), m.group(2))
             return tid_src
         if src in self.array_args:
             # array used as a value (phi merges of `if arr:` blocks, bool
-            # contexts): upstream tests array_t's non-null data pointer, and
-            # warp-metal always binds a real buffer → statically true
-            return "true"
+            # contexts): upstream tests array_t's non-null data pointer;
+            # warp-metal binds a real buffer even for None args, so read
+            # the meta's ndim (0 only for a null binding)
+            spec = self.array_args[src]
+            return f"({self._meta_ref(spec)}.ndim != 0)"
+        m_ptr = re.match(r"^(\w+)\.ptr$", src)
+        if m_ptr and m_ptr.group(1) in self.array_args:
+            # .ptr on an array binding: the raw device address. Local stack
+            # arrays / views carry it in `{name}_data`; bound kernel arrays
+            # have the same shape (their binding is the buffer pointer), and
+            # ref-copy aliases share the original spec's name (same address).
+            spec = self.array_args[m_ptr.group(1)]
+            return f"((uint64_t)((device char*){self._data_expr(spec)}))"
         # value aliases (`&(x).field`, array-truthiness temps) resolve inline
         alias = self.aliases.get(src)
         if alias is not None:
@@ -590,12 +775,82 @@ class _BodyTranslator:
 
     def _builtin_tid(self, n: str, arg_src: str) -> str:
         args = split_args(arg_src) if arg_src.strip() else []
+        if self.unit.block_dim is not None:
+            # tiled launch: the grid is dim*block_dim threads in
+            # block_dim-sized threadgroups. `wp.tid()` is the flattened
+            # GLOBAL thread index (upstream semantics) — kernels either use
+            # it directly or partition manually via wp.block_dim() math.
+            # The 2-D form maps (block, lane) for launch_tiled-style kernels.
+            if n == "1":
+                if args:
+                    raise TranslationError("builtin_tid1d takes no args")
+                return "_idx"
+            if n == "2" and len(args) == 2:
+                bd = self.unit.block_dim
+                return f"{args[0]} = _idx / {bd}; {args[1]} = _idx % {bd};"
+            raise TranslationError(f"builtin_tid{n}d is not supported in tiled launches")
         if n == "1":
             if args:
                 raise TranslationError("builtin_tid1d takes no args")
             return "_idx"
         out = ", ".join(a.strip() for a in args)
         return f"wp_tid{n}({out}, _idx, _wp_args._dims)"
+
+    def _tile_reduce(self, target: str, rhs: str) -> list[str]:
+        """Lower `target = wp::tile_reduce(op, tile_var);` to a threadgroup
+        tree reduction over a kernel-scope shared array.
+
+        Every thread in the block participates: each writes its element, then
+        a log2(block_dim) barriered pairwise fold leaves the result at [0]
+        for all threads to read. Requires uniform control flow around the
+        call (true for every tile_reduce in the Newton closure) and a
+        power-of-two block_dim (validated at launch).
+        """
+        open_paren = rhs.index("(")
+        close = _find_balanced(rhs, open_paren)
+        parts = split_args(rhs[open_paren + 1 : close])
+        # convenience forms carry the op in the name: tile_sum/min/max(var);
+        # tile_reduce takes the operator as its first argument
+        m_conv = re.match(r"^wp::tile_(sum|min|max)\(", rhs)
+        if m_conv:
+            if len(parts) != 1:
+                raise TranslationError(f"{rhs.split('(')[0]} with {len(parts)} args (axis form is outside the closure)")
+            src = parts[0].strip()
+            op_name = m_conv.group(1)
+            combine = {"sum": "+", "min": "wp_min", "max": "wp_max"}[op_name]
+        else:
+            if len(parts) != 2:
+                raise TranslationError(f"tile_reduce with {len(parts)} args (axis form is outside the closure)")
+            op, src = parts[0].strip(), parts[1].strip()
+            op_msl = _CALL_TABLE.get(op[4:] if op.startswith("wp::") else op)
+            if op_msl not in ("wp_min", "wp_max", "wp_bit_or"):
+                raise TranslationError(f"tile_reduce operator {op!r} is outside the closure (min/max/bit_or only)")
+            combine = {"wp_min": "wp_min", "wp_max": "wp_max", "wp_bit_or": "|"}[op_msl]
+        elem = self.tile_vars.get(src)
+        if elem is None:
+            raise TranslationError(f"tile_reduce source {src!r} is not a tile variable")
+        if self.unit.block_dim is None:
+            raise TranslationError("wp::tile_reduce outside a tiled launch")
+        k = len(self.unit.tile_reduces)  # unit-global slot (kernel + @wp.func sites share the numbering)
+        self.unit.tile_reduces.append((elem, combine))
+        self.used_shr.append((k, elem, combine))
+        bd = self.unit.block_dim
+        shr_lhs = f"_wp_tile_shr_{k}[_wp_lane]"
+        shr_rhs = f"_wp_tile_shr_{k}[_wp_lane + _wp_s]"
+        combined = (
+            f"({shr_lhs} {combine} {shr_rhs})" if combine in ("+", "|") else f"{combine}({shr_lhs}, {shr_rhs})"
+        )
+        return [
+            f"_wp_tile_shr_{k}[_wp_lane] = {src};",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"for (int _wp_s = {bd} >> 1; _wp_s > 0; _wp_s >>= 1) {{",
+            f"    if (_wp_lane < _wp_s) {{",
+            f"        {shr_lhs} = {combined};",
+            "    }",
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "}",
+            f"{target} = _wp_tile_shr_{k}[0];",
+        ]
 
     def _call(self, src: str) -> str:
         m = re.match(r"^(wp::[A-Za-z_]\w*(?:<[^()]*>)?)\(", src)
@@ -629,6 +884,19 @@ class _BodyTranslator:
             return f"make_{msl_t}({', '.join(self.expr(a) for a in args)})"
         if key == "wp::copy":
             return self.expr(args[0])
+        if key == "wp::store":
+            if len(args) == 2:
+                # store through an element pointer (wp::indexref result or a
+                # wp::address into an array): `wp::store(p, v)` → *p = v
+                tgt = args[0].strip()
+                alias = self.aliases.get(tgt)
+                if alias is None or not alias[0]:
+                    raise TranslationError(f"wp::store target {tgt!r} is not a pointer alias")
+                return f"(*({alias[1]}) = {self.expr(args[1])})"
+            # register-vector element store: `wp::store(v, i, x);` (array
+            # stores go through wp::array_store, which binds via data+meta)
+            tgt = args[0].strip()
+            return f"({tgt} = wp_vec_insert({tgt}, {self.expr(args[1])}, {self.expr(args[2])}))"
         if key == "wp::load":
             return self._load(args[0])
         if key == "wp::address":
@@ -649,11 +917,37 @@ class _BodyTranslator:
             # The generated line keeps a marker so the elision stays visible.
             return "/* wp.print elided (Metal) */ 0"
         if key == "wp::mesh_get":
-            # Phase-1 stub (see prelude): returns a zeroed wp_mesh. Provable
-            # no-op — mesh registration doesn't exist in Phase 1, so every
-            # caller is guarded by mesh_id != 0.
-            return "wp_mesh_get(" + self.expr(args[0]) + ")"
-        if key in ("wp::bvh_get_group_root", "wp::hash_grid_query", "wp::mesh_query"):
+            # real wp.Mesh: read the mesh entry from the per-launch mesh
+            # table (`device wp_mesh* _wp_mesh_table`, host-built — see
+            # runtime/host.py; the kernel takes the binding when its call
+            # graph reaches wp::mesh_get). ids index the table directly
+            # (entry 0 is the null mesh); upstream reads mesh_array[id]
+            # unguarded the same way.
+            self.used_mesh = True
+            return f"_wp_mesh_table[{self.expr(args[0])}]"
+        if key == "wp::tile_extract":
+            # extract [0] from a reduced shape-(1,) tile: the shared var the
+            # reduction lowered to already holds element 0 for every thread.
+            # A non-constant or nonzero index is outside the closure (the
+            # upstream tile has shape (1,), so only [0] is in-bounds anyway).
+            idx_var = args[1].strip()
+            idx = self.const_vars.get(idx_var)
+            if idx != "0":
+                raise TranslationError(
+                    f"wp::tile_extract index {idx_var!r} is not the compile-time constant 0 (outside the closure)"
+                )
+            return self.expr(args[0])
+        if key == "wp::block_dim":
+            # wp::block_dim() folds to the tiled launch's compile-time size
+            if self.unit.block_dim is None:
+                raise TranslationError("wp::block_dim() outside a tiled launch")
+            return str(self.unit.block_dim)
+        if key == "wp::bvh_get_group_root":
+            # BVH host build lives in runtime/bvh.py (upstream bvh.cpp port,
+            # same device struct layout — see prelude); group-root traversal
+            # is ported to MSL there
+            return "wp_bvh_get_group_root(" + ", ".join(self.expr(a) for a in args) + ")"
+        if key in ("wp::hash_grid_query", "wp::mesh_query"):
             raise TranslationError(
                 f"{key}: BVH/Mesh device builtins are Phase 2 (KEP-0001); not available in M1.4"
             )
@@ -698,10 +992,17 @@ class _BodyTranslator:
         if m := _RE_IF_OPEN.match(line):
             cond = m.group(1).strip()
             # array truthiness (`if arr:` — upstream emits `if (array_var)`
-            # via array_t's non-null data check; warp-metal always binds a
-            # real device buffer, so the check is statically true)
-            if cond in self.array_args:
-                return ["if (true) {"]
+            # via array_t's non-null data check; warp-metal binds a real
+            # buffer even for None args, so truthiness reads the meta's
+            # ndim — 0 only for a null (None) array binding; the `!` form
+            # (upstream's else-branch lowering) negates it)
+            bare = cond[1:].strip() if cond.startswith("!") else cond
+            if bare in self.array_args:
+                spec = self.array_args[bare]
+                test = f"{self._meta_ref(spec)}.ndim != 0"
+                if cond.startswith("!"):
+                    test = f"!({test})"
+                return [f"if ({test}) {{"]
             return [f"if ({self.expr(m.group(1))}) {{"]
         if _RE_ELSE.match(line):
             return ["} else {"]
@@ -709,6 +1010,21 @@ class _BodyTranslator:
             return ["}"]
         if m := _RE_RETURN.match(line):
             return [f"return {self.expr(m.group(1))};".replace("return ;", "return;")]
+
+        # tile value decls (`wp::tile_register_t<T, layout> var_N = ...{};` /
+        # `wp::tile_shared_t<T, layout, B> var_N = wp::tile_alloc_empty<...>();`):
+        # the tile is a per-thread element value in this lowering — remember
+        # the element type and drop the decl (assigned before every read)
+        m = re.match(
+            r"^\s*(?:const\s+)?wp::tile_(?:register|shared)_t<([A-Za-z0-9_:<>,\s]+)>\s+(\w+)\s*=\s*.*?;\s*$",
+            line,
+        )
+        if m:
+            elem = msl_type(split_args(m.group(1))[0])
+            self.tile_vars[m.group(2)] = elem
+            # kept as an ordinary element-typed var: register tiles lower to
+            # the thread's own value, shared tiles to the reduction result
+            return [f"{elem} {m.group(2)} = {{}};"]
 
         # plain assignment `name = expr;` (targets may be struct members:
         # `var_contact_data.field = ...`) — must be tried before the decl
@@ -719,6 +1035,19 @@ class _BodyTranslator:
             if rhs.startswith("wp::address(") or rhs.startswith("&("):
                 self._alias(target, rhs)
                 return []  # alias collapsed: no MSL line, no decl (pointer decl was dropped)
+            if rhs.startswith("wp::indexref("):
+                # `p = wp::indexref(base, idx);` — pointer to element idx of
+                # a vector VALUE the base aliases (SSA form of `v[i] = x`
+                # through a `&((struct).vecfield)` alias); consumed by the
+                # 2-arg wp::store / wp::load
+                iargs = split_args(rhs[len("wp::indexref(") : -1])
+                base = iargs[0].strip()
+                alias = self.aliases.get(base)
+                if alias is None or alias[0]:
+                    raise TranslationError(f"wp::indexref base {base!r} is not a value alias")
+                idx_src = self.expr(iargs[1])
+                self.aliases[target] = (True, f"(&wp_vec_ref({alias[1]}, {idx_src}))")
+                return []
             if rhs.startswith("wp::load("):
                 spec = self._resolve_array_load(rhs)
                 if spec is not None:
@@ -734,11 +1063,159 @@ class _BodyTranslator:
                 # the data pointer, always bound here).
                 self.array_args[target] = self.array_args[rhs]
                 return []
+            m_copy = re.match(r"^wp::copy\((\w+)\)$", rhs)
+            if m_copy and m_copy.group(1) in self.array_args:
+                # `t = wp::copy(arr);` — array ref copy (the SSA materializes
+                # struct-field arrays through &field → wp::load → wp::copy
+                # chains, e.g. `edges = provider.support_neighbors`)
+                self.array_args[target] = self.array_args[m_copy.group(1)]
+                return []
+            m_where = re.match(r"^wp::where\((.*)\)$", rhs)
+            if m_where:
+                wargs = split_args(m_where.group(1))
+                if (
+                    len(wargs) == 3
+                    and wargs[1].strip() in self.array_args
+                    and wargs[2].strip() in self.array_args
+                ):
+                    # phi select between two array bindings
+                    # (`arr_a if cond else arr_b`): materialize a local
+                    # (data, meta) pair the downstream wp::address reads
+                    cond = self.expr(wargs[0])
+                    sa = self.array_args[wargs[1].strip()]
+                    sb = self.array_args[wargs[2].strip()]
+                    spec = ArgSpec(target, "array", sa.ctype)
+                    spec.local = True
+                    self.array_args[target] = spec
+                    elem = array_elem_msl(sa.ctype)
+                    self.hoisted.extend([
+                        f"wp_arr_meta {target}_m = {{}};",
+                        f"device {elem}* {target}_data = (device {elem}*)0;",
+                    ])
+                    return [
+                        f"{target}_m = {self._meta_ref(sa)};",
+                        f"{target}_data = {sa.name}_data;",
+                        f"if (!({cond})) {{ {target}_m = {self._meta_ref(sb)}; {target}_data = {sb.name}_data; }}",
+                    ]
+            if rhs.startswith("wp::fixedarray_t<"):
+                # in-device wp.zeros(shape=(N,), dtype=T): a fixed-size stack
+                # array. Lowered to a slice of the per-thread arena (each site
+                # has a unique static byte offset, so nested live allocations
+                # can't collide) plus a zero-fill and a local (data, meta)
+                # binding — see KernelUnit.arena_next_off.
+                open_p = rhs.index("(")
+                m_fa = re.match(r"^wp::fixedarray_t<(\d+),\s*(.+?)>$", rhs[:open_p].strip())
+                if not m_fa:
+                    raise TranslationError(f"cannot parse fixedarray ctor {rhs!r}")
+                n, dtype_ctype = int(m_fa.group(1)), m_fa.group(2).strip()
+                close = _find_balanced(rhs, open_p)
+                if rhs[close + 1 :].strip() or len(split_args(rhs[open_p + 1 : close])) > 1:
+                    raise TranslationError(f"fixedarray ctor with unexpected args: {rhs!r}")
+                elem = msl_type(dtype_ctype)
+                ebytes = _ELEM_BYTES.get(elem)
+                if ebytes is None:
+                    raise TranslationError(f"no _ELEM_BYTES entry for {elem!r} ({rhs!r})")
+                spec = ArgSpec(target, "array", f"wp::array_t<{dtype_ctype}>")
+                spec.local = True
+                self.array_args[target] = spec
+                self.used_arena = True
+                off = self.unit.arena_next_off
+                self.unit.arena_next_off += (n * ebytes + 15) & ~15
+                self.hoisted.extend([
+                    f"wp_arr_meta {target}_m = {{}};",
+                    f"device {elem}* {target}_data = (device {elem}*)0;",
+                ])
+                return [
+                    f"{target}_data = (device {elem}*)(_wp_arena + {off});",
+                    f"{target}_m.offset = 0; {target}_m.ndim = 1;",
+                    f"{target}_m.shape[0] = {n}; {target}_m.shape[1] = 0; {target}_m.shape[2] = 0; {target}_m.shape[3] = 0;",
+                    f"{target}_m.strides[0] = {ebytes}; {target}_m.strides[1] = 0; {target}_m.strides[2] = 0; {target}_m.strides[3] = 0;",
+                    f"{{ {elem} _wp_z = {{}}; for (int _wp_i = 0; _wp_i < {n}; ++_wp_i) {{ {target}_data[_wp_i] = _wp_z; }} }}",
+                ]
+            if rhs.startswith("wp::array_t<"):
+                # `v = wp.array(ptr=..., shape=..., dtype=T)`: a view over an
+                # existing device address. The SSA passes the address as an
+                # integer value (via .data pointer loads, see the .ptr expr
+                # hook) plus shape scalars; lower to a local (data, meta)
+                # pair with byte strides.
+                open_p = rhs.index("(")
+                m_at = re.match(r"^wp::array_t<(.+)>$", rhs[:open_p].strip())
+                if not m_at:
+                    raise TranslationError(f"cannot parse array_t ctor {rhs!r}")
+                dtype_ctype = m_at.group(1).strip()
+                close = _find_balanced(rhs, open_p)
+                cargs = split_args(rhs[open_p + 1 : close])
+                if len(cargs) < 2:
+                    raise TranslationError(f"array_t ctor needs (ptr, shape...): {rhs!r}")
+                elem = msl_type(dtype_ctype)
+                ebytes = _ELEM_BYTES.get(elem)
+                if ebytes is None:
+                    raise TranslationError(f"no _ELEM_BYTES entry for {elem!r} ({rhs!r})")
+                nd = len(cargs) - 1
+                spec = ArgSpec(target, "array", f"wp::array_t<{dtype_ctype}>")
+                spec.local = True
+                self.array_args[target] = spec
+                self.hoisted.extend([
+                    f"wp_arr_meta {target}_m = {{}};",
+                    f"device {elem}* {target}_data = (device {elem}*)0;",
+                ])
+                lines = [
+                    f"{target}_data = (device {elem}*)(uintptr_t)({self.expr(cargs[0])});",
+                    f"{target}_m.offset = 0; {target}_m.ndim = {nd};",
+                ]
+                for i in range(4):
+                    if i < nd:
+                        lines.append(f"{target}_m.shape[{i}] = (int)({self.expr(cargs[1 + i])});")
+                    else:
+                        lines.append(f"{target}_m.shape[{i}] = 0;")
+                # byte strides, last dim contiguous (row-major, as upstream)
+                lines.append(f"{target}_m.strides[{nd - 1}] = {ebytes};")
+                for i in range(nd - 2, -1, -1):
+                    lines.append(f"{target}_m.strides[{i}] = {target}_m.strides[{i + 1}] * {target}_m.shape[{i + 1}];")
+                for i in range(nd, 4):
+                    lines.append(f"{target}_m.strides[{i}] = 0;")
+                return lines
+            m_dataptr = re.match(r"^\((wp::uint64)\*\)&\((\w+)\.data\)$", rhs)
+            if m_dataptr and m_dataptr.group(2) in self.array_args:
+                # `(wp::uint64*)&(stack_array.data)`: SSA materialization of
+                # `stack_array.ptr` — the address OF the data pointer. For an
+                # arena-backed stack array that address IS the data pointer,
+                # so this collapses to a value alias of the raw address (the
+                # subsequent wp::load then yields the uint64 address for
+                # wp.array(ptr=...) views).
+                spec = self.array_args[m_dataptr.group(2)]
+                self.aliases[target] = (False, f"((uint64_t)((device char*){self._data_expr(spec)}))")
+                return []
+            if rhs.startswith("wp::tuple("):
+                # `t = wp::tuple(x);` shape-tuple temp: a value alias (only
+                # fixedarray/array_t ctors consume these, which read the
+                # template + shape scalars, not the tuple itself)
+                inner = rhs[len("wp::tuple(") : -1].strip()
+                self.aliases[target] = (False, self.expr(inner))
+                return []
             if target in self.deferred_any:
                 # first assignment to a `wp::Any` temp (wp.static lowering):
                 # declare with a deduced `auto` type at the point of init
                 self.deferred_any.discard(target)
                 return [f"const auto {target} = {self.expr(rhs)};"]
+            if rhs.startswith("wp::tile<"):
+                # wp::tile<T>(v): broadcast a register value into a per-thread
+                # tile — each thread already holds its own copy, so identity
+                open_paren = rhs.index("(")
+                close = _find_balanced(rhs, open_paren)
+                return [f"{target} = {self.expr(rhs[open_paren + 1 : close])};"]
+            if rhs.startswith("wp::tile_reduce(") or rhs.startswith("wp::tile_sum(") or rhs.startswith("wp::tile_min(") or rhs.startswith("wp::tile_max("):
+                return self._tile_reduce(target, rhs)
+            if rhs.startswith("wp::tile_zeros<"):
+                # wp.tile_zeros(shape=(1,), ...): the tile is a per-thread
+                # element value in this lowering — zero it
+                return [f"{target} = {{}};"]
+            m_cp = re.match(r"^wp::copy\((\w+)\)$", rhs)
+            base = m_cp.group(1) if m_cp else (rhs.strip() if re.match(r"^\w+$", rhs.strip()) else None)
+            if rhs.startswith("wp::mesh_get(") or (base is not None and base in self.mesh_vars):
+                # wp.Mesh value (mesh_get result or a value copy): members
+                # bind as real arrays (see the _alias member path)
+                self.mesh_vars.add(target)
             return [f"{target} = {self.expr(rhs)};"]
 
         # alias creation: var_p = wp::address(...) / var_p = &(expr)
@@ -759,6 +1236,14 @@ class _BodyTranslator:
                     if spec is None:
                         raise TranslationError(f"array decl from non-array load {init!r}")
                     self.array_args[name] = spec
+                return []
+            if _RE_FIXEDARRAY_T.match(ctype.strip()):
+                # in-device wp.zeros() decl: the fixedarray ctor ASSIGN
+                # registers the (arena data, meta) pair — drop the decl
+                return []
+            if ctype.strip().startswith("wp::tuple_t<"):
+                # shape-tuple temp decl: `t = wp::tuple(x);` registers the
+                # value alias — drop the decl
                 return []
             if ctype.strip() == "wp::Any":
                 # wp.static temps: type-erased in the SSA; declared as
@@ -797,17 +1282,48 @@ class _BodyTranslator:
                     # -Wmissing-braces (Metal surfaces warnings before errors
                     # and the 1KB error buffer would clip the real failure)
                     elems = "{" + row_inits + "}"
-                return [f"{'const ' if const else ''}{msl_t} {name} = {{{elems}}};"]
+                return [
+                    f"{'const ' if const else ''}{msl_t} {name} = {{{elems}}};",
+                    f"    (void)({name});  // keep -Wunused-variable diagnostics from clipping the error buffer",
+                ]
             if init is not None:
-                return [f"{'const ' if const else ''}{msl_t} {name} = {self.expr(init)};"]
+                if const and re.fullmatch(r"-?\d+(\.\d+)?", init.strip()):
+                    # compile-time SSA constant (e.g. the `var_8 = 0` index
+                    # behind tile_extract's [0]) — recorded for constant-fold
+                    self.const_vars[name] = init.strip()
+                return [
+                    f"{'const ' if const else ''}{msl_t} {name} = {self.expr(init)};",
+                    f"    (void)({name});  // keep -Wunused-variable diagnostics from clipping the error buffer",
+                ]
             # zero-init: Metal promotes -Wsometimes-uninitialized to an error
             # on phi-merged temps; SSA assigns before every reachable read,
-            # so a static zero is never observable
-            if msl_t in ("vec2f", "vec3f", "vec4f", "quatf", "mat22f", "mat33f", "mat44f",
-                         "transformf", "spatial_vectorf", "vec2i", "vec3i", "vec4i",
-                         "wp_range", "wp_mesh") or msl_t in self.unit.structs:
-                return [f"{'const ' if const else ''}{msl_t} {name} = {{}};"]
-            return [f"{'const ' if const else ''}{msl_t} {name} = 0;"]
+            # so a static zero is never observable. `{}` value-initializes
+            # every MSL type here (scalars, vectors, user structs — a struct
+            # def may not even be registered yet when a leaf function creates
+            # a local of it, so name-based struct detection is unreliable).
+            return [
+                f"{'const ' if const else ''}{msl_t} {name} = {{}};",
+                f"    (void)({name});  // keep -Wunused-variable diagnostics from clipping the error buffer",
+            ]
+
+        if stripped.startswith("wp::tile_scatter_masked("):
+            # wp.tile_scatter_masked(tile, idx, v, mask): a shared shape-(1,)
+            # tile written by the masked threads. Per-thread lowering: each
+            # thread writes its own copy (uniform for the live closure; the
+            # mesh mid-phase user is dead — see the wp_mesh stub). idx is
+            # always the compile-time constant 0 in the closure.
+            open_p = len("wp::tile_scatter_masked(") - 1
+            close = _find_balanced(stripped, open_p)
+            sargs = split_args(stripped[open_p + 1 : close])
+            if len(sargs) != 4:
+                raise TranslationError(f"tile_scatter_masked with {len(sargs)} args")
+            return [f"if ({self.expr(sargs[3])}) {{ {sargs[0].strip()} = {self.expr(sargs[2])}; }}"]
+
+        m_ca = re.match(r"^\s*(\w+(?:\.\w+)*)\s*([+\-*/])=\s*(.+?);\s*$", line)
+        if m_ca:
+            # compound assignment (Newton: `iteration += 1` counters)
+            t, op, r = m_ca.group(1), m_ca.group(2), m_ca.group(3)
+            return [f"{t} = {t} {op} ({self.expr(r)});"]
 
         if m := re.match(r"^\s*(.+?);\s*$", line):
             return [self.call_stmt(m.group(1)) + ";"]
@@ -829,7 +1345,7 @@ class _BodyTranslator:
             if spec is None:
                 raise TranslationError(f"wp::address on non-array arg {arr_var!r}")
             idx = ", ".join(self.expr(a) for a in args[1:])
-            expr = f"wp_address({spec.name}_data, {self._meta_ref(spec)}{', ' + idx if idx else ''})"
+            expr = f"wp_address({self._data_expr(spec)}, {self._meta_ref(spec)}{', ' + idx if idx else ''})"
             self.aliases[var] = (True, expr)
             return
         # &(expr) reference forms
@@ -843,8 +1359,22 @@ class _BodyTranslator:
             expr = f"int4({s}[0], {s}[1], {s}[2], {s}[3])"
             self.aliases[var] = (False, expr)
             return
-        # struct member reference &((var).field)
-        member = re.match(r"^\((\w+)\)((?:\.\w+)+)$", inner)
+        # struct member reference &((var).field) / &(var.field)
+        member = re.match(r"^(?:\()?(\w+)(?:\))?((?:\.\w+)+)$", inner)
+        if not member:
+            # struct-array element member address: &(((*wp::address(arr, idx))).field)
+            # — e.g. in_gaussians[g].num_points; lowers through the array
+            # alias machinery (element pointer, then member projection)
+            elem_member = re.match(r"^\(\(\*wp::address\(([^()]+)\)\)\)((?:\.\w+)+)$", inner)
+            if elem_member:
+                addr_args = split_args(elem_member.group(1))
+                spec = self.array_args.get(addr_args[0].strip())
+                if spec is None:
+                    raise TranslationError(f"&(...address(...).field) on non-array arg {addr_args[0]!r}")
+                idx = ", ".join(self.expr(i) for i in addr_args[1:])
+                addr = f"wp_address({self._data_expr(spec)}, {self._meta_ref(spec)}{', ' + idx if idx else ''})"
+                self.aliases[var] = (True, f"(&(((*({addr}))){elem_member.group(2)}))")
+                return
         if not member:
             # pointer-dereference member form &(var_x->field): var_x is a
             # value alias → (alias_expr).field; var_x is an array binding →
@@ -870,6 +1400,16 @@ class _BodyTranslator:
         if spec is not None:
             self.array_args[var] = spec
             return
+        m_mesh = re.match(r"^(var_\w+)\.(points|indices)$", key)
+        if m_mesh and m_mesh.group(1) in self.mesh_vars:
+            # real wp.Mesh member array (device pointers inside the mesh
+            # table entry — see prelude wp_mesh / runtime/host.py)
+            field = m_mesh.group(2)
+            elem_ctype = "wp::vec_t<3, wp::float32>" if field == "points" else "wp::int32"
+            spec = ArgSpec(var, "array", f"wp::array_t<{elem_ctype}>")
+            spec.mesh_member = (m_mesh.group(1), field)
+            self.array_args[var] = spec
+            return
         self.aliases[var] = (False, self.expr(inner))
 
     def call_stmt(self, src: str) -> str:
@@ -877,6 +1417,11 @@ class _BodyTranslator:
         m = re.match(r"^builtin_tid([1234])d\s*\((.*)\)$", src)
         if m:
             return self._builtin_tid(m.group(1), m.group(2))
+        if re.match(r"^builtin_block_dim\s*\(\s*\)$", src):
+            # wp.block_dim() folds to the tiled launch's compile-time size
+            if self.unit.block_dim is None:
+                raise TranslationError("wp.block_dim() outside a tiled launch")
+            return str(self.unit.block_dim)
         m = re.match(r"^(wp::[A-Za-z_]\w*(?:<[^()]*>)?)\(", src)
         if not m:
             # user function call (multi-output) — pass through with name check
@@ -902,7 +1447,7 @@ class _BodyTranslator:
                 raise TranslationError(f"wp::array_store on non-array arg {arr_var!r}")
             idx = ", ".join(self.expr(a) for a in args[1:-1])
             value = self.expr(args[-1])
-            return f"*wp_address({spec.name}_data, {self._meta_ref(spec)}{', ' + idx if idx else ''}) = {value}"
+            return f"*wp_address({self._data_expr(spec)}, {self._meta_ref(spec)}{', ' + idx if idx else ''}) = {value}"
         if key and key[4:].startswith("atomic_"):
             return self._atomic(key[4:], args)
         # value-producing builtins as statements: emit as expression statement
@@ -951,28 +1496,74 @@ class _BodyTranslator:
                 spec = self._array_arg_spec(arg)
                 if spec is None:
                     raise TranslationError(f"array param {p.name} of {name} got non-array {arg!r}")
-                out.append(f"{spec.name}_data")
+                out.append(self._data_expr(spec))
                 out.append(self._meta_ref(spec))
             elif p.kind == "struct" and p.array_fields:
                 # struct value + one (data, meta) pair per split array field
                 out.append(self.expr(arg))
-                for field, _elem_ctype in p.array_fields:
+                for field, elem_ctype in p.array_fields:
                     spec = self.array_args.get(f"{arg.strip()}.{field}")
                     if spec is None:
-                        raise TranslationError(
-                            f"struct param {p.name} of {name}: array field {field!r} has no binding"
-                        )
-                    out.append(f"{spec.name}_data")
+                        # Struct-array element passed by value (e.g.
+                        # Gaussian.Data via wp.array[Gaussian.Data]): its
+                        # array fields are inline runtime data with no launch
+                        # bindings. Dead-by-construction branch in the M1
+                        # closure (no Gaussian geometry exists in Phase 1 —
+                        # the shape_type guard can never select it), so bind
+                        # null data + a zero meta: an executed read would
+                        # fault loudly, never silently diverge.
+                        out.append(f"((device {msl_type(elem_ctype)}*)0)")
+                        out.append("_wp_dead_meta_g")
+                        self.dead_meta_emitted = True
+                        continue
+                    out.append(self._data_expr(spec))
                     out.append(self._meta_ref(spec))
             else:
                 out.append(self.expr(arg))
         if vi != len(args):
             raise TranslationError(f"call {name}: {len(args)} args for {len(fn.params)} params")
+        if fn.needs_lane:
+            out.append("_wp_lane")
+            for k, _elem in fn.shr_slots:
+                out.append(f"_wp_tile_shr_{k}")
+            self.callee_needs_lane = True
+            for slot_k, slot_elem in fn.shr_slots:
+                if all(slot_k != k for k, _e, _c in self.used_shr):
+                    self.used_shr.append((slot_k, slot_elem, "+"))
+        if fn.needs_arena:
+            out.append("_wp_arena")
+            self.callee_needs_arena = True
+        if fn.needs_mesh:
+            out.append("_wp_mesh_table")
+            self.callee_needs_mesh = True
         return f"{name}({', '.join(out)})"
 
 
 _RE_ITER = re.compile(r"\b(iter_cmp|iter_next)\(")
 _RE_SEC = re.compile(r"^\s*//\s*(argument vars|primal vars|forward)\s*$")
+
+# C99 suffixed math names appearing in Newton's func_native snippets
+# (metal_stdlib exposes only the unprefixed overloads)
+_C_MATH_REWRITES = {
+    "sqrtf": "sqrt",
+    "fabsf": "fabs",
+    "fminf": "min",
+    "fmaxf": "max",
+    "ceilf": "ceil",
+    "floorf": "floor",
+    "roundf": "rint",
+    "logf": "precise::log",
+    "expf": "precise::exp",
+    "sinf": "precise::sin",
+    "cosf": "precise::cos",
+    "tanf": "precise::tan",
+    "asinf": "asin",
+    "acosf": "acos",
+    "atanf": "atan",
+    "atan2f": "atan2",
+    "powf": "pow",
+    "fmodf": "fmod",
+}
 
 
 def _split_bool_op(src: str, op: str) -> tuple[str, str] | None:
@@ -994,7 +1585,7 @@ def _split_bool_op(src: str, op: str) -> tuple[str, str] | None:
 def _classify_ctype(ctype: str) -> str:
     """'array' | 'struct' | 'scalar' classification of a C++ type string."""
     ctype = ctype.strip().rstrip("*").strip()
-    if _RE_ARRAY_T.match(ctype):
+    if _RE_ARRAY_T.match(ctype) or _RE_FIXEDARRAY_T.match(ctype):
         return "array"
     if ctype in _SCALAR_CTYPES or _RE_VEC_T.match(ctype) or _RE_MAT_T.match(ctype):
         return "scalar"
@@ -1035,6 +1626,11 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
     name = re.sub(r"\W", "_", base)
 
     unit = KernelUnit(name)
+    if "block_dim" in opts:
+        # tiled launch: vendored parse consumed options["block_dim"] for the
+        # tile shapes; the emitter keys tid mapping / block_dim() / the
+        # threadgroup reduction off the same value
+        unit.block_dim = int(opts["block_dim"])
 
     # ---- classify kernel args from the vendored type objects ----
     from ..frontend.codegen import Var as _Var
@@ -1095,7 +1691,9 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
 
     # arg bindings (scalars/structs read from the Params buffer)
     bindings = [f"{a.msl} var_{a.name} = _wp_args.{a.name};" for a in unit.args if a.kind in ("scalar", "struct")]
-    unit.kernel.lines = bindings + body
+    if tr.used_mesh:
+        unit.needs_mesh = True
+    unit.kernel.lines = bindings + tr.hoisted + body
     return unit
 
 
@@ -1124,6 +1722,11 @@ def _translate_native_function(f, snippet: str, unit: KernelUnit, _codegen) -> M
     # a local lvalue's only legal address space is `thread` (semantics equal
     # to the unqualified CPU C++ form the snippets are written against)
     body = re.sub(r"reinterpret_cast<\s*([^<>]+?)\s*&\s*>", r"reinterpret_cast<thread \1&>", body)
+    # C99 suffixed math names have no MSL counterparts (metal_stdlib exposes
+    # the unprefixed overloads); rewrite on word boundaries — `float` type
+    # text never matches these keys
+    for c_name, msl_name in _C_MATH_REWRITES.items():
+        body = re.sub(rf"\b{c_name}\s*\(", f"{msl_name}(", body)
     fn.lines = [f"    {ln}" for ln in body.splitlines()]
     return fn
 
@@ -1215,6 +1818,25 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
             elif s == "}":
                 depth -= 1
         fn.lines.extend(out)
+    if tr.used_shr:
+        # tile ops inside a @wp.func (own sites or transitively through a
+        # callee): the function receives the caller's lane index and the
+        # kernel-scope shared arrays as hidden trailing parameters — a device
+        # function has no tid, and MSL forbids function-scope threadgroup
+        # storage outside kernels. Every tile call site sits in uniform
+        # control flow under the tiled kernel, so the kernel preamble's
+        # `_wp_lane`/arrays serve nested users too.
+        if unit.block_dim is None:
+            raise TranslationError(f"function {fname}: tile ops outside a tiled launch")
+        fn.needs_lane = True
+        fn.shr_slots = [(k, elem) for k, elem, _combine in tr.used_shr]
+    if getattr(tr, "used_arena", False) or getattr(tr, "callee_needs_arena", False):
+        fn.needs_arena = True
+    if getattr(tr, "used_mesh", False) or getattr(tr, "callee_needs_mesh", False):
+        fn.needs_mesh = True
+        unit.needs_mesh = True
+    if tr.hoisted:
+        fn.lines[:0] = tr.hoisted
     return fn
 
 
@@ -1260,11 +1882,10 @@ def _emit_struct_def(s, unit: KernelUnit, _codegen, split_arrays: bool = False) 
         lines.append(f"    {s.native_name} v;")
         for label, _ in fields:
             lines.append(f"    v.{label} = {label};")
-    else:
-        lines.append(f"    {s.native_name} v = {{}};")
-    lines.append("    return v;")
-    lines.append("}")
-    lines.append(f"static inline {s.native_name} make_{s.native_name}() {{")
+        lines.append("    return v;")
+        lines.append("}")
+        # zero-arg form; for empty structs it would collide with the above
+        lines.append(f"static inline {s.native_name} make_{s.native_name}() {{")
     lines.append(f"    {s.native_name} v = {{}};")
     lines.append("    return v;")
     lines.append("}")
