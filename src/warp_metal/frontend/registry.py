@@ -223,6 +223,10 @@ class _CoreShim:
         rotated = cls._quat_rotate_xyzw(t7[3:], vec)
         cls._as_f32(out_ref, 3)[:] = rotated.astype(np.float32)
 
+    @classmethod
+    def wp_builtin_transform_identity_float32(cls, out_ref) -> None:
+        cls._as_f32(out_ref, 7)[:] = np.array([0, 0, 0, 0, 0, 0, 1], dtype=np.float32)
+
 
 class _RuntimeShim:
     core = _CoreShim()

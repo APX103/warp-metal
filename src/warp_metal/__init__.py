@@ -24,6 +24,7 @@ from .compat import (
     __version__,
     check_vendored_version,
 )
+from .shim import install_as_warp  # noqa: F401
 
 # Importing the frontend registers the full builtin table, attaches the
 # exported ``wp.*`` callables to this package, and wires the host module
@@ -206,6 +207,7 @@ __all__ = [
     "EXPECTED_VENDORED_WARP_VERSION",
     "VendoredVersionError",
     "check_vendored_version",
+    "install_as_warp",
     # decorators + type machinery
     "kernel",
     "func",
