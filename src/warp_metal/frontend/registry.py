@@ -281,6 +281,14 @@ class _CoreShim:
         cls._as_f32(out_ref, 3)[:] = (t7[:3] + rotated).astype(np.float32)
 
     @classmethod
+    def wp_builtin_transform_get_translation_transformf(cls, t, out_ref) -> None:
+        cls._as_f32(out_ref, 3)[:] = cls._as_f32(t, 7)[:3]
+
+    @classmethod
+    def wp_builtin_transform_get_rotation_transformf(cls, t, out_ref) -> None:
+        cls._as_f32(out_ref, 4)[:] = cls._as_f32(t, 7)[3:]
+
+    @classmethod
     def wp_builtin_transform_vector_transformf_vec3f(cls, t, v, out_ref) -> None:
         t7 = cls._as_f32(t, 7)
         vec = cls._as_f32(v, 3)
