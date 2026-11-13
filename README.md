@@ -16,12 +16,14 @@ without any NVIDIA dependency.
 
 ## Status
 
-Phase 0 spike (KEP-0001). The plan of record (ROADMAP.md) and the KEP design
-live in the Newton working repo under
+Phase 0 spike complete (2026-11-13): vendored frontend (warp 1.19.0) with
+extracted registry, hand-written MSL emitter for the 10 spike kernels,
+native Metal runtime with `wp.launch(device="metal")` end-to-end, and 10/10
+numeric alignment against the warp CPU(LLVM) backend (`phase0-report.md`
+in the Newton KEP dir). Phase 1 (rigid-body MVP: full type system, host
+runtime, per-frequency builtins, primitive collision, Newton shim) is
+next — plan of record: ROADMAP.md in the Newton working repo under
 `keps/0001-standalone-warp-metal-library-with-msl-backend-for-newton-on-apple-silicon/`.
-
-`import warp_metal` works; the `wp.*` API surface lands incrementally over
-M0.2–M0.5. Nothing here is usable for simulation yet.
 
 ## License
 
