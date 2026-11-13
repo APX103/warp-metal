@@ -6,12 +6,9 @@
 # of the License at http://www.apache.org/licenses/LICENSE-2.0.
 """``@wp.struct`` decorator (KEP-0001 M1.1, ported from warp 1.19 context.py).
 
-Upstream keeps this in ``context.py`` against the full runtime Module hub;
-the vendored frontend carries the placeholder :class:`Module`, so the
-decorator resolves user classes to a placeholder module keyed by
-``__module__``. The module table is replaced by the M1.2 host runtime.
-
-Supported call forms (matching upstream):
+Module resolution goes through the host runtime's module hub (``get_module``
+lazy bindings, :mod:`warp_metal.runtime.modules`). Supported call forms
+(matching upstream):
 
     @wp.struct
     class A: ...
@@ -25,31 +22,23 @@ from __future__ import annotations
 import functools
 
 from . import codegen
-from .registry import Module
+from .registry import _LazySymbol
 
-# Per-source-module placeholder modules so that structs from the same Python
-# module land in the same Module (upstream: get_module(c.__module__)).
-_MODULES: dict[str, Module] = {}
-
-
-def _placeholder_module(name: str) -> Module:
-    mod = _MODULES.get(name)
-    if mod is None:
-        mod = Module(name)
-        _MODULES[name] = mod
-    return mod
+_get_module = _LazySymbol("_get_module")
+get_module = _LazySymbol("get_module")
+Module = _LazySymbol("Module")
 
 
-def struct(c: type | None = None, *, module: Module | str | None = None):
+def struct(c: type | None = None, *, module=None):
     """Decorator to define a Warp struct for use in kernels and functions."""
 
     def wrapper(c, *args, **kwargs):
         if module is None:
-            m = _placeholder_module(c.__module__)
+            m = _get_module(c.__module__, c.__qualname__)
         elif module == "unique":
-            m = Module(c.__name__)
+            m = Module(c.__name__, None)
         elif isinstance(module, str):
-            m = _placeholder_module(module)
+            m = get_module(module)
         else:
             m = module
         s = codegen.Struct(key=codegen.make_full_qualified_name(c), cls=c, module=m)

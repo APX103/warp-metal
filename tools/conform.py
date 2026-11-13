@@ -119,8 +119,12 @@ def _classify(obj):
     - ``other``      — constant or anything else: ``type(obj).__name__``.
     """
     # Codegen-level Function (warp.context.Function / vendored registry
-    # Function), matched by its ``key`` + ``input_types`` pair.
-    input_types = getattr(obj, "input_types", None)
+    # Function), matched by its ``key`` + ``input_types`` pair. getattr is
+    # guarded: stub namespaces (wp.utils) raise on any attribute.
+    try:
+        input_types = getattr(obj, "input_types", None)
+    except Exception:
+        input_types = None
     if isinstance(input_types, dict) and isinstance(getattr(obj, "key", None), str):
         return "builtin", ",".join(input_types.keys())
     if inspect.isroutine(obj):

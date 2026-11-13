@@ -121,6 +121,11 @@ class _CoreShim:
     mathdx (cuBLASDx/cuSolverDx/cuFFTDx) is permanently unavailable here, so
     every LTO-dispatch branch in vendored builtins.py takes its documented
     CPU/no-MathDx fallback. fp16/bf16 literal conversion is done in numpy.
+
+    Also provides the native transform builtins Newton's host_transform.py
+    calls through ``wp._src.context.runtime.core`` — implemented in numpy
+    against the ctypes calling convention (operands passed as ctypes float
+    arrays / ``byref`` CArgObjects, results written through the byref arg).
     """
 
     @staticmethod
@@ -134,6 +139,87 @@ class _CoreShim:
     @staticmethod
     def wp_bfloat16_bits_to_float(bits) -> float:
         return float(np.frombuffer(np.uint32([int(bits) << 16]).tobytes(), dtype=np.float32)[0])
+
+    # -- host transform builtins (ctypes float-array conventions) ----------
+
+    @staticmethod
+    def _as_f32(obj, n: int) -> np.ndarray:
+        """View a ctypes float array or ``byref`` object as a numpy vector."""
+        ptr = ctypes.cast(obj, ctypes.POINTER(ctypes.c_float * n))
+        return np.ctypeslib.as_array(ptr.contents)
+
+    @classmethod
+    def wp_builtin_quat_from_matrix_mat44f(cls, m, out_ref) -> None:
+        # row-major 4x4 -> xyzw quaternion (standard Shepperd method)
+        m44 = cls._as_f32(m, 16).reshape(4, 4)
+        tr = float(m44[0, 0] + m44[1, 1] + m44[2, 2])
+        if tr > 0.0:
+            s = np.sqrt(tr + 1.0) * 2.0
+            w = 0.25 * s
+            x = (m44[2, 1] - m44[1, 2]) / s
+            y = (m44[0, 2] - m44[2, 0]) / s
+            z = (m44[1, 0] - m44[0, 1]) / s
+        elif m44[0, 0] > m44[1, 1] and m44[0, 0] > m44[2, 2]:
+            s = np.sqrt(1.0 + m44[0, 0] - m44[1, 1] - m44[2, 2]) * 2.0
+            w = (m44[2, 1] - m44[1, 2]) / s
+            x = 0.25 * s
+            y = (m44[0, 1] + m44[1, 0]) / s
+            z = (m44[0, 2] + m44[2, 0]) / s
+        elif m44[1, 1] > m44[2, 2]:
+            s = np.sqrt(1.0 + m44[1, 1] - m44[0, 0] - m44[2, 2]) * 2.0
+            w = (m44[0, 2] - m44[2, 0]) / s
+            x = (m44[0, 1] + m44[1, 0]) / s
+            y = 0.25 * s
+            z = (m44[1, 2] + m44[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + m44[2, 2] - m44[0, 0] - m44[1, 1]) * 2.0
+            w = (m44[1, 0] - m44[0, 1]) / s
+            x = (m44[0, 2] + m44[2, 0]) / s
+            y = (m44[1, 2] + m44[2, 1]) / s
+            z = 0.25 * s
+        q = np.asarray([x, y, z, w], dtype=np.float32)
+        n = q / np.linalg.norm(q)
+        cls._as_f32(out_ref, 4)[:] = n
+
+    @classmethod
+    def wp_builtin_transform_inverse_transformf(cls, t, out_ref) -> None:
+        t7 = cls._as_f32(t, 7)
+        p, q = t7[:3], t7[3:]
+        # conjugate quaternion: (x,y,z) negated, w kept
+        qi = np.asarray([-q[0], -q[1], -q[2], q[3]], dtype=np.float32)
+        rotated = cls._quat_rotate_xyzw(qi, p)
+        cls._as_f32(out_ref, 7)[:] = np.concatenate((-rotated, qi)).astype(np.float32)
+
+    @classmethod
+    def _quat_rotate_xyzw(cls, q: np.ndarray, v: np.ndarray) -> np.ndarray:
+        """Rotate ``v`` by unit quaternion ``q`` (xyzw layout)."""
+        xyz, w = q[:3], float(q[3])
+        uv = np.cross(xyz, v)
+        return v + 2.0 * (w * uv + np.cross(xyz, uv))
+
+    @classmethod
+    def wp_builtin_mul_transformf_transformf(cls, a, b, out_ref) -> None:
+        a7 = cls._as_f32(a, 7)
+        b7 = cls._as_f32(b, 7)
+        qa, qb = a7[3:], b7[3:]
+        xyz = qa[:3] * qb[3] + qb[:3] * qa[3] + np.cross(qa[:3], qb[:3])
+        w = qa[3] * qb[3] - float(np.dot(qa[:3], qb[:3]))
+        pos = a7[:3] + cls._quat_rotate_xyzw(qa, b7[:3])
+        cls._as_f32(out_ref, 7)[:] = np.concatenate((pos, xyz, [w])).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_transform_point_transformf_vec3f(cls, t, p, out_ref) -> None:
+        t7 = cls._as_f32(t, 7)
+        point = cls._as_f32(p, 3)
+        rotated = cls._quat_rotate_xyzw(t7[3:], point)
+        cls._as_f32(out_ref, 3)[:] = (t7[:3] + rotated).astype(np.float32)
+
+    @classmethod
+    def wp_builtin_transform_vector_transformf_vec3f(cls, t, v, out_ref) -> None:
+        t7 = cls._as_f32(t, 7)
+        vec = cls._as_f32(v, 3)
+        rotated = cls._quat_rotate_xyzw(t7[3:], vec)
+        cls._as_f32(out_ref, 3)[:] = rotated.astype(np.float32)
 
 
 class _RuntimeShim:

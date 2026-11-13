@@ -230,11 +230,11 @@ def run_metal_compare(inp):
     idx.numpy_view()[:] = inp["idx"]
 
     out = arr_f32()
-    wp.launch(sk.k_copy_scale, dim=n, inputs=[a, out], scalars=[2.5], device="metal")
+    wp.launch(sk.k_copy_scale, dim=n, inputs=[a, out, 2.5], device="metal")
     outs["k_copy_scale"] = out.to_numpy()
 
     out = arr_vec3()
-    wp.launch(sk.k_saxpy3, dim=n, inputs=[va, vb, out], scalars=[2.0], device="metal")
+    wp.launch(sk.k_saxpy3, dim=n, inputs=[va, vb, out, 2.0], device="metal")
     outs["k_saxpy3"] = out.to_numpy()
 
     out = arr_f32()
@@ -250,7 +250,7 @@ def run_metal_compare(inp):
     outs["k_trig"] = out.to_numpy()
 
     out = arr_f32()
-    wp.launch(sk.k_select_clip, dim=n, inputs=[clip_in, out], scalars=[-1.0, 1.0], device="metal")
+    wp.launch(sk.k_select_clip, dim=n, inputs=[clip_in, out, -1.0, 1.0], device="metal")
     outs["k_select_clip"] = out.to_numpy()
 
     out = arr_vec3()
@@ -266,7 +266,7 @@ def run_metal_compare(inp):
     outs["k_atomic_accum"] = acc.to_numpy()
 
     acc2 = wp.zeros(8, dtype=wp.float32)
-    wp.launch(sk.k_mixed, dim=n, inputs=[va, vb, acc2], scalars=[0.7], device="metal")
+    wp.launch(sk.k_mixed, dim=n, inputs=[va, vb, acc2, 0.7], device="metal")
     outs["k_mixed"] = acc2.to_numpy()
 
     return outs

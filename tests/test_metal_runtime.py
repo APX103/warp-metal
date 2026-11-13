@@ -52,7 +52,7 @@ class TestMetalRuntime(unittest.TestCase):
         a = wp.zeros(n, dtype=wp.float32)
         out = wp.zeros(n, dtype=wp.float32)
         a.numpy_view()[:] = np.arange(n, dtype=np.float32)
-        wp.launch(k_copy_scale, dim=n, inputs=[a, out], scalars=[2.5], device="metal")
+        wp.launch(k_copy_scale, dim=n, inputs=[a, out, 2.5], device="metal")
         np.testing.assert_allclose(out.numpy_view(), np.arange(n) * 2.5, rtol=1e-6)
 
     def test_launch_trig_identity(self):

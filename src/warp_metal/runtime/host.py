@@ -3,17 +3,21 @@
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
 # use this file except in compliance with the License. You may obtain a copy
 # of the License at http://www.apache.org/licenses/LICENSE-2.0.
-"""warp-metal host runtime prototype (KEP-0001 M0.4).
+"""warp-metal host runtime (KEP-0001 M1.2, bucket D).
 
-Minimal bucket-D surface for the Phase 0 spike:
-  - ``WarpArray``: one MTLBuffer (storageModeShared) + zero-copy numpy view
-  - ``zeros``/``empty``/``ones``/``full`` array constructors (1D concrete dtypes)
-  - ``launch``: emit MSL -> compile -> PSO cache -> synchronous dispatch
-  - ``synchronize``
+Built on the M0.4 prototype:
+  - ``WarpArray``: one MTLBuffer (storageModeShared) + zero-copy numpy view,
+    now with shape (1d-4d flattened) and device tracking
+  - array constructors with upstream signatures (shape tuple, device kwarg),
+    ``*_like`` variants, ``copy``/``clone``/``from_numpy``
+  - ``launch`` with the upstream signature (adjoint kwargs fail loudly)
+  - capture passthrough (``capture_begin``/``capture_end``/``capture_launch``)
+  - ``init``/``synchronize``/device module
 
-Everything is 1D; scalars pass through per-arg constant-space buffers
-(MSL kernels cannot take scalar-value params). The full bucket-D surface
-(devices, streams, 2d-4d arrays, copies, capture batching) is M1.2/M2.5.
+Arrays live in unified memory regardless of the allocating device, so a
+``"cpu"`` array is directly usable by Metal kernels — the foundation for
+per-builtin CPU fallback routing (M1.3). Whole-kernel CPU execution (LLVM
+path) is not wired yet; launching on "cpu" fails loudly.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ from ..frontend.types import (
 )
 from .. import native as _mm
 from ..msl.emitter import MSLEmitter
+from .devices import get_device
 
 _SCALAR_NP = {
     float32: np.float32,
@@ -94,12 +99,37 @@ def _dtype_layout(dtype):
     raise NotImplementedError(f"dtype {dtype} not in spike subset")
 
 
-class WarpArray:
-    """MTLBuffer-backed array with a zero-copy numpy view."""
+def _normalize_shape(shape) -> tuple[int, ...]:
+    if shape is None:
+        return ()
+    if isinstance(shape, (int, np.integer)):
+        return (int(shape),)
+    return tuple(int(s) for s in shape)
 
-    def __init__(self, n: int, dtype=float32):
-        self.n = int(n)
+
+class WarpArray:
+    """MTLBuffer-backed array with a zero-copy numpy view.
+
+    ``shape`` may be ``()`` (zero-dim scalar buffer), an int, or a tuple of
+    up to 4 ints; the backing buffer is the flattened product in row-major
+    order (warp layout). ``device`` is recorded for dispatch validation but
+    allocation is device-independent (storageModeShared unified memory).
+    """
+
+    def __init__(self, n, dtype=float32, shape=None, device=None, pinned=False, requires_grad=False, retain_grad=False):
+        if requires_grad or retain_grad or pinned:
+            # Adjoint/pinned allocation is a KEP-0001 Non-Goal: fail loud
+            # rather than silently ignoring the flag (black-box principle).
+            raise RuntimeError(
+                "warp-metal does not support requires_grad/pinned/retain_grad allocation flags "
+                "(adjoint codegen is a KEP-0001 Non-Goal)"
+            )
+        self.device = get_device(device).name
         self.dtype = dtype
+        self.shape = _normalize_shape(shape) if shape is not None else _normalize_shape(n)
+        self.n = 1
+        for s in self.shape:
+            self.n *= s
         self.np_dtype, self.item_bytes, self.is_composite = _dtype_layout(dtype)
         self._buffer = _mm.buffer_create(self.n * self.item_bytes)
         self._ptr = _mm.buffer_ptr(self._buffer)
@@ -138,32 +168,107 @@ class WarpArray:
         return self.n
 
     def __repr__(self):
-        return f"warp_metal.WarpArray(n={self.n}, dtype={getattr(self.dtype, '__name__', self.dtype)})"
+        return (
+            f"warp_metal.WarpArray(shape={self.shape}, dtype={getattr(self.dtype, '__name__', self.dtype)}, "
+            f"device={self.device!r})"
+        )
 
 
-def zeros(n: int, dtype=float32) -> WarpArray:
-    arr = WarpArray(n, dtype)
+def _allocate(shape, dtype, device, requires_grad=False, pinned=False, retain_grad=False) -> WarpArray:
+    return WarpArray(shape, dtype, shape=shape, device=device, requires_grad=requires_grad, pinned=pinned, retain_grad=retain_grad)
+
+
+def zeros(shape, dtype=float32, device=None, requires_grad=False, pinned=False, retain_grad=False, **kwargs):
+    arr = _allocate(shape, dtype, device, requires_grad, pinned, retain_grad)
     arr.numpy.fill(0)
     return arr
 
 
-def empty(n: int, dtype=float32) -> WarpArray:
-    return WarpArray(n, dtype)
+def empty(shape, dtype=float32, device=None, requires_grad=False, pinned=False, retain_grad=False, **kwargs):
+    return _allocate(shape, dtype, device, requires_grad, pinned, retain_grad)
 
 
-def ones(n: int, dtype=float32) -> WarpArray:
-    arr = WarpArray(n, dtype)
+def ones(shape, dtype=float32, device=None, requires_grad=False, pinned=False, retain_grad=False, **kwargs):
+    arr = _allocate(shape, dtype, device, requires_grad, pinned, retain_grad)
     arr.numpy.fill(1)
     return arr
 
 
-def full(n: int, value, dtype=float32) -> WarpArray:
-    arr = zeros(n, dtype)
+def full(shape, value, dtype=float32, device=None, requires_grad=False, pinned=False, retain_grad=False, **kwargs):
+    arr = zeros(shape, dtype, device, requires_grad, pinned, retain_grad)
     if arr.is_composite:
         arr.numpy_view()[:] = np.asarray(value, dtype=np.float32)
     else:
         arr.numpy.fill(value)
     return arr
+
+
+def _like_kwargs(src, device, requires_grad, pinned, retain_grad):
+    if requires_grad or pinned or retain_grad:
+        raise RuntimeError(
+            "warp-metal does not support requires_grad/pinned/retain_grad allocation flags "
+            "(adjoint codegen is a KEP-0001 Non-Goal)"
+        )
+    return src.shape, src.dtype, device if device is not None else src.device
+
+
+def zeros_like(src, device=None, requires_grad=False, pinned=False, retain_grad=False):
+    return zeros(*_like_kwargs(src, device, requires_grad, pinned, retain_grad))
+
+
+def empty_like(src, device=None, requires_grad=False, pinned=False, retain_grad=False):
+    return empty(*_like_kwargs(src, device, requires_grad, pinned, retain_grad))
+
+
+def ones_like(src, device=None, requires_grad=False, pinned=False, retain_grad=False):
+    return ones(*_like_kwargs(src, device, requires_grad, pinned, retain_grad))
+
+
+def full_like(src, value, device=None, requires_grad=False, pinned=False, retain_grad=False):
+    return full(src.shape, value, src.dtype, device)
+
+
+def clone(src, device=None, requires_grad=False, pinned=False, retain_grad=False):
+    arr = _allocate(*_like_kwargs(src, device, requires_grad, pinned, retain_grad))
+    arr.numpy[:] = src.numpy
+    return arr
+
+
+def copy(dest, src, dest_offset=0, src_offset=0, count=None, stream=None):
+    """Copy ``count`` elements (all when None) from ``src`` into ``dest``."""
+    if dest.dtype != src.dtype:
+        raise TypeError(f"copy dtype mismatch: dest {dest.dtype} vs src {src.dtype}")
+    n = src.n - src_offset if count is None else int(count)
+    if n < 0 or dest_offset + n > dest.n or src_offset + n > src.n:
+        raise ValueError(f"copy out of bounds: count={n}, dest_offset={dest_offset}, src_offset={src_offset}")
+    dest.numpy[dest_offset : dest_offset + n] = src.numpy[src_offset : src_offset + n]
+
+
+def from_numpy(arr, dtype=None, shape=None, device=None, requires_grad=False, retain_grad=False):
+    """Create a WarpArray from a numpy array.
+
+    Copies the data into a fresh MTLBuffer (shared storage). A zero-copy
+    wrap of foreign memory needs a native ``buffer_from_ptr`` (Phase 2).
+    """
+    if requires_grad or retain_grad:
+        raise RuntimeError("warp-metal does not support grad flags (adjoint is a KEP-0001 Non-Goal)")
+    np_arr = np.ascontiguousarray(arr)
+    if dtype is None:
+        # map the numpy dtype back to a warp dtype
+        for wtype, np_t in _SCALAR_NP.items():
+            if np_t == np_arr.dtype:
+                dtype = wtype
+                break
+        else:
+            raise NotImplementedError(f"from_numpy: numpy dtype {np_arr.dtype} not mapped")
+    target_shape = tuple(np_arr.shape) if shape is None else _normalize_shape(shape)
+    out = _allocate(target_shape or (1,), dtype, device)
+    expected = int(np.prod(target_shape)) if target_shape else 1
+    flat = np_arr.reshape(-1)
+    if flat.size * np.dtype(out.np_dtype).itemsize * (out.item_bytes // np.dtype(out.np_dtype).itemsize) != out.n * out.item_bytes or flat.size != expected:
+        raise ValueError(f"from_numpy shape mismatch: numpy has {flat.size} elements, target {target_shape} needs {expected}")
+    out.numpy[:expected] = flat
+    return out
 
 
 def synchronize() -> None:
@@ -179,8 +284,16 @@ def device_name() -> str:
 # ---------------------------------------------------------------------------
 
 _PSO_LOCK = threading.Lock()
-_PSO_CACHE: dict[int, tuple] = {}  # id(kernel) -> pso handle
+_PSO_CACHE: dict[int, tuple] = {}  # id(kernel func) -> pso handle
 _EMITTER: MSLEmitter | None = None
+
+
+def clear_pso_cache() -> None:
+    """Drop all compiled kernel pipelines (used by wp.clear_kernel_cache)."""
+    with _PSO_LOCK:
+        _PSO_CACHE.clear()
+    global _EMITTER
+    _EMITTER = None
 
 
 def _emitter() -> MSLEmitter:
@@ -192,23 +305,36 @@ def _emitter() -> MSLEmitter:
     return _EMITTER
 
 
-def _pso_for(kernel_func):
+def _kernel_emit_target(kernel):
+    """(plain func, key) the spike emitter consumes for a kernel argument.
+
+    Accepts a vendored ``Kernel`` record (M1.2+) or a plain decorated
+    function (M0.4 spike path).
+    """
+    func = getattr(kernel, "func", kernel)
+    key = getattr(kernel, "key", None)
+    name = func.__name__ if key is None else key.rsplit("::", 1)[-1]
+    return func, name
+
+
+def _pso_for(kernel):
+    func, name = _kernel_emit_target(kernel)
     with _PSO_LOCK:
-        pso = _PSO_CACHE.get(id(kernel_func))
+        pso = _PSO_CACHE.get(id(func))
         if pso is not None:
             return pso
-        source = _emitter().emit(kernel_func)
+        source = _emitter().emit(func)
         lib = _mm.library_create(source)
-        fn = _mm.function_get(lib, kernel_func.__name__)
+        fn = _mm.function_get(lib, name)
         pso = _mm.pso_create(fn)
         _mm.function_release(fn)
         _mm.library_release(lib)
-        _PSO_CACHE[id(kernel_func)] = pso
+        _PSO_CACHE[id(func)] = pso
         return pso
 
 
 def _scalar_buffer(value) -> int:
-    """One 4-byte constant-space buffer per scalar kernel param."""
+    """One constant-space buffer per scalar kernel param (4 bytes float)."""
     packed = np.asarray([value], dtype=np.float32)
     handle = _mm.buffer_create(packed.nbytes)
     dst = np.ctypeslib.as_array(
@@ -219,32 +345,149 @@ def _scalar_buffer(value) -> int:
     return handle
 
 
-def launch(kernel_func, dim: int, inputs: list[WarpArray], scalars=None, device="metal"):
-    """Spike launch: 1D dispatch over ``dim`` threads.
+def launch(
+    kernel,
+    dim=None,
+    inputs=None,
+    outputs=None,
+    adj_inputs=None,
+    adj_outputs=None,
+    device=None,
+    stream=None,
+    adjoint=None,
+    record_tape=None,
+    record_cmd=None,
+    max_blocks=None,
+    block_dim=None,
+):
+    """Launch a kernel (upstream-compatible signature, forward-only).
 
-    ``inputs`` are WarpArrays; ``scalars`` are the kernel's scalar params in
-    declaration order (buffered individually in the constant address space).
-    Handles are passed in kernel-parameter order via the emitter layout.
+    ``adj_*``/``adjoint``/``record_tape`` fail loudly (adjoint is a KEP
+    Non-Goal); ``stream``/``record_cmd``/``max_blocks``/``block_dim`` are
+    accepted for API parity (dispatch is synchronous, batching is Phase 2).
+    ``dim`` may be an int or a tuple (multi-dim grids flatten for now; the
+    emitter only reads ``tid`` — multi-dim indexing is M1.3 scope). Scalar
+    kernel params are passed interleaved in ``inputs``/``outputs`` in
+    declaration order, exactly like upstream warp.
     """
-    if device != "metal":
-        raise ValueError(f"spike runtime supports device='metal' only, got {device!r}")
-    pso = _pso_for(kernel_func)
-    layout = _emitter().param_layout(kernel_func)
+    if adj_inputs is not None or adj_outputs is not None or adjoint or record_tape:
+        raise RuntimeError(
+            "warp-metal does not support adjoint launches (adjoint codegen is a KEP-0001 Non-Goal); "
+            "use enable_backward=False / forward-only launches"
+        )
 
-    inputs = list(inputs)
-    scalars = list(scalars or [])
-    scalar_iter = iter(scalars)
+    if device is not None and get_device(device).name != "metal":
+        # Whole-kernel CPU execution (LLVM path) is not wired (see module docstring).
+        raise RuntimeError(
+            f"launch device={device!r} is not available yet: the Metal backend dispatches on 'metal'; "
+            "'cpu' execution arrives with the CPU fallback routing"
+        )
+
+    if dim is None:
+        raise TypeError("launch() missing required argument 'dim'")
+    if isinstance(dim, (tuple, list)):
+        dim = int(np.prod([int(d) for d in dim]))
+    dim = int(dim)
+
+    merged = list(inputs or []) + list(outputs or [])
+
+    pso = _pso_for(kernel)
+    layout = _emitter().param_layout(_kernel_emit_target(kernel)[0])
+
     handles, temp = [], []
     for _name, is_array, _msl_t in layout:
         if is_array:
-            handles.append(inputs.pop(0).buffer)
+            arg = merged.pop(0)
+            if not isinstance(arg, WarpArray):
+                raise TypeError(f"kernel array parameter got {type(arg).__name__}, expected WarpArray")
+            handles.append(arg.buffer)
         else:
-            h = _scalar_buffer(next(scalar_iter))
+            value = merged.pop(0)
+            h = _scalar_buffer(value)
             handles.append(h)
             temp.append(h)
-    if inputs or list(scalar_iter):
+    if merged:
         raise ValueError("more launch arguments than kernel parameters")
 
-    _mm.dispatch(pso, handles, int(dim))
+    _mm.dispatch(pso, handles, dim)
     for h in temp:
         _mm.buffer_release(h)
+
+
+# ---------------------------------------------------------------------------
+# capture passthrough (KEP-0001: MVP 直通 — dispatch is synchronous, so
+# "captured" kernels run immediately; the returned graph is an empty record)
+# ---------------------------------------------------------------------------
+
+
+class Graph:
+    """Opaque capture record.
+
+    With synchronous passthrough capture, launches between capture_begin and
+    capture_end have already executed, so the record is legitimately empty
+    and replay is a no-op — never silently wrong results.
+    """
+
+    def __init__(self, device=None, n_ops: int = 0):
+        self.device = device
+        self.n_ops = n_ops
+
+    def __repr__(self):
+        return f"warp_metal.Graph(device={self.device!r}, n_ops={self.n_ops})"
+
+
+_CAPTURE_LOCK = threading.Lock()
+_CAPTURE_DEPTH = 0
+
+
+def capture_begin(device=None, stream=None, force_module_load=False, external=None, apic=None, capture_mode=None):
+    """Begin capture (passthrough: kernels run immediately)."""
+    global _CAPTURE_DEPTH
+    if external is not None or apic:
+        raise RuntimeError("warp-metal does not support external/apic capture (CUDA-graph machinery)")
+    with _CAPTURE_LOCK:
+        _CAPTURE_DEPTH += 1
+
+
+def capture_end(device=None, stream=None) -> Graph:
+    """End capture; returns an empty graph record (ops already executed)."""
+    global _CAPTURE_DEPTH
+    with _CAPTURE_LOCK:
+        _CAPTURE_DEPTH = max(0, _CAPTURE_DEPTH - 1)
+    return Graph(get_device(device).name if device is not None else None, n_ops=0)
+
+
+def capture_launch(graph, stream=None):
+    """Replay a captured graph.
+
+    The passthrough capture model executes kernels eagerly, so the captured
+    graph is empty and replay is an honest no-op. Replaying a foreign graph
+    object fails loudly.
+    """
+    if isinstance(graph, Graph):
+        return
+    raise RuntimeError(f"capture_launch: cannot replay {type(graph).__name__} (warp-metal graphs are capture-passthrough records)")
+
+
+def capture_if(condition, on_true=None, on_false=None, stream=None, **kwargs):
+    """Conditional graph nodes are CUDA-graph machinery — fail loudly."""
+    raise NotImplementedError("wp.capture_if is not supported by warp-metal (CUDA-graph construct)")
+
+
+def capture_while(condition, while_body=None, stream=None, **kwargs):
+    """While-loop graph nodes are CUDA-graph machinery — fail loudly."""
+    raise NotImplementedError("wp.capture_while is not supported by warp-metal (CUDA-graph construct)")
+
+
+def init() -> None:
+    """Validate the vendored frontend sentinel and lazily probe devices.
+
+    Mirrors ``wp.init()`` as an idempotent bootstrap (safe to call many
+    times, as Newton does).
+    """
+    from ..compat import check_vendored_version
+
+    check_vendored_version()
+    from . import devices as _devices
+
+    _devices.is_metal_available()

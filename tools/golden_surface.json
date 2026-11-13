@@ -144,7 +144,7 @@
   },
   "_src": {
    "kind": "module",
-   "sig": "warp._src"
+   "sig": "_src"
   },
   "abs": {
    "kind": "builtin",
@@ -303,7 +303,7 @@
   },
   "config": {
    "kind": "module",
-   "sig": "warp.config"
+   "sig": "config"
   },
   "constant": {
    "kind": "function",
@@ -1169,7 +1169,7 @@
   },
   "types": {
    "kind": "module",
-   "sig": "warp.types"
+   "sig": "types"
   },
   "uint16": {
    "kind": "type",
@@ -1192,7 +1192,7 @@
   },
   "utils": {
    "kind": "module",
-   "sig": "warp.utils"
+   "sig": "utils"
   },
   "vec2": {
    "kind": "type",

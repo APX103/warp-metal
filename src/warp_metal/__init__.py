@@ -12,9 +12,11 @@ Components (KEP-0001 "库形态与组件边界"):
 
 - ``warp_metal.frontend`` — vendored Warp compiler frontend (frozen at 1.19.0)
 - ``warp_metal.msl``      — MSL code generator (Warp AST → Metal Shading Language)
-- ``warp_metal.runtime``  — native Metal runtime + LLVM CPU fallback
+- ``warp_metal.runtime``  — native Metal runtime + module/device hub
 - ``warp_metal.compat``   — ``wp`` compatibility layer + version sentinel
 """
+
+import sys as _sys
 
 from .compat import (
     EXPECTED_VENDORED_WARP_VERSION,
@@ -38,6 +40,18 @@ from .frontend.types import *  # noqa: F401,F403
 # ``struct`` module, which would otherwise shadow the decorator.
 from .frontend.structs import struct  # noqa: F401
 from .frontend.codegen import Struct  # noqa: F401
+from .frontend.registry import Function  # noqa: F401
+
+# Kernel/function decorators + Kernel record (M1.2, ported from upstream context.py).
+from .frontend.kernels import (  # noqa: F401
+    Kernel,
+    kernel,
+    func,
+    overload,
+    func_native,
+    func_grad,
+    func_replay,
+)
 
 # Math constants (upstream warp exports plain floats of the same values).
 import math as _math  # noqa: E402
@@ -49,40 +63,173 @@ inf = _math.inf  # noqa: F401
 nan = _math.nan  # noqa: F401
 HALF_PI = _math.pi / 2  # noqa: F401
 
-# Host runtime (M0.4 prototype): buffers, launch, synchronize. These also
-# serve as the registry's lazy runtime_symbol targets for vendored code.
-from .runtime import (  # noqa: F401
+# Log levels (upstream logger constants).
+LOG_DEBUG = 10  # noqa: F401
+LOG_INFO = 20  # noqa: F401
+LOG_WARNING = 30  # noqa: F401
+LOG_ERROR = 40  # noqa: F401
+
+# Host runtime (M1.2): devices, module hub, buffers, launch, capture.
+from .runtime.devices import (  # noqa: F401
+    Device,
+    Stream,
+    Event,
+    ScopedDevice,
+    ScopedStream,
+    get_device,
+    get_current_device,
+    set_device,
+    get_preferred_device,
+    get_stream,
+    set_stream,
+    synchronize_device,
+    synchronize_stream,
+    record_event,
+    get_event_elapsed_time,
+    is_cuda_available,
+    is_metal_available,
+    is_mempool_enabled,
+    get_mempool_used_mem_current,
+    get_mempool_used_mem_high,
+    can_access_device,
+)
+from .runtime.modules import (  # noqa: F401
+    Module,
+    get_module,
+    _get_module,
+    set_module_options,
+    get_module_options,
+    clear_kernel_cache,
+    clear_lto_cache,
+)
+from .runtime.host import (  # noqa: F401
     WarpArray,
     zeros,
     empty,
     ones,
     full,
+    zeros_like,
+    empty_like,
+    ones_like,
+    full_like,
+    clone,
+    copy,
+    from_numpy,
     launch,
     synchronize,
+    capture_begin,
+    capture_end,
+    capture_launch,
+    capture_if,
+    capture_while,
+    Graph,
+    init,
     device_name,
-    Module,
 )
+
+# Upstream-internals aliases Newton relies on (``wp._src.context.runtime.core``).
+from .frontend import context as _frontend_context  # noqa: F401
+from .frontend import config as config  # noqa: F401
+from .frontend import utils as utils  # noqa: F401
+
+_src = _sys.modules["warp_metal.frontend"]  # upstream: warp._src
+_src.__name__ = "warp_metal._src"  # display parity with the upstream alias
+
+# Host-side transform helper (upstream signature: transform_expand(t)).
+from .frontend.types import transform as _transform_type  # noqa: E402
+
+
+def transform_expand(t) -> _transform_type:
+    """Expand a 7-element sequence (px,py,pz,qx,qy,qz,qw) into a transform."""
+    out = _transform_type()
+    vals = [float(v) for v in t]
+    if len(vals) != 7:
+        raise ValueError(f"transform_expand expects 7 elements, got {len(vals)}")
+    for i, v in enumerate(vals):
+        out[i] = v
+    return out
+
 
 __all__ = [
     "__version__",
     "EXPECTED_VENDORED_WARP_VERSION",
     "VendoredVersionError",
     "check_vendored_version",
-    "WarpArray",
-    "zeros",
-    "empty",
-    "ones",
-    "full",
-    "launch",
-    "synchronize",
-    "device_name",
-    "Module",
+    # decorators + type machinery
+    "kernel",
+    "func",
+    "overload",
+    "func_native",
+    "func_grad",
+    "func_replay",
     "struct",
     "Struct",
+    "Kernel",
+    "Function",
+    "Module",
+    # constants
     "pi",
     "PI",
     "tau",
     "inf",
     "nan",
     "HALF_PI",
+    "LOG_DEBUG",
+    "LOG_INFO",
+    "LOG_WARNING",
+    "LOG_ERROR",
+    # devices
+    "Device",
+    "Stream",
+    "Event",
+    "ScopedDevice",
+    "ScopedStream",
+    "get_device",
+    "get_current_device",
+    "set_device",
+    "get_preferred_device",
+    "get_stream",
+    "set_stream",
+    "synchronize_device",
+    "synchronize_stream",
+    "record_event",
+    "get_event_elapsed_time",
+    "is_cuda_available",
+    "is_metal_available",
+    "is_mempool_enabled",
+    "get_mempool_used_mem_current",
+    "get_mempool_used_mem_high",
+    "can_access_device",
+    # module hub
+    "get_module",
+    "set_module_options",
+    "get_module_options",
+    "clear_kernel_cache",
+    "clear_lto_cache",
+    # arrays + launch + capture
+    "WarpArray",
+    "zeros",
+    "empty",
+    "ones",
+    "full",
+    "zeros_like",
+    "empty_like",
+    "ones_like",
+    "full_like",
+    "clone",
+    "copy",
+    "from_numpy",
+    "launch",
+    "synchronize",
+    "capture_begin",
+    "capture_end",
+    "capture_launch",
+    "capture_if",
+    "capture_while",
+    "Graph",
+    "init",
+    "device_name",
+    "transform_expand",
+    "config",
+    "utils",
 ]
