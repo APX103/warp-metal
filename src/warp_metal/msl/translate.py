@@ -163,6 +163,24 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
         lines.append(f"    for (int i = 0; i < {N}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = m.c[j][i];")
         lines.append("    return r;")
         lines.append("}")
+        # value-returning component atomics (warp atomic_add/sub on arrays of
+        # matrix dtype, e.g. featherstone body_I_c accumulation): row-major
+        # float components are independently atomic
+        for op, fname in (("add", "wp_atomic_add_ret_at"), ("sub", "wp_atomic_sub_ret_at")):
+            lines.append(
+                f"static inline {msl_t} {fname}(device {msl_t}* d, wp_arr_meta m, int i, {msl_t} v) {{"
+            )
+            lines.append(
+                f"    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));"
+            )
+            lines.append(f"    {msl_t} r;")
+            lines.append(f"    for (int a = 0; a < {M}; ++a)")
+            lines.append(f"        for (int b = 0; b < {N}; ++b)")
+            lines.append(
+                f"            r.c[a][b] = atomic_fetch_{op}_explicit((device atomic_float*)(base + a*{N} + b), v.c[a][b], memory_order_relaxed);"
+            )
+            lines.append("    return r;")
+            lines.append("}")
     unit.structs[msl_t] = "\n".join(lines)
 
 

@@ -250,6 +250,43 @@ class TestSSAKernels(unittest.TestCase):
         np.testing.assert_allclose(o1.numpy_view(), (X < 0).astype(np.float32), rtol=TOL)
         np.testing.assert_allclose(o2.numpy_view().reshape(n, 6), -S.reshape(n, 6), rtol=TOL)
 
+    def test_mod_i64_length_spatial_atomic_mat(self):
+        # int64 wp.mod (ambiguity fix), wp.length on spatial_vectorf, and
+        # atomic_add on a mat6x6f array (joint_damping body_I_c accumulation).
+        @wp.kernel
+        def k(
+            a: wp.array(dtype=wp.int64),
+            b: wp.array(dtype=wp.int64),
+            om: wp.array(dtype=wp.int64),
+            s: wp.array(dtype=wp.spatial_vector),
+            ln: wp.array(dtype=wp.float32),
+            m: wp.array(dtype=wp.spatial_matrix),
+            am: wp.array(dtype=wp.spatial_matrix),
+        ):
+            i = wp.tid()
+            om[i] = wp.mod(a[i], b[i])
+            ln[i] = wp.length(s[i])
+            wp.atomic_add(m, i, am[i])
+
+        a = wp.empty(2, dtype=wp.int64, device="metal")
+        a.numpy_view()[:] = np.array([17, -17], dtype=np.int64)
+        b = wp.empty(2, dtype=wp.int64, device="metal")
+        b.numpy_view()[:] = np.array([5, 5], dtype=np.int64)
+        om = wp.empty(2, dtype=wp.int64, device="metal")
+        s = wp.empty(2, dtype=wp.spatial_vector, device="metal")
+        s.numpy_view()[:] = np.array([[3.0, 4.0, 0, 0, 0, 0], [1, 2, 2, 0, 0, 0]], dtype=np.float32)
+        ln = wp.empty(2, dtype=wp.float32, device="metal")
+        m = wp.zeros(2, dtype=wp.spatial_matrix, device="metal")
+        am = wp.empty(2, dtype=wp.spatial_matrix, device="metal")
+        am.numpy_view()[:] = np.tile(np.eye(6, dtype=np.float32) * 2.0, (2, 1)).reshape(2, 36)
+        wp.launch(k, dim=2, inputs=[a, b, om, s, ln, m, am], device="metal")
+        wp.synchronize()
+        np.testing.assert_array_equal(om.numpy_view(), np.array([2, -2], dtype=np.int64))
+        np.testing.assert_allclose(ln.numpy_view(), [5.0, 3.0], rtol=TOL)
+        np.testing.assert_allclose(
+            m.numpy_view().reshape(2, 6, 6), np.tile(np.eye(6) * 2.0, (2, 1)).reshape(2, 6, 6), rtol=TOL, atol=TOL
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

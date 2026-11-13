@@ -732,6 +732,8 @@ static inline transformf wp_transform_inverse(transformf t) {
 static inline vec3f wp_spatial_top(spatial_vectorf a) { return a.w; }
 static inline vec3f wp_spatial_bottom(spatial_vectorf a) { return a.v; }
 static inline float wp_dot(spatial_vectorf a, spatial_vectorf b) { return dot(a.w, b.w) + dot(a.v, b.v); }
+static inline float wp_length_sq(spatial_vectorf s) { return wp_dot(s, s); }
+static inline float wp_length(spatial_vectorf s) { return sqrt(wp_length_sq(s)); }
 static inline spatial_vectorf operator-(spatial_vectorf a) {
     spatial_vectorf r; r.w = -a.w; r.v = -a.v; return r;
 }
@@ -745,6 +747,8 @@ _SCALAR_OPS = """\
 // ---- scalar semantics (builtin.h DECLARE macros; Python-mod for floats) ----
 static inline int wp_mod(int a, int b) { return a % b; }            // builtin.h: a%b
 static inline uint wp_mod(uint a, uint b) { return a % b; }
+static inline int64_t wp_mod(int64_t a, int64_t b) { return a % b; }
+static inline uint64_t wp_mod(uint64_t a, uint64_t b) { return a % b; }
 static inline float wp_mod(float a, float b) {                      // builtin.h float mod: fmod + Python-sign fix
     float r = fmod(a, b);
     if (r != 0.0f && (r < 0.0f) != (b < 0.0f)) r += b;
