@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "warp-metal"
+version = "0.0.1"
+description = "Warp-compatible DSL frontend with a native Apple Metal (MSL) backend for Newton on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Jaylin Lee" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = []
+
+[project.urls]
+# Upstream the vendored frontend is derived from (attribution; not a dependency):
+Upstream = "https://github.com/NVIDIA/warp"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/warp_metal"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "LICENSE", "NOTICE", "README.md"]

@@ -1,0 +1,21 @@
+warp-metal
+Copyright 2026 Jaylin Lee
+
+This product includes substantial portions of code vendored from NVIDIA warp
+(https://github.com/NVIDIA/warp), licensed under the Apache License, Version 2.0:
+
+    Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+Vendored components and provenance:
+  - src/warp_metal/frontend/  — vendored from warp-lang 1.19.0 (python package
+    `warp-lang`, source tree `warp/_src/`), frozen upstream version: 1.19.0.
+    Modified from the original: NVIDIA-specific nvrtc/ptx/cuda binding paths
+    removed; Metal backend additions applied locally.
+
+All other components (src/warp_metal/msl/, src/warp_metal/runtime/,
+src/warp_metal/compat.py) are original work created for this project and are
+NOT derived from NVIDIA warp.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not
+use this file except in compliance with the License. You may obtain a copy of
+the License at http://www.apache.org/licenses/LICENSE-2.0.
