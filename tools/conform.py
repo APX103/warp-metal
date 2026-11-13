@@ -225,6 +225,11 @@ TOLERATED_MISMATCHES = {
     # upstream exports a plain host decorator; vendored registry exposes the
     # codegen Function — both callable as wp.static(expr) with same semantics.
     "static": "callable-equivalent（上游=普通函数，vendored=registry Function，内核语义一致）",
+    # upstream's module attr is a *args/**kwargs unpack wrapper; warp-metal
+    # spells the same upstream parameter list explicitly. Same call surface
+    # (launch_tiled(kernel, dim, inputs=..., outputs=..., block_dim=...)),
+    # adjoint kwargs fail loud per KEP-0001.
+    "launch_tiled": "签名等价（上游=*args/**kwargs 解包封装，warp-metal=显式上游参数表；调用面一致，adjoint 实参 fail-loud）",
 }
 
 
