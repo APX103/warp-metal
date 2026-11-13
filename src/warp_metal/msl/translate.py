@@ -118,9 +118,9 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
     lines.append(
         f"static inline float wp_extract({msl_t} m, int i, int j) {{ return m.c[i][j]; }}"
     )
-    # row assign (warp assign_inplace(m, i, vec))
-    assign_body = "; ".join(f"m.c[i][{j}] = v.{comp}" for j, comp in enumerate(
-        ["x", "y", "z", "w"][:N]))
+    # row assign (warp assign_inplace(m, i, vec)); wp_extract covers every
+    # row type (vec2f-5f, spatial_vectorf) and any width N (mat6x6 rows)
+    assign_body = "; ".join(f"m.c[i][{j}] = wp_extract(v, {j})" for j in range(N))
     lines.append(
         f"static inline void wp_assign_inplace(thread {msl_t}& m, int i, {vec} v) {{ {assign_body}; }}"
     )
@@ -251,6 +251,8 @@ _CALL_TABLE = {
     "pow": "wp_pow",
     "isinf": "wp_isinf",
     "isnan": "wp_isnan",
+    # matrix
+    "skew": "wp_skew",
     # vector
     "dot": "wp_dot",
     "outer": "wp_outer",

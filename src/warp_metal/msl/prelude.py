@@ -430,6 +430,14 @@ static inline vec3f wp_where(bool c, vec3f a, vec3f b) { return c ? a : b; }
 static inline vec4f wp_where(bool c, vec4f a, vec4f b) { return c ? a : b; }
 static inline quatf wp_where(bool c, quatf a, quatf b) { return c ? a : b; }
 static inline mat33f wp_where(bool c, mat33f a, mat33f b) { return c ? a : b; }
+// warp skew(v): the cross-product matrix with skew(v) * x == cross(v, x)
+static inline mat33f wp_skew(vec3f v) {
+    mat33f m = make_mat33f();
+    m.c[0][1] = -v.z; m.c[0][2] = v.y;
+    m.c[1][0] = v.z;  m.c[1][2] = -v.x;
+    m.c[2][0] = -v.y; m.c[2][1] = v.x;
+    return m;
+}
 static inline transformf wp_where(bool c, transformf a, transformf b) { return c ? a : b; }
 static inline spatial_vectorf wp_where(bool c, spatial_vectorf a, spatial_vectorf b) { return c ? a : b; }
 static inline float wp_where(bool c, float a, float b) { return c ? a : b; }
