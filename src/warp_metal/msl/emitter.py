@@ -164,24 +164,31 @@ static inline mat33f mat33_mul_mat(mat33f a, mat33f b) {
             r.c[i][j] = a.c[i][0]*b.c[0][j] + a.c[i][1]*b.c[1][j] + a.c[i][2]*b.c[2][j];
     return r;
 }
-// cofactor (adjugate) inverse, matches warp native mat_inverse for 3x3
+// exact port of warp native mat.h inverse_impl<3,3> (cofactor form:
+// full adjugate first, then elementwise scale by 1/det) for numeric parity
 static inline mat33f mat33_inverse(mat33f m) {
-    float c00 =  (m.c[1][1]*m.c[2][2] - m.c[1][2]*m.c[2][1]);
-    float c01 = -(m.c[1][0]*m.c[2][2] - m.c[1][2]*m.c[2][0]);
-    float c02 =  (m.c[1][0]*m.c[2][1] - m.c[1][1]*m.c[2][0]);
-    float det = m.c[0][0]*c00 + m.c[0][1]*c01 + m.c[0][2]*c02;
-    float inv_det = 1.0f / det;
-    mat33f r;
-    r.c[0][0] = c00 * inv_det;
-    r.c[0][1] = (m.c[0][2]*m.c[2][1] - m.c[0][1]*m.c[2][2]) * inv_det;
-    r.c[0][2] = (m.c[0][1]*m.c[1][2] - m.c[0][2]*m.c[1][1]) * inv_det;
-    r.c[1][0] = c01 * inv_det;
-    r.c[1][1] = (m.c[0][0]*m.c[2][2] - m.c[0][2]*m.c[2][0]) * inv_det;
-    r.c[1][2] = (m.c[0][2]*m.c[1][0] - m.c[0][0]*m.c[1][2]) * inv_det;
-    r.c[2][0] = c02 * inv_det;
-    r.c[2][1] = (m.c[0][1]*m.c[2][0] - m.c[0][0]*m.c[2][1]) * inv_det;
-    r.c[2][2] = (m.c[0][0]*m.c[1][1] - m.c[0][1]*m.c[1][0]) * inv_det;
-    return r;
+    float det = m.c[0][0]*(m.c[1][1]*m.c[2][2] - m.c[1][2]*m.c[2][1])
+              - m.c[0][1]*(m.c[1][0]*m.c[2][2] - m.c[1][2]*m.c[2][0])
+              + m.c[0][2]*(m.c[1][0]*m.c[2][1] - m.c[1][1]*m.c[2][0]);
+    if (det != 0.0f) {
+        mat33f b;
+        b.c[0][0] = m.c[1][1]*m.c[2][2] - m.c[1][2]*m.c[2][1];
+        b.c[1][0] = m.c[1][2]*m.c[2][0] - m.c[1][0]*m.c[2][2];
+        b.c[2][0] = m.c[1][0]*m.c[2][1] - m.c[1][1]*m.c[2][0];
+        b.c[0][1] = m.c[0][2]*m.c[2][1] - m.c[0][1]*m.c[2][2];
+        b.c[1][1] = m.c[0][0]*m.c[2][2] - m.c[0][2]*m.c[2][0];
+        b.c[2][1] = m.c[0][1]*m.c[2][0] - m.c[0][0]*m.c[2][1];
+        b.c[0][2] = m.c[0][1]*m.c[1][2] - m.c[0][2]*m.c[1][1];
+        b.c[1][2] = m.c[0][2]*m.c[1][0] - m.c[0][0]*m.c[1][2];
+        b.c[2][2] = m.c[0][0]*m.c[1][1] - m.c[0][1]*m.c[1][0];
+        float rcp_det = 1.0f / det;
+        // b * rcp_det (warp mat_t scalar multiply)
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                b.c[i][j] *= rcp_det;
+        return b;
+    }
+    return mat33f();
 }
 
 // ---- fp32 device atomics (Metal 2+; replaces warp's CUDA atomic path) ----
