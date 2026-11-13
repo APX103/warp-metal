@@ -32,6 +32,8 @@ from typing import Any
 
 import numpy as np
 
+from copy import copy as shallowcopy  # vendored registry uses copy() in get_overload
+
 from . import _pkg
 from .logger import log_warning
 from .codegen import (

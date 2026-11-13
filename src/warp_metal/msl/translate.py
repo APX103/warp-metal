@@ -142,6 +142,8 @@ _CALL_TABLE = {
     "bit_xor": "wp_bit_xor",
     "lshift": "wp_lshift",
     "rshift": "wp_rshift",
+    "invert": "wp_invert",
+    "unot": "wp_unot",
     # rounding/trig/scalar
     "sqrt": "wp_sqrt",
     "sin": "wp_sin",
@@ -149,6 +151,8 @@ _CALL_TABLE = {
     "tan": "wp_tan",
     "asin": "wp_asin",
     "acos": "wp_acos",
+    "atan": "wp_atan",
+    "atan2": "wp_atan2",
     "isfinite": "wp_isfinite",
     "nan": "wp_nan",
     # vector
@@ -160,6 +164,8 @@ _CALL_TABLE = {
     "ddot": "wp_ddot",
     "transpose": "wp_transpose",
     "inverse": "wp_inverse",
+    "matrix_from_cols": "wp_matrix_from_cols",
+    "matrix_from_rows": "wp_matrix_from_rows",
     "extract": "wp_extract",
     "where": "wp_where",
     "assign_inplace": "wp_assign_inplace",
@@ -169,6 +175,8 @@ _CALL_TABLE = {
     "quat_rotate": "wp_quat_rotate",
     "quat_rotate_inv": "wp_quat_rotate_inv",
     "quat_to_matrix": "wp_quat_to_matrix",
+    "quat_from_matrix": "wp_quat_from_matrix",
+    "quat_from_axis_angle": "wp_quat_from_axis_angle",
     # transform
     "transform_identity": "wp_transform_identity",
     "transform_get_translation": "wp_transform_get_translation",
@@ -376,11 +384,26 @@ def fn_src(fn: MSLFunction) -> str:
 # ---------------------------------------------------------------------------
 
 class _BodyTranslator:
-    def __init__(self, unit: KernelUnit, args: dict[str, ArgSpec], user_funcs: dict[str, "MSLFunction"]):
+    def __init__(self, unit: KernelUnit, args: dict[str, ArgSpec], user_funcs: dict[str, "MSLFunction"],
+                 scope: str = "kernel"):
         self.unit = unit
-        self.array_args = {f"var_{a.name}": a for a in args.values() if a.kind == "array"}
+        self.scope = scope  # "kernel" (Params buffer) | "func" (meta params)
+        self.array_args = {}
+        for a in args.values():
+            if a.kind != "array":
+                continue
+            key = a.name if a.name.startswith("var_") else f"var_{a.name}"
+            self.array_args[key] = a
         self.user_funcs = user_funcs  # native name -> translation (param kinds)
         self.aliases: dict[str, tuple[bool, str]] = {}  # var -> (is_pointer, value expr)
+        # `wp::Any var_N;` decls (wp.static temps) — typed at first assignment
+        self.deferred_any: set[str] = set()
+
+    def _meta_ref(self, spec: ArgSpec) -> str:
+        """wp_arr_meta reference for an array arg in the current scope."""
+        if self.scope == "kernel":
+            return f"_wp_args.{spec.name}_m"
+        return f"{spec.name}_m"  # fn_src emits `constant wp_arr_meta& {name}_m`
 
     # -- expressions ---------------------------------------------------------
 
@@ -390,10 +413,37 @@ class _BodyTranslator:
         if m:
             tid_src = self._builtin_tid(m.group(1), m.group(2))
             return tid_src
+        if src in self.array_args:
+            # array used as a value (phi merges of `if arr:` blocks, bool
+            # contexts): upstream tests array_t's non-null data pointer, and
+            # warp-metal always binds a real buffer → statically true
+            return "true"
+        # value aliases (`&(x).field`, array-truthiness temps) resolve inline
+        alias = self.aliases.get(src)
+        if alias is not None:
+            if alias[0]:
+                raise TranslationError(f"pointer alias {src!r} used outside wp::load")
+            return alias[1]
+        # short-circuit bool ops: SSA keeps C++ `&&`/`||` on bool temps
+        for op in ("&&", "||"):
+            parts = _split_bool_op(src, op)
+            if parts is not None:
+                return f"({self.expr(parts[0])} {op} {self.expr(parts[1])})"
         idx = src.find("wp::")
-        if idx < 0:
-            return src  # plain var / already-valid MSL op expression
         if idx != 0:
+            # user function call in expression context (RHS of assignment):
+            # needs param-aware expansion (array params → data + meta args)
+            m = re.match(r"^([A-Za-z_]\w*)\(", src)
+            if m and (
+                m.group(1) in self.user_funcs
+                or m.group(1) in self.unit.structs
+                or m.group(1) in ("printf", "print")
+            ):
+                close = _find_balanced(src, len(m.group(1)) - 1)
+                if not src[close + 1 :].strip():
+                    return self._call_user(src[: close + 1])
+            if idx < 0:
+                return src  # plain var / already-valid MSL op expression
             # wp:: inside a larger expression (e.g. casts inside ops) — recurse
             # around it: only single-call or operator forms occur in the SSA
             head, tail = src[:idx], src[idx:]
@@ -422,6 +472,10 @@ class _BodyTranslator:
             raise TranslationError(f"trailing text after call in {src!r}")
         args = split_args(inner)
 
+        # aggregate init forms arrive as one braced wrapper (`wp::spatial_vector_t<f32>({a,...,f})`)
+        if inner.startswith("{") and inner.endswith("}"):
+            args = split_args(inner[1:-1])
+
         if key in _ZEROARG_TABLE:
             if args:
                 raise TranslationError(f"{key} expected no args, got {args}")
@@ -447,15 +501,25 @@ class _BodyTranslator:
             # value-returning context (warp atomics return the old value)
             return self._atomic(key[4:], args, ret=True)
         if key in ("wp::print", "wp::printf"):
-            raise TranslationError(
-                "wp.printf: MSL printf output is host-tool-dependent; not wired in M1.3 (fail loud)"
-            )
+            # wp.print is debug stdout only — it cannot affect output arrays,
+            # so elide it in MSL (Metal device printf is host-tool-dependent).
+            # The generated line keeps a marker so the elision stays visible.
+            return "/* wp.print elided (Metal) */ 0"
         if key in ("wp::mesh_get", "wp::bvh_get_group_root", "wp::hash_grid_query", "wp::mesh_query"):
             raise TranslationError(
                 f"{key}: BVH/Mesh device builtins are Phase 2 (KEP-0001); not available in M1.3"
             )
-        if key[4:] in _CALL_TABLE:
-            return f"{_CALL_TABLE[key[4:]]}({', '.join(self.expr(a) for a in args)})"
+        if key == "wp::static":
+            # wp.static(x): compile-time constant expression — emit the arg
+            # (the `wp::Any` decl it feeds is deferred to the first assignment)
+            if len(args) != 1:
+                raise TranslationError(f"wp::static with {len(args)} args")
+            return self.expr(args[0])
+        # generic calls carry a template suffix (`wp::matrix_from_cols<wp::float32>`);
+        # strip it for the plain-call table (cast/ctor tables keep the full key)
+        base = key[4:].split("<", 1)[0]
+        if base in _CALL_TABLE:
+            return f"{_CALL_TABLE[base]}({', '.join(self.expr(a) for a in args)})"
         raise TranslationError(f"builtin {key!r} has no MSL translation")
 
     def _load(self, var: str) -> str:
@@ -484,6 +548,12 @@ class _BodyTranslator:
             # bare iter_cmp/iter_next on the range-loop condition line
             return [_RE_ITER.sub(lambda mo: f"wp_{mo.group(1)}(", out)]
         if m := _RE_IF_OPEN.match(line):
+            cond = m.group(1).strip()
+            # array truthiness (`if arr:` — upstream emits `if (array_var)`
+            # via array_t's non-null data check; warp-metal always binds a
+            # real device buffer, so the check is statically true)
+            if cond in self.array_args:
+                return ["if (true) {"]
             return [f"if ({self.expr(m.group(1))}) {{"]
         if _RE_ELSE.match(line):
             return ["} else {"]
@@ -500,6 +570,16 @@ class _BodyTranslator:
             if rhs.startswith("wp::address(") or rhs.startswith("&("):
                 self._alias(target, rhs)
                 return []  # alias collapsed: no MSL line, no decl (pointer decl was dropped)
+            if rhs in self.array_args:
+                # array-truthiness temp (`t = arr;` then `if (t)`) — upstream
+                # tests the array data pointer non-null; always bound here
+                self.aliases[target] = (False, "true")
+                return []
+            if target in self.deferred_any:
+                # first assignment to a `wp::Any` temp (wp.static lowering):
+                # declare with a deduced `auto` type at the point of init
+                self.deferred_any.discard(target)
+                return [f"const auto {target} = {self.expr(rhs)};"]
             return [f"{target} = {self.expr(rhs)};"]
 
         # alias creation: var_p = wp::address(...) / var_p = &(expr)
@@ -512,6 +592,14 @@ class _BodyTranslator:
             # are dropped (address-of aliases collapse to direct reads)
             if ctype.rstrip().endswith("*"):
                 return []
+            if ctype.strip() == "wp::Any":
+                # wp.static temps: type-erased in the SSA; declared as
+                # `const auto` at the first (only) assignment instead
+                self.deferred_any.add(name)
+                return []
+            if ctype.strip() == "wp::str":
+                # string-literal temps feed only wp.print, which is elided
+                return []
             if not ctype:
                 raise TranslationError(f"EMPTY TYPE on line {line!r}")
             try:
@@ -520,7 +608,14 @@ class _BodyTranslator:
                 raise TranslationError(f"decl line {line!r}: {e}")
             if init is not None:
                 return [f"{'const ' if const else ''}{msl_t} {name} = {self.expr(init)};"]
-            return [f"{'const ' if const else ''}{msl_t} {name};"]
+            # zero-init: Metal promotes -Wsometimes-uninitialized to an error
+            # on phi-merged temps; SSA assigns before every reachable read,
+            # so a static zero is never observable
+            if msl_t in ("vec2f", "vec3f", "vec4f", "quatf", "mat22f", "mat33f", "mat44f",
+                         "transformf", "spatial_vectorf", "vec2i", "vec3i", "vec4i",
+                         "wp_range") or msl_t in self.unit.structs:
+                return [f"{'const ' if const else ''}{msl_t} {name} = {{}};"]
+            return [f"{'const ' if const else ''}{msl_t} {name} = 0;"]
 
         if m := re.match(r"^\s*(.+?);\s*$", line):
             return [self.call_stmt(m.group(1)) + ";"]
@@ -535,7 +630,7 @@ class _BodyTranslator:
             if spec is None:
                 raise TranslationError(f"wp::address on non-array arg {arr_var!r}")
             idx = ", ".join(self.expr(a) for a in args[1:])
-            expr = f"wp_address({spec.name}_data, _wp_args.{spec.name}_m{', ' + idx if idx else ''})"
+            expr = f"wp_address({spec.name}_data, {self._meta_ref(spec)}{', ' + idx if idx else ''})"
             self.aliases[var] = (True, expr)
             return
         # &(expr) reference forms
@@ -545,7 +640,7 @@ class _BodyTranslator:
             spec = self.array_args.get(shape_of.group(1))
             if spec is None:
                 raise TranslationError(f"&(...shape) on non-array arg {inner!r}")
-            s = f"_wp_args.{spec.name}_m.shape"
+            s = f"{self._meta_ref(spec)}.shape"
             expr = f"int4({s}[0], {s}[1], {s}[2], {s}[3])"
             self.aliases[var] = (False, expr)
             return
@@ -585,7 +680,7 @@ class _BodyTranslator:
                 raise TranslationError(f"wp::array_store on non-array arg {arr_var!r}")
             idx = ", ".join(self.expr(a) for a in args[1:-1])
             value = self.expr(args[-1])
-            return f"*wp_address({spec.name}_data, _wp_args.{spec.name}_m{', ' + idx if idx else ''}) = {value}"
+            return f"*wp_address({spec.name}_data, {self._meta_ref(spec)}{', ' + idx if idx else ''}) = {value}"
         if key and key[4:].startswith("atomic_"):
             return self._atomic(key[4:], args)
         # value-producing builtins as statements: emit as expression statement
@@ -599,7 +694,7 @@ class _BodyTranslator:
         idx = ", ".join(self.expr(a) for a in args[1:-1])
         value = self.expr(args[-1])
         suffix = "_ret_at" if ret else "_at"
-        return f"wp_{op}{suffix}({spec.name}_data, _wp_args.{spec.name}_m{', ' + idx if idx else ''}, {value})"
+        return f"wp_{op}{suffix}({spec.name}_data, {self._meta_ref(spec)}{', ' + idx if idx else ''}, {value})"
 
     def _call_user(self, src: str) -> str:
         name = src.split("(", 1)[0]
@@ -610,6 +705,9 @@ class _BodyTranslator:
             # struct value constructor (Name_hash(...)) — rewrite to make_<T>
             if name in self.unit.structs:
                 return f"make_{name}({', '.join(self.expr(a) for a in args)})"
+            if name in ("printf", "print"):
+                # wp.printf lowers to a native printf call; elided like wp::print
+                return "/* wp.print elided (Metal) */ 0"
             return f"{name}({', '.join(self.expr(a) for a in args)})"
         out: list[str] = []
         vi = 0
@@ -623,7 +721,7 @@ class _BodyTranslator:
                 if spec is None:
                     raise TranslationError(f"array param {p.name} of {name} got non-array {arg!r}")
                 out.append(f"{spec.name}_data")
-                out.append(f"_wp_args.{spec.name}_m")
+                out.append(self._meta_ref(spec))
             else:
                 out.append(self.expr(arg))
         if vi != len(args):
@@ -633,6 +731,22 @@ class _BodyTranslator:
 
 _RE_ITER = re.compile(r"\b(iter_cmp|iter_next)\(")
 _RE_SEC = re.compile(r"^\s*//\s*(argument vars|primal vars|forward)\s*$")
+
+
+def _split_bool_op(src: str, op: str) -> tuple[str, str] | None:
+    """Split `a && b` / `a || b` at the top level (outside parens/brackets)."""
+    depth = 0
+    i = 0
+    while i < len(src) - 1:
+        c = src[i]
+        if c in "(<[{":
+            depth += 1
+        elif c in ")>]}" and depth > 0:
+            depth -= 1
+        elif depth == 0 and src.startswith(op, i):
+            return src[:i].strip(), src[i + len(op):].strip()
+        i += 1
+    return None
 
 
 def _classify_ctype(ctype: str) -> str:
@@ -784,7 +898,9 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
         ctype, pname = arg_src.rsplit(None, 1)
         if _classify_ctype(ctype) == "array":
             fn.params.append(Param("array", array_elem_msl(ctype), pname))
-            args_by_var[f"var_{pname}"] = ArgSpec(pname, "array", ctype)
+            # C++ SSA function params already carry the var_ prefix
+            key = pname if pname.startswith("var_") else f"var_{pname}"
+            args_by_var[key] = ArgSpec(pname, "array", ctype)
         else:
             fn.params.append(Param("value", msl_type(ctype), pname))
             if _classify_ctype(ctype) == "struct":
@@ -792,17 +908,25 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
                     if var.label == pname:
                         _emit_struct_def(var.type, unit, _codegen)
 
-    tr = _BodyTranslator(unit, args_by_var, user_funcs)
+    tr = _BodyTranslator(unit, args_by_var, user_funcs, scope="func")
     section = None
+    depth = 0  # emitted-brace depth; 0 → the C++ function's closing brace
     for line in lines[body_start:]:
         if m := _RE_SEC.match(line):
             section = m.group(1)
             continue
-        if line.strip() == "}":
-            break
         if section in (None, "argument vars"):
             continue  # args are the MSL signature params already
-        fn.lines.extend(tr.stmt(line))
+        if line.strip() == "}" and depth == 0:
+            break  # function-closing brace (early `return` blocks nest deeper)
+        out = tr.stmt(line)
+        for emitted in out:
+            s = emitted.strip()
+            if s.endswith("{"):
+                depth += 1
+            elif s == "}":
+                depth -= 1
+        fn.lines.extend(out)
     return fn
 
 

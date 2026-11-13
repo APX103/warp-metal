@@ -39,6 +39,7 @@ from ..frontend.types import (
     uint16,
     int64,
     uint64,
+    bool as warp_bool,
     vec2f,
     vec3f,
     vec4f,
@@ -48,6 +49,9 @@ from ..frontend.types import (
     mat44f,
     transformf,
     spatial_vectorf,
+    vec2i,
+    vec3i,
+    vec4i,
 )
 from .. import native as _mm
 from ..msl.emitter import MSLEmitter
@@ -64,6 +68,7 @@ _SCALAR_NP = {
     uint16: np.uint16,
     int64: np.int64,
     uint64: np.uint64,
+    warp_bool: np.bool_,
 }
 
 # composite warp dtypes: contiguous runs of float32
@@ -79,6 +84,13 @@ _COMPOSITE_FLOATS = {
     spatial_vectorf: 6,  # {vec3 w, vec3 v}
 }
 
+# composite warp dtypes: contiguous runs of int32 (vec.h vec_t with int)
+_COMPOSITE_INTS = {
+    vec2i: 2,
+    vec3i: 3,
+    vec4i: 4,
+}
+
 _CTYPES_PTR = {
     np.float32: ctypes.c_float,
     np.float16: ctypes.c_uint16,   # view later
@@ -90,6 +102,7 @@ _CTYPES_PTR = {
     np.uint16: ctypes.c_uint16,
     np.int64: ctypes.c_int64,
     np.uint64: ctypes.c_uint64,
+    np.bool_: ctypes.c_bool,
 }
 
 
@@ -101,6 +114,9 @@ def _dtype_layout(dtype):
     n = _COMPOSITE_FLOATS.get(dtype)
     if n is not None:
         return np.float32, 4 * n, True
+    n = _COMPOSITE_INTS.get(dtype)
+    if n is not None:
+        return np.int32, 4 * n, True
     raise NotImplementedError(f"dtype {dtype} not in spike subset")
 
 

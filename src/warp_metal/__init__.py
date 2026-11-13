@@ -180,6 +180,27 @@ def transform_expand(t) -> _transform_type:
     return out
 
 
+# Vendored upstream math helpers (warp 1.19 warp/_src/math.py verbatim).
+# Upstream attaches these @wp.func definitions to the wp namespace at import
+# time; imported last so every attribute their bodies reference exists, then
+# re-exported so kernels resolve wp.quat_to_euler & co. as user functions.
+from .frontend.math_funcs import (  # noqa: E402
+    norm_huber,
+    norm_l1,
+    norm_l2,
+    norm_pseudo_huber,
+    quat_from_euler,
+    quat_to_euler,
+    quat_to_rpy,
+    quat_twist,
+    quat_twist_angle,
+    quat_twist_angle_signed,
+    smooth_normalize,
+    transform_twist,
+    transform_wrench,
+    velocity_at_point,
+)
+
 __all__ = [
     "__version__",
     "EXPECTED_VENDORED_WARP_VERSION",

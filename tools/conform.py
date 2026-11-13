@@ -333,9 +333,272 @@ def format_surface_section(res: dict) -> str:
 # Layers (b) corpus and (c) trajectory — M1.7(b)/(c)
 # --------------------------------------------------------------------------
 
+# corpus: (newton module, kernel qualname, builder name in corpus_builders).
+# Builders live in tools/corpus_builders.py (pure numpy, both venvs).
+CORPUS_TABLE = [
+    ("newton._src.solvers.solver", "integrate_bodies", "integrate_bodies"),
+    ("newton._src.solvers.solver", "_update_effective_inv_mass_inertia", "update_effective_inv_mass_inertia"),
+    ("newton._src.geometry.inertia", "compute_body_inverses_kernel", "compute_body_inverses_kernel"),
+    ("newton._src.geometry.inertia", "validate_and_correct_inertia_kernel", "validate_and_correct_inertia_kernel"),
+    ("newton._src.geometry.bvh", "compute_enabled_shapes", "compute_enabled_shapes"),
+    ("newton._src.geometry.bvh", "compute_shape_world_transforms", "compute_shape_world_transforms"),
+    ("newton._src.geometry.bvh", "compute_bvh_group_roots", "compute_bvh_group_roots"),
+    ("newton._src.viewer.kernels", "update_shape_xforms", "update_shape_xforms"),
+    ("newton._src.viewer.kernels", "repack_shape_colors", "repack_shape_colors"),
+    ("newton._src.viewer.kernels", "repack_shape_opacities", "repack_shape_opacities"),
+    ("newton._src.viewer.kernels", "estimate_world_extents", "estimate_world_extents"),
+    ("newton._src.viewer.kernels", "compute_com_positions", "compute_com_positions"),
+    ("newton._src.sim.collide", "compute_shape_aabbs", "compute_shape_aabbs"),
+    ("newton._src.sim.collide", "_record_reduction_overflow", "record_reduction_overflow"),
+    ("newton._src.geometry.broad_phase_nxn", "_nxn_broadphase_precomputed_pairs", "nxn_broadphase_precomputed_pairs"),
+    ("newton._src.geometry.narrow_phase", "compute_mesh_plane_vert_counts", "compute_mesh_plane_vert_counts"),
+    ("newton._src.geometry.narrow_phase", "verify_narrow_phase_buffers", "verify_narrow_phase_buffers"),
+    ("newton._src.solvers.xpbd.kernels", "apply_joint_forces", "apply_joint_forces"),
+    ("newton._src.solvers.xpbd.kernels", "apply_body_deltas", "apply_body_deltas"),
+    ("newton._src.solvers.xpbd.kernels", "solve_body_joints", "solve_body_joints"),
+    ("newton._src.solvers.xpbd.kernels", "solve_body_contact_positions", "solve_body_contact_positions"),
+    ("newton._src.solvers.xpbd.kernels", "copy_kinematic_body_state_kernel", "copy_kinematic_body_state_kernel"),
+    ("newton._src.geometry.contact_reduction_global", "_clear_active_kernel", "clear_active_kernel"),
+    ("newton._src.geometry.contact_reduction_global", "_zero_active_count_kernel", "zero_active_count_kernel"),
+    ("newton._src.geometry.contact_reduction_global", "reduce_buffered_contacts_kernel", None),
+    ("newton._src.geometry.contact_reduction_global", "mesh_triangle_contacts_to_reducer_kernel", None),
+    ("newton._src.geometry.narrow_phase", "create_narrow_phase_primitive_kernel.<locals>.narrow_phase_primitive_kernel", None),
+    ("newton._src.geometry.narrow_phase", "create_narrow_phase_kernel_gjk_mpr.<locals>.narrow_phase_kernel_gjk_mpr", None),
+    ("newton._src.geometry.narrow_phase", "_create_find_mesh_triangle_overlaps_kernel.<locals>.narrow_phase_find_mesh_triangle_overlaps_kernel", None),
+    ("newton._src.sim.articulation", "eval_articulation_fk", None),
+]
 
-def run_corpus() -> dict:
-    sys.exit("error: corpus layer not implemented yet (KEP-0001 M1.7(b))")
+_GJK_SKIP = "GJK/MPR factory kernel calls @wp.func_native support functions (Metal translation: Phase 2)"
+_STRUCT_SKIP = "kernel takes a struct param with array fields (GlobalContactReducerData) — fail loud in the M1.3 emitter"
+_ARTICULATION_SKIP = "articulation FK needs a joint-model fixture (builder pending)"
+_DEFAULT_SEED = 20261113
+CORPUS_NPZ = Path(__file__).resolve().parent / "corpus_golden.npz"
+
+
+def _corpus_dtype(pkg, key: str):
+    """Element dtype object for a corpus dtype key, per side's wp package."""
+    return {
+        "f32": pkg.float32, "i32": pkg.int32, "u32": pkg.uint32, "u64": pkg.uint64,
+        "bool": pkg.bool, "vec3": pkg.vec3, "vec4": pkg.vec4, "vec2i": pkg.vec2i,
+        "vec3i": pkg.vec3i, "vec4i": pkg.vec4i, "mat33": pkg.mat33,
+        "transform": pkg.transform, "spatial_vector": pkg.spatial_vector,
+    }[key]
+
+
+def _corpus_launch_dim(args) -> int | tuple:
+    """Launch dim: explicit '__dim__' entry, else first output, else first array."""
+    explicit = [v for (n, _k, v) in args if n == "__dim__"]
+    if explicit:
+        return explicit[0]
+    for name, key, val in args:
+        if key.startswith("out"):
+            return val
+    for name, key, val in args:
+        if key.startswith("arr"):
+            return int(val.shape[0])
+    raise ValueError("cannot derive corpus launch dim")
+
+
+
+def _arr_view(arr):
+    """numpy view of an array from either side (real warp vs warp_metal)."""
+    v = getattr(arr, "numpy_view", None)
+    return v() if v is not None else arr.numpy()
+
+def _pack_args(pkg, args, device="cpu"):
+    """(launch_args, dim, out_arrays, out_names) from builder triples.
+
+    Every argument is passed through ``inputs`` in signature order (upstream
+    warp treats ``outputs`` as pure convenience — Newton's own call sites
+    pass output arrays via ``inputs`` too). ``out_arrays``/``out_names``
+    capture the buffers to compare after the launch.
+    """
+    import numpy as np
+
+    launch_args, out_arrays, out_names = [], [], []
+    dim = _corpus_launch_dim(args)
+    for name, key, val in args:
+        if name == "__dim__":
+            continue
+        if key.startswith("arr:") or key.startswith("io:"):
+            off = 4 if key.startswith("arr:") else 3
+            elem = _corpus_dtype(pkg, key[off:])
+            arr = pkg.zeros(int(val.shape[0]), dtype=elem, device=device)
+            view = _arr_view(arr)
+            view[:] = val.reshape(view.shape)
+            launch_args.append(arr)
+        elif key.startswith("arr2:"):
+            elem = _corpus_dtype(pkg, key[5:])
+            arr = pkg.zeros(val.shape, dtype=elem, device=device)
+            view = _arr_view(arr)
+            view[:] = val.reshape(view.shape)
+            launch_args.append(arr)
+        elif key.startswith("out2:"):
+            elem = _corpus_dtype(pkg, key[5:])
+            out_arr = pkg.zeros(val, dtype=elem, device=device)
+            launch_args.append(out_arr)
+            out_arrays.append(out_arr)
+            out_names.append(name)
+        elif key.startswith("out:"):
+            elem = _corpus_dtype(pkg, key[4:])
+            out_arr = pkg.zeros(int(val), dtype=elem, device=device)
+            launch_args.append(out_arr)
+            out_arrays.append(out_arr)
+            out_names.append(name)
+        elif key.startswith("scalar:"):
+            launch_args.append(bool(val) if key[7:] == "bool" else val)
+        elif key.startswith("value:"):
+            # value-typed param: wp.transform-style 7-float sequence
+            t = pkg.transform()
+            for i, v in enumerate(np.asarray(val, dtype=np.float32).ravel()):
+                t[i] = v
+            launch_args.append(t)
+        else:
+            raise ValueError(f"bad corpus dtype key {key!r}")
+    return launch_args, dim, out_arrays, out_names
+
+
+def run_corpus_golden(out_npz: Path) -> dict:
+    """Golden phase (Newton venv, real warp): CPU reference for every entry."""
+    import numpy as np
+
+    try:
+        import warp  # noqa: F401 — must be the REAL warp-lang
+        if "warp_metal" in sys.modules:
+            raise ImportError
+    except ImportError:
+        sys.exit("error: corpus golden phase must run under the Newton venv (real warp)")
+
+    tool_dir = Path(__file__).resolve().parent
+    for p in (str(NEWTON_REPO / "src"), str(NEWTON_REPO), str(tool_dir)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    import warp as wp  # real warp-lang, CPU(LLVM)
+
+    import corpus_builders as cb
+
+    meta = {}
+    payload = {}
+    for module, qualname, builder in CORPUS_TABLE:
+        entry = f"{module}.{qualname}"
+        if builder is None:
+            reason = (_GJK_SKIP if "<locals>" in qualname else
+                      (_STRUCT_SKIP if "contact" in qualname else _ARTICULATION_SKIP))
+            meta[entry] = {"skip": reason}
+            continue
+        args, skips = cb.BUILDERS[builder](np.random.default_rng(_DEFAULT_SEED))
+        if skips:
+            meta[entry] = {"skip": "; ".join(skips)}
+            continue
+        mod = importlib.import_module(module)
+        kern = getattr(mod, qualname)
+        launch_args, dim, out_arrays, out_names = _pack_args(wp, args)
+        wp.launch(kern, dim, inputs=launch_args, outputs=[], device="cpu")
+        wp.synchronize()
+        for i, name in enumerate(out_names):
+            payload[f"{qualname}::{name}"] = _arr_view(out_arrays[i]).copy()
+        meta[entry] = {"builder": builder, "dim": dim}
+    np.savez(out_npz, **payload)
+    (out_npz.parent / "corpus_golden_meta.json").write_text(json.dumps(meta, indent=1))
+    return meta
+
+
+def _metal_shim_bootstrap() -> None:
+    """Alias warp -> warp_metal (mini-M1.5) BEFORE importing newton modules."""
+    import warp_metal
+
+    sys.modules["warp"] = warp_metal
+    for _name, _mod in list(sys.modules.items()):
+        if _name == "warp_metal" or _name.startswith("warp_metal."):
+            sys.modules.setdefault("warp" + _name[len("warp_metal"):], _mod)
+        if _name.startswith("warp_metal.frontend"):
+            _rest = _name[len("warp_metal.frontend"):]
+            sys.modules.setdefault("warp." + _rest.lstrip("."), _mod)
+            sys.modules.setdefault("warp._src" + _rest, _mod)
+
+
+def run_corpus(golden_npz: Path) -> str:
+    """Compare phase (this venv): Metal launches vs the CPU golden npz."""
+    import numpy as np
+
+    if not golden_npz.is_file():
+        # two-phase: run the golden side under the Newton venv first
+        cmd = [
+            str(NEWTON_PYTHON), "-I", str(Path(__file__).resolve()),
+            "--layer", "corpus", "--corpus-golden", str(golden_npz),
+        ]
+        print("golden phase:", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+    meta = json.loads(golden_npz.with_name("corpus_golden_meta.json").read_text())
+    data = np.load(golden_npz)
+
+    tool_dir = Path(__file__).resolve().parent
+    for p in (str(NEWTON_REPO / "src"), str(NEWTON_REPO), str(tool_dir)):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    _metal_shim_bootstrap()
+    import warp_metal as wp
+
+    import corpus_builders as cb
+
+    passed, failed, skipped = [], [], []
+    for module, qualname, builder in CORPUS_TABLE:
+        entry = f"{module}.{qualname}"
+        short = qualname.split(".")[-1]
+        m = meta.get(entry, {})
+        if "skip" in m:
+            skipped.append((short, m["skip"]))
+            continue
+        args, _skips = cb.BUILDERS[builder](np.random.default_rng(_DEFAULT_SEED))
+        try:
+            mod = importlib.import_module(module)
+            kern = getattr(mod, qualname)
+            launch_args, dim, out_arrays, out_names = _pack_args(wp, args, device="metal")
+            wp.launch(kern, dim, inputs=launch_args, outputs=[], device="metal")
+            wp.synchronize()
+            ok, detail = True, []
+            for i, name in enumerate(out_names):
+                got = _arr_view(out_arrays[i])
+                want = data[f"{qualname}::{name}"]
+                if got.dtype.kind in "iub":
+                    if not np.array_equal(got.reshape(want.shape), want):
+                        ok = False
+                        detail.append(name)
+                else:
+                    try:
+                        np.testing.assert_allclose(got.reshape(want.shape), want, rtol=1e-5, atol=1e-6)
+                    except AssertionError:
+                        ok = False
+                        detail.append(name)
+            (passed if ok else failed).append((short, ",".join(detail) or "all outputs"))
+        except Exception as e:  # noqa: BLE001 — corpus entries report, never abort
+            failed.append((short, f"{type(e).__name__}: {str(e)[:120]}"))
+
+    lines = [
+        f"- golden: {len(meta)} entries, npz `{golden_npz.name}` (seed {_DEFAULT_SEED}); "
+        f"Metal compare rtol 1e-5 / atol 1e-6（整数位级相等）",
+        f"- **passed: {len(passed)}**（ratchet 只升不降；前值见 git 历史）",
+        f"- failed: {len(failed)}; skipped: {len(skipped)}",
+        "",
+    ]
+    if passed:
+        lines.append("| kernel | outputs |")
+        lines.append("|---|---|")
+        for name, detail in sorted(passed):
+            lines.append(f"| {name} | {detail} |")
+        lines.append("")
+    if failed:
+        lines.append("| kernel | first divergence / error |")
+        lines.append("|---|---|")
+        for name, detail in sorted(failed):
+            lines.append(f"| {name} | {detail} |")
+        lines.append("")
+    if skipped:
+        lines.append("| kernel | skip reason |")
+        lines.append("|---|---|")
+        for name, reason in sorted(skipped):
+            lines.append(f"| {name} | {reason} |")
+    return "\n".join(lines)
 
 
 def run_trajectory() -> dict:
@@ -401,6 +664,8 @@ def main() -> None:
     ap.add_argument("--layer", choices=["surface", "corpus", "trajectory", "all"], default="surface")
     ap.add_argument("--dump-golden", metavar="PATH", help="golden pass (Newton venv): dump warp 1.19.0 signatures")
     ap.add_argument("--golden", type=Path, default=DEFAULT_GOLDEN, help="golden signature JSON for the compare pass")
+    ap.add_argument("--corpus-golden", type=Path, default=CORPUS_NPZ,
+                    help="corpus golden npz (written by the Newton-venv golden phase)")
     ap.add_argument("--report", type=Path, default=DEFAULT_REPORT)
     args = ap.parse_args()
 
@@ -414,7 +679,15 @@ def main() -> None:
         results["surface"] = format_surface_section(res)
         print(f"surface: {res['n_ok']} ok / {res['n_mismatch']} mismatch / {res['n_missing']} missing")
     if args.layer in ("corpus", "all"):
-        run_corpus()
+        try:
+            import warp_metal  # noqa: F401 — compare side
+        except ImportError:
+            # Newton venv (no warp_metal): this process IS the golden phase
+            run_corpus_golden(args.corpus_golden)
+            print(f"corpus golden -> {args.corpus_golden}")
+            return
+        results["corpus"] = run_corpus(args.corpus_golden)
+        print(f"corpus: report section updated (see {args.report})")
     if args.layer in ("trajectory", "all"):
         run_trajectory()
     write_report(args.report, SECTION_TITLES, results)

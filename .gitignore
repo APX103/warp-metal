@@ -16,3 +16,7 @@ venv/
 # tooling
 .DS_Store
 .uv-cache/
+
+# corpus golden artifacts (regenerable via tools/conform.py)
+tools/corpus_golden.npz
+tools/corpus_golden_meta.json

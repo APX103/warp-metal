@@ -147,6 +147,9 @@ static inline mat44f make_mat44f() { mat44f m = {{{0.0f}}}; return m; }
 static inline transformf make_transformf() { transformf t; t.p = make_vec3f(); t.q = make_quatf(); return t; }
 static inline spatial_vectorf make_spatial_vectorf() { spatial_vectorf s; s.w = make_vec3f(); s.v = make_vec3f(); return s; }
 static inline spatial_vectorf make_spatial_vectorf(vec3f w, vec3f v) { spatial_vectorf s; s.w = w; s.v = v; return s; }
+static inline spatial_vectorf make_spatial_vectorf(float wx, float wy, float wz, float vx, float vy, float vz) {
+    spatial_vectorf s; s.w.x = wx; s.w.y = wy; s.w.z = wz; s.v.x = vx; s.v.y = vy; s.v.z = vz; return s;
+}
 
 static inline vec2f make_vec2f(float x, float y) { vec2f v; v.x = x; v.y = y; return v; }
 static inline vec3f make_vec3f(float x, float y, float z) { vec3f v; v.x = x; v.y = y; v.z = z; return v; }
@@ -209,6 +212,9 @@ static inline float wp_extract(transformf t, int i) { return i < 3 ? wp_extract(
 static inline vec2f wp_extract(mat22f m, int r) { return make_vec2f(m.c[r][0], m.c[r][1]); }
 static inline vec3f wp_extract(mat33f m, int r) { return make_vec3f(m.c[r][0], m.c[r][1], m.c[r][2]); }
 static inline vec4f wp_extract(mat44f m, int r) { return make_vec4f(m.c[r][0], m.c[r][1], m.c[r][2], m.c[r][3]); }
+static inline float wp_extract(mat22f m, int r, int c) { return m.c[r][c]; }
+static inline float wp_extract(mat33f m, int r, int c) { return m.c[r][c]; }
+static inline float wp_extract(mat44f m, int r, int c) { return m.c[r][c]; }
 // assign_inplace (vec.h / quat.h: component_ref with negative-index wrap)
 static inline void wp_assign_inplace(thread vec2f& v, int i, float x) {
     if (i < 0) i += 2;
@@ -397,6 +403,30 @@ static inline vec4f wp_mul(mat44f m, vec4f v) {
         m.c[2][0]*v.x + m.c[2][1]*v.y + m.c[2][2]*v.z + m.c[2][3]*v.w,
         m.c[3][0]*v.x + m.c[3][1]*v.y + m.c[3][2]*v.z + m.c[3][3]*v.w);
 }
+static inline mat22f wp_mul(float s, mat22f m) {
+    mat22f r;
+    for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j)
+            r.c[i][j] = s*m.c[i][j];
+    return r;
+}
+static inline mat33f wp_mul(float s, mat33f m) {
+    mat33f r;
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            r.c[i][j] = s*m.c[i][j];
+    return r;
+}
+static inline mat44f wp_mul(float s, mat44f m) {
+    mat44f r;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            r.c[i][j] = s*m.c[i][j];
+    return r;
+}
+static inline mat22f wp_mul(mat22f m, float s) { return wp_mul(s, m); }
+static inline mat33f wp_mul(mat33f m, float s) { return wp_mul(s, m); }
+static inline mat44f wp_mul(mat44f m, float s) { return wp_mul(s, m); }
 static inline mat22f wp_transpose(mat22f m) {
     mat22f r;
     for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) r.c[i][j] = m.c[j][i];
@@ -412,6 +442,31 @@ static inline mat44f wp_transpose(mat44f m) {
     for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) r.c[i][j] = m.c[j][i];
     return r;
 }
+// matrix_from_rows/cols: row-major c[row][col], col j of from_cols is arg j
+static inline mat22f wp_matrix_from_cols(vec2f c0, vec2f c1) {
+    mat22f r;
+    r.c[0][0]=c0.x; r.c[0][1]=c1.x;
+    r.c[1][0]=c0.y; r.c[1][1]=c1.y;
+    return r;
+}
+static inline mat33f wp_matrix_from_cols(vec3f c0, vec3f c1, vec3f c2) {
+    mat33f r;
+    r.c[0][0]=c0.x; r.c[0][1]=c1.x; r.c[0][2]=c2.x;
+    r.c[1][0]=c0.y; r.c[1][1]=c1.y; r.c[1][2]=c2.y;
+    r.c[2][0]=c0.z; r.c[2][1]=c1.z; r.c[2][2]=c2.z;
+    return r;
+}
+static inline mat44f wp_matrix_from_cols(vec4f c0, vec4f c1, vec4f c2, vec4f c3) {
+    mat44f r;
+    r.c[0][0]=c0.x; r.c[0][1]=c1.x; r.c[0][2]=c2.x; r.c[0][3]=c3.x;
+    r.c[1][0]=c0.y; r.c[1][1]=c1.y; r.c[1][2]=c2.y; r.c[1][3]=c3.y;
+    r.c[2][0]=c0.z; r.c[2][1]=c1.z; r.c[2][2]=c2.z; r.c[2][3]=c3.z;
+    r.c[3][0]=c0.w; r.c[3][1]=c1.w; r.c[3][2]=c2.w; r.c[3][3]=c3.w;
+    return r;
+}
+static inline mat22f wp_matrix_from_rows(vec2f r0, vec2f r1) { return wp_transpose(wp_matrix_from_cols(r0, r1)); }
+static inline mat33f wp_matrix_from_rows(vec3f r0, vec3f r1, vec3f r2) { return wp_transpose(wp_matrix_from_cols(r0, r1, r2)); }
+static inline mat44f wp_matrix_from_rows(vec4f r0, vec4f r1, vec4f r2, vec4f r3) { return wp_transpose(wp_matrix_from_cols(r0, r1, r2, r3)); }
 // exact port of warp native mat.h inverse_impl<3,3> (cofactor form: full
 // adjugate first, then elementwise scale by 1/det) for numeric parity
 static inline mat33f wp_inverse(mat33f m) {
@@ -494,6 +549,57 @@ static inline mat33f wp_quat_to_matrix(quatf q) {
     return m;
 }
 
+// quat.h quat_from_matrix (Shepperd), exact port for numeric parity
+static inline quatf wp_quat_from_matrix(mat33f m) {
+    float tr = m.c[0][0] + m.c[1][1] + m.c[2][2];
+    float x = 0.0f, y = 0.0f, z = 0.0f, w = 0.0f, h = 0.0f;
+    if (tr >= 0.0f) {
+        h = sqrt(tr + 1.0f);
+        w = 0.5f * h;
+        h = 0.5f / h;
+        x = (m.c[2][1] - m.c[1][2]) * h;
+        y = (m.c[0][2] - m.c[2][0]) * h;
+        z = (m.c[1][0] - m.c[0][1]) * h;
+    } else {
+        int max_diag = 0;
+        if (m.c[1][1] > m.c[0][0]) max_diag = 1;
+        if (m.c[2][2] > m.c[max_diag][max_diag]) max_diag = 2;
+        if (max_diag == 0) {
+            h = sqrt((m.c[0][0] - (m.c[1][1] + m.c[2][2])) + 1.0f);
+            x = 0.5f * h;
+            h = 0.5f / h;
+            y = (m.c[0][1] + m.c[1][0]) * h;
+            z = (m.c[2][0] + m.c[0][2]) * h;
+            w = (m.c[2][1] - m.c[1][2]) * h;
+        } else if (max_diag == 1) {
+            h = sqrt((m.c[1][1] - (m.c[2][2] + m.c[0][0])) + 1.0f);
+            y = 0.5f * h;
+            h = 0.5f / h;
+            z = (m.c[1][2] + m.c[2][1]) * h;
+            x = (m.c[0][1] + m.c[1][0]) * h;
+            w = (m.c[0][2] - m.c[2][0]) * h;
+        }
+        if (max_diag == 2) {
+            h = sqrt((m.c[2][2] - (m.c[0][0] + m.c[1][1])) + 1.0f);
+            z = 0.5f * h;
+            h = 0.5f / h;
+            x = (m.c[2][0] + m.c[0][2]) * h;
+            y = (m.c[1][2] + m.c[2][1]) * h;
+            w = (m.c[1][0] - m.c[0][1]) * h;
+        }
+    }
+    float len = sqrt(x*x + y*y + z*z + w*w);
+    return make_quatf(x/len, y/len, z/len, w/len);
+}
+
+// quat.h quat_from_axis_angle (exact port)
+static inline quatf wp_quat_from_axis_angle(vec3f axis, float angle) {
+    float half_angle = angle * 0.5f;
+    float w = cos(half_angle);
+    float s = sin(half_angle);
+    return make_quatf(axis.x*s, axis.y*s, axis.z*s, w);
+}
+
 // ---- transform ops (spatial.h, exact ports) ----
 static inline transformf wp_transform_identity() { transformf t; t.p = make_vec3f(); t.q = wp_quat_identity(); return t; }
 static inline vec3f wp_transform_get_translation(transformf t) { return t.p; }
@@ -542,8 +648,10 @@ static inline float wp_mod(float a, float b) {                      // builtin.h
     if (r != 0.0f && (r < 0.0f) != (b < 0.0f)) r += b;
     return r;
 }
-static inline float wp_asin(float x) { return asin(x); }
-static inline float wp_acos(float x) { return acos(x); }
+static inline float wp_asin(float x) { return asin(clamp(x, -1.0f, 1.0f)); }   // domain guard: FMA noise can push |x|>1 (CPU stays inside)
+static inline float wp_acos(float x) { return acos(clamp(x, -1.0f, 1.0f)); }
+static inline float wp_atan(float x) { return atan(x); }
+static inline float wp_atan2(float y, float x) { return atan2(y, x); }
 static inline float wp_sin(float x) { return precise::sin(x); }     // align CPU numeric path
 static inline float wp_cos(float x) { return precise::cos(x); }
 static inline float wp_tan(float x) { return precise::tan(x); }
@@ -731,6 +839,50 @@ static inline uint wp_atomic_max_ret_at(device uint* d, constant wp_arr_meta& m,
 static inline float wp_atomic_max_ret_at(device float* d, constant wp_arr_meta& m, int i, float v) {
     return wp_atomic_max_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
+// 2D _ret_at variants (array2d atomics, e.g. world extents reduction)
+static inline float wp_atomic_add_ret_at(device float* d, constant wp_arr_meta& m, int i, int j, float v) {
+    return wp_atomic_add_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+static inline float wp_atomic_min_ret_at(device float* d, constant wp_arr_meta& m, int i, int j, float v) {
+    return wp_atomic_min_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+static inline float wp_atomic_max_ret_at(device float* d, constant wp_arr_meta& m, int i, int j, float v) {
+    return wp_atomic_max_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+static inline int wp_atomic_add_ret_at(device int* d, constant wp_arr_meta& m, int i, int j, int v) {
+    return wp_atomic_add_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+static inline int wp_atomic_min_ret_at(device int* d, constant wp_arr_meta& m, int i, int j, int v) {
+    return wp_atomic_min_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+static inline int wp_atomic_max_ret_at(device int* d, constant wp_arr_meta& m, int i, int j, int v) {
+    return wp_atomic_max_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+
+// composite (spatial_vectorf) atomics: per-component fetch on the packed
+// 6-float layout (upstream lowers wp.atomic_add on vector dtypes the same way)
+static inline spatial_vectorf wp_atomic_add_ret_at(device spatial_vectorf* d, constant wp_arr_meta& m, int i, spatial_vectorf v) {
+    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    spatial_vectorf r;
+    r.w.x = atomic_fetch_add_explicit((device atomic_float*)(base + 0), v.w.x, memory_order_relaxed);
+    r.w.y = atomic_fetch_add_explicit((device atomic_float*)(base + 1), v.w.y, memory_order_relaxed);
+    r.w.z = atomic_fetch_add_explicit((device atomic_float*)(base + 2), v.w.z, memory_order_relaxed);
+    r.v.x = atomic_fetch_add_explicit((device atomic_float*)(base + 3), v.v.x, memory_order_relaxed);
+    r.v.y = atomic_fetch_add_explicit((device atomic_float*)(base + 4), v.v.y, memory_order_relaxed);
+    r.v.z = atomic_fetch_add_explicit((device atomic_float*)(base + 5), v.v.z, memory_order_relaxed);
+    return r;
+}
+static inline spatial_vectorf wp_atomic_sub_ret_at(device spatial_vectorf* d, constant wp_arr_meta& m, int i, spatial_vectorf v) {
+    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    spatial_vectorf r;
+    r.w.x = atomic_fetch_sub_explicit((device atomic_float*)(base + 0), v.w.x, memory_order_relaxed);
+    r.w.y = atomic_fetch_sub_explicit((device atomic_float*)(base + 1), v.w.y, memory_order_relaxed);
+    r.w.z = atomic_fetch_sub_explicit((device atomic_float*)(base + 2), v.w.z, memory_order_relaxed);
+    r.v.x = atomic_fetch_sub_explicit((device atomic_float*)(base + 3), v.v.x, memory_order_relaxed);
+    r.v.y = atomic_fetch_sub_explicit((device atomic_float*)(base + 4), v.v.y, memory_order_relaxed);
+    r.v.z = atomic_fetch_sub_explicit((device atomic_float*)(base + 5), v.v.z, memory_order_relaxed);
+    return r;
+}
 
 // ---- bit ops (builtin.h bit_and/bit_or/bit_xor/lshift/rshift) ----
 static inline int wp_bit_and(int a, int b) { return a & b; }
@@ -745,11 +897,18 @@ static inline int wp_lshift(int a, int b) { return a << b; }
 static inline uint wp_lshift(uint a, int b) { return a << b; }
 static inline int wp_rshift(int a, int b) { return a >> b; }
 static inline uint wp_rshift(uint a, int b) { return a >> b; }
+// invert (builtin.h: bitwise complement, Int types)
+static inline int wp_invert(int a) { return ~a; }
+static inline uint wp_invert(uint a) { return ~a; }
+static inline int64_t wp_invert(int64_t a) { return ~a; }
+static inline uint64_t wp_invert(uint64_t a) { return ~a; }
+// unot (builtin.h: logical not, Bool types)
+static inline bool wp_unot(bool a) { return !a; }
 static inline uint64_t wp_rshift(uint64_t a, uint64_t b) { return a >> b; }
 
 // ---- scalar sign / neg / div (builtin.h semantics) ----
-static inline float wp_sign(float x) { return x < 0.0f ? -1.0f : (x > 0.0f ? 1.0f : 0.0f); }
-static inline int wp_sign(int x) { return (x > 0) - (x < 0); }
+static inline float wp_sign(float x) { return x < 0.0f ? -1.0f : 1.0f; }  // upstream: -1 if x<0, else 1 (sign(0)=1)
+static inline int wp_sign(int x) { return x < 0 ? -1 : 1; }
 static inline float wp_neg(float x) { return -x; }
 static inline int wp_neg(int x) { return -x; }
 static inline vec2f wp_neg(vec2f a) { return -a; }
@@ -767,6 +926,21 @@ static inline int wp_min(int a, int b) { return a < b ? a : b; }
 static inline int wp_max(int a, int b) { return a > b ? a : b; }
 static inline float wp_min(float a, float b) { return a < b ? a : b; }
 static inline float wp_max(float a, float b) { return a > b ? a : b; }
+// 64-bit scalar arithmetic (warp supports int64/uint64 like int)
+static inline int64_t wp_add(int64_t a, int64_t b) { return a + b; }
+static inline int64_t wp_sub(int64_t a, int64_t b) { return a - b; }
+static inline int64_t wp_mul(int64_t a, int64_t b) { return a * b; }
+static inline int64_t wp_div(int64_t a, int64_t b) { return a / b; }
+static inline int64_t wp_min(int64_t a, int64_t b) { return a < b ? a : b; }
+static inline int64_t wp_max(int64_t a, int64_t b) { return a > b ? a : b; }
+static inline uint64_t wp_add(uint64_t a, uint64_t b) { return a + b; }
+static inline uint64_t wp_sub(uint64_t a, uint64_t b) { return a - b; }
+static inline uint64_t wp_mul(uint64_t a, uint64_t b) { return a * b; }
+static inline uint64_t wp_div(uint64_t a, uint64_t b) { return a / b; }
+static inline uint64_t wp_min(uint64_t a, uint64_t b) { return a < b ? a : b; }
+static inline uint64_t wp_max(uint64_t a, uint64_t b) { return a > b ? a : b; }
+static inline bool wp_isfinite(int64_t x) { return true; }
+static inline bool wp_isfinite(uint64_t x) { return true; }
 
 // ---- vector bridges for the wp_-prefixed call table ----
 static inline float wp_dot(vec2f a, vec2f b) { return dot(a, b); }
@@ -835,6 +1009,7 @@ static inline quatf wp_mul(quatf a, quatf b) {
 }
 static inline quatf wp_mul(quatf a, float s) { return a * s; }   // quat.h mul(quat_t, Type)
 static inline quatf wp_mul(float s, quatf a) { return a * s; }   // quat.h operator*(Type, quat_t)
+static inline transformf wp_mul(transformf a, transformf b) { return wp_transform_multiply(a, b); }  // spatial.h mul(transform, transform)
 static inline transformf wp_mul(transformf a, float s) {  // spatial.h mul(transform, s)
     transformf r; r.p = a.p * s; r.q = a.q * s; return r;
 }
