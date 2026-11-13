@@ -147,5 +147,39 @@ class TestSSAKernels(unittest.TestCase):
         np.testing.assert_allclose(lo.numpy_view(), expected[:, 0], rtol=1e-4, atol=1e-6)
 
 
+    def test_struct_and_value_params(self):
+        @wp.struct
+        class Particle:
+            pos: wp.vec3
+            mass: wp.float32
+            flags: wp.int32
+
+        @wp.kernel
+        def k(xf: wp.transform, p: Particle, out: wp.array(dtype=wp.vec3), n: int):
+            i = wp.tid()
+            local = wp.transform_point(xf, p.pos * wp.float(i))
+            out[i] = local + wp.vec3(wp.float(p.flags), p.mass, wp.float(n))
+
+        n = 4
+        xform = wp.transform()
+        for i, v in enumerate([1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]):  # translate(1,2,3), quat identity
+            xform[i] = v
+        pt = Particle()
+        pt.pos = wp.vec3(1.0, 2.0, 3.0)
+        pt.mass = 4.5
+        pt.flags = 10
+
+        out = wp.zeros(n, dtype=wp.vec3, device="metal")
+        wp.launch(k, dim=n, inputs=[xform, pt, out, n], device="metal")
+        wp.synchronize()
+
+        p0 = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        expected = np.zeros((n, 3), dtype=np.float32)
+        for i in range(n):
+            local = p0 * float(i) + np.array([1.0, 2.0, 3.0], dtype=np.float32)  # transform_point
+            expected[i] = local + np.array([10.0, 4.5, float(n)], dtype=np.float32)
+        np.testing.assert_allclose(out.numpy_view(), expected, rtol=TOL, atol=1e-6)
+
+
 if __name__ == "__main__":
     unittest.main()

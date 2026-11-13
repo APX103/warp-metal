@@ -62,9 +62,10 @@ _SCALAR_CTYPES = {
 }
 
 _VEC_SIZES = {2: "vec2f", 3: "vec3f", 4: "vec4f", 6: "spatial_vectorf"}
+_VECI_SIZES = {2: "vec2i", 3: "vec3i", 4: "vec4i"}
 _MAT_SIZES = {(2, 2): "mat22f", (3, 3): "mat33f", (4, 4): "mat44f"}
 
-_RE_VEC_T = re.compile(r"^wp::vec_t<(\d+),\s*wp::float32>$")
+_RE_VEC_T = re.compile(r"^wp::vec_t<(\d+),\s*wp::(float32|int32)>$")
 _RE_MAT_T = re.compile(r"^wp::mat_t<(\d+),\s*(\d+),\s*wp::float32>$")
 _RE_QUAT_T = re.compile(r"^wp::quat_t<wp::float32>$")
 _RE_TRANSFORM_T = re.compile(r"^wp::transform_t<wp::float32>$")
@@ -78,8 +79,9 @@ def msl_type(ctype: str) -> str:
         return _SCALAR_CTYPES[ctype]
     if m := _RE_VEC_T.match(ctype):
         n = int(m.group(1))
-        if n in _VEC_SIZES:
-            return _VEC_SIZES[n]
+        sizes = _VEC_SIZES if m.group(2) == "float32" else _VECI_SIZES
+        if n in sizes:
+            return sizes[n]
         raise TranslationError(f"wp::vec_t<{n}> has no MSL mapping")
     if m := _RE_MAT_T.match(ctype):
         key = (int(m.group(1)), int(m.group(2)))
@@ -191,6 +193,9 @@ _CTOR_TABLE = {
     "wp::vec_t<3, wp::float32>": "make_vec3f",
     "wp::vec_t<4, wp::float32>": "make_vec4f",
     "wp::vec_t<6, wp::float32>": "make_spatial_vectorf",
+    "wp::vec_t<2, wp::int32>": "make_vec2i",
+    "wp::vec_t<3, wp::int32>": "make_vec3i",
+    "wp::vec_t<4, wp::int32>": "make_vec4i",
     "wp::quat_t<wp::float32>": "make_quatf",
     "wp::mat_t<2, 2, wp::float32>": "make_mat22f",
     "wp::mat_t<3, 3, wp::float32>": "make_mat33f",
@@ -300,6 +305,7 @@ class KernelUnit:
 
     def __init__(self, kernel_name: str):
         self.structs: dict[str, str] = {}  # native_name -> MSL struct def
+        self.struct_fields: dict[str, list[tuple[str, str]]] = {}  # name -> [(field, msl type)]
         self.functions: list[MSLFunction] = []  # callees first
         self.kernel = MSLFunction(kernel_name, None)
         self.args: list[ArgSpec] = []  # kernel args in order
@@ -628,6 +634,8 @@ def _classify_ctype(ctype: str) -> str:
         return "scalar"
     if _RE_QUAT_T.match(ctype) or _RE_TRANSFORM_T.match(ctype):
         return "scalar"
+    if ctype == "wp::spatial_vector_t<wp::float32>":
+        return "scalar"
     if ctype in ("wp::range_t", "wp::shape_t"):
         return "scalar"
     if re.match(r"^[A-Za-z_]\w*$", ctype):
@@ -820,3 +828,5 @@ def _emit_struct_def(s, unit: KernelUnit, _codegen) -> None:
     lines.append("    return v;")
     lines.append("}")
     unit.structs[s.native_name] = "\n".join(lines)
+    # host-side ctypes mirror spec (packed in declaration order, matching MSL)
+    unit.struct_fields[s.native_name] = fields

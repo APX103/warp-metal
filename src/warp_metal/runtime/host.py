@@ -23,6 +23,7 @@ path) is not wired yet; launching on "cpu" fails loudly.
 from __future__ import annotations
 
 import ctypes
+import functools
 import threading
 
 import numpy as np
@@ -370,17 +371,56 @@ _CTYPE_OF_SCALAR = {
 }
 
 
+def _builtin_value_fields(msl_t: str) -> list[tuple] | None:
+    """ctypes field list for a builtin warp value type (MSL prelude struct).
+
+    Layouts match the prelude exactly: packed 4-byte members, row-major
+    ``c[r][col]`` for mats, transform {p, q}, spatial {w, v}.
+    """
+    f, i = _ctypes.c_float, _ctypes.c_int32
+    table = {
+        "vec2f": [("x", f), ("y", f)],
+        "vec3f": [("x", f), ("y", f), ("z", f)],
+        "vec4f": [("x", f), ("y", f), ("z", f), ("w", f)],
+        "quatf": [("x", f), ("y", f), ("z", f), ("w", f)],
+        "vec2i": [("x", i), ("y", i)],
+        "vec3i": [("x", i), ("y", i), ("z", i)],
+        "vec4i": [("x", i), ("y", i), ("z", i), ("w", i)],
+        "transformf": [("p", "vec3f"), ("q", "quatf")],
+        "spatial_vectorf": [("w", "vec3f"), ("v", "vec3f")],
+        "mat22f": [("c", (f * 2) * 2)],
+        "mat33f": [("c", (f * 3) * 3)],
+        "mat44f": [("c", (f * 4) * 4)],
+    }
+    return table.get(msl_t)
+
+
+@functools.lru_cache(maxsize=None)
+def _builtin_value_struct(msl_t: str):
+    fields = _builtin_value_fields(msl_t)
+    if fields is None:
+        raise RuntimeError(f"launch: no ctypes mirror for builtin value type {msl_t!r}")
+    resolved = []
+    for fname, ftype in fields:
+        if isinstance(ftype, str):  # nested builtin value type (vec3f, quatf, …)
+            resolved.append((fname, _builtin_value_struct(ftype)))
+        else:
+            resolved.append((fname, ftype))
+    return type(f"_{msl_t}_ctypes", (_ctypes.Structure,), {"_fields_": resolved})
+
+
 def _params_struct(unit: KernelUnit):
     """Build the ctypes mirror of the MSL ``Params_<name>`` struct."""
     fields = []
     for a in unit.args:
         if a.kind == "scalar":
-            try:
+            if a.msl in _CTYPE_OF_SCALAR:
                 fields.append((a.name, _CTYPE_OF_SCALAR[a.msl]))
-            except KeyError:
-                raise RuntimeError(f"launch: scalar param {a.name} has unsupported MSL type {a.msl}")
+            else:
+                # builtin value type (vec/quat/transform/mat/spatial)
+                fields.append((a.name, _builtin_value_struct(a.msl)))
         elif a.kind == "struct":
-            fields.append((a.name, _struct_ctypes(a)))
+            fields.append((a.name, _user_struct_ctypes(a, unit)))
         elif a.kind == "array":
             fields.append((f"{a.name}_m", _ArrMeta))
     fields.append(("_dims", _ArrMeta))
@@ -391,13 +431,77 @@ def _params_struct(unit: KernelUnit):
     return Params
 
 
-def _struct_ctypes(arg_spec):
+def _user_struct_ctypes(arg_spec, unit: KernelUnit):
     """ctypes.Structure class mirroring a vendored struct's field layout."""
-    import warp_metal.frontend.codegen as _codegen
+    fields: list[tuple] = []
+    for label, msl_t in unit.struct_fields[arg_spec.msl]:
+        if msl_t in _CTYPE_OF_SCALAR:
+            fields.append((label, _CTYPE_OF_SCALAR[msl_t]))
+        elif msl_t in ("vec2i", "vec3i", "vec4i"):
+            fields.append((label, _builtin_value_struct(msl_t)))
+        elif _builtin_value_fields(msl_t) is not None:
+            fields.append((label, _builtin_value_struct(msl_t)))
+        elif msl_t in unit.struct_fields:  # nested user struct
+            nested_spec = type("_Ref", (), {"msl": msl_t})
+            fields.append((label, _user_struct_ctypes(nested_spec, unit)))
+        else:
+            raise RuntimeError(f"launch: struct field {label!r}: unsupported MSL type {msl_t!r}")
+    return type(f"_{arg_spec.msl}_ctypes", (_ctypes.Structure,), {"_fields_": fields})
 
-    raise RuntimeError(
-        "launch: struct kernel params are not wired yet (M1.3 corpus scope: scalar/array params)"
-    )
+
+def _pack_value(dest, msl_t: str, value):
+    """Pack a Python-side warp value into its ctypes mirror ``dest``.
+
+    Vector-protocol values (vec/quat/transform/spatial: ``len(v)`` +
+    ``v[j]``) flatten componentwise; mats flatten row-major linear
+    (mat.h initializer_array order), matching the prelude layouts.
+    """
+    fields = _builtin_value_fields(msl_t)
+    if fields is None:
+        raise RuntimeError(f"launch: cannot pack MSL value type {msl_t!r}")
+    if msl_t.startswith("mat"):
+        comps = [value[r][c] for r in range(len(value)) for c in range(len(value[0]))]
+    else:
+        comps = [value[j] for j in range(len(value))]
+    cur = [0]
+    _fill_struct(dest, fields, comps, cur)
+    if cur[0] != len(comps):
+        raise RuntimeError(f"launch: {msl_t} packing consumed {cur[0]} of {len(comps)} components")
+
+
+def _fill_struct(dest, fields, comps, cur) -> None:
+    for fname, ftype in fields:
+        if isinstance(ftype, str):  # nested builtin value type
+            _fill_struct(getattr(dest, fname), _builtin_value_fields(ftype), comps, cur)
+        elif isinstance(ftype, type) and issubclass(ftype, _ctypes.Array):
+            _fill_array(getattr(dest, fname), comps, cur)
+        else:
+            setattr(dest, fname, comps[cur[0]])
+            cur[0] += 1
+
+
+def _fill_array(arr, comps, cur) -> None:
+    for k in range(len(arr)):
+        item = arr[k]
+        if isinstance(item, _ctypes.Array):
+            _fill_array(item, comps, cur)
+        else:
+            arr[k] = comps[cur[0]]
+            cur[0] += 1
+
+
+def _pack_user_struct(dest, msl_t: str, value, unit: KernelUnit):
+    """Pack a vendored struct instance (attribute per ``.vars`` order)."""
+    for label, f_msl in unit.struct_fields[msl_t]:
+        field_value = getattr(value, label)
+        if f_msl in _CTYPE_OF_SCALAR:
+            setattr(dest, label, field_value)
+        elif _builtin_value_fields(f_msl) is not None:
+            _pack_value(getattr(dest, label), f_msl, field_value)
+        elif f_msl in unit.struct_fields:
+            _pack_user_struct(getattr(dest, label), f_msl, field_value, unit)
+        else:
+            raise RuntimeError(f"launch: struct field {label!r}: unsupported MSL type {f_msl!r}")
 
 
 def _arr_meta(arr: WarpArray) -> _ArrMeta:
@@ -453,9 +557,12 @@ def _launch_ssa(kernel, dim, merged) -> None:
             meta = _arr_meta(value)
             setattr(params, f"{a.name}_m", meta)
         elif a.kind == "scalar":
-            setattr(params, a.name, value)
+            if a.msl in _CTYPE_OF_SCALAR:
+                setattr(params, a.name, value)
+            else:  # builtin value type (vec/quat/transform/mat/spatial)
+                _pack_value(getattr(params, a.name), a.msl, value)
         else:
-            raise RuntimeError(f"launch: struct param '{a.name}' not wired yet (M1.3 fail loud)")
+            _pack_user_struct(getattr(params, a.name), a.msl, value, unit)
     if values:
         raise ValueError("more launch arguments than kernel parameters")
 

@@ -33,6 +33,10 @@ struct mat33f { float c[3][3]; };
 struct mat44f { float c[4][4]; };
 struct transformf { vec3f p; quatf q; };  // (spatial.h transform_t)
 struct spatial_vectorf { vec3f w, v; };   // (spatial.h spatial_vector_t)
+// integer vectors (vec.h vec_t<Type> with int; packed layout, not MSL int3)
+struct vec2i { int x, y; };
+struct vec3i { int x, y, z; };
+struct vec4i { int x, y, z, w; };
 
 // ---- range iterator (builtin.h range_t + warp.codegen iter protocol) ----
 struct wp_range {
@@ -166,6 +170,33 @@ static inline mat33f make_mat33f(float a, float b, float c, float d, float e, fl
     mat33f m; m.c[0][0]=a; m.c[0][1]=b; m.c[0][2]=c; m.c[1][0]=d; m.c[1][1]=e; m.c[1][2]=f;
     m.c[2][0]=g; m.c[2][1]=h; m.c[2][2]=i; return m;
 }
+// ---- integer vectors (vec.h vec_t with int) ----
+static inline vec2i make_vec2i() { vec2i v = {0, 0}; return v; }
+static inline vec3i make_vec3i() { vec3i v = {0, 0, 0}; return v; }
+static inline vec4i make_vec4i() { vec4i v = {0, 0, 0, 0}; return v; }
+static inline vec2i make_vec2i(int x, int y) { vec2i v; v.x = x; v.y = y; return v; }
+static inline vec3i make_vec3i(int x, int y, int z) { vec3i v; v.x = x; v.y = y; v.z = z; return v; }
+static inline vec4i make_vec4i(int x, int y, int z, int w) { vec4i v; v.x = x; v.y = y; v.z = z; v.w = w; return v; }
+static inline vec2i make_vec2i(int s) { return make_vec2i(s, s); }
+static inline vec3i make_vec3i(int s) { return make_vec3i(s, s, s); }
+static inline vec4i make_vec4i(int s) { return make_vec4i(s, s, s, s); }
+// extract-style component read with runtime index (vec.h extract + component_ref)
+static inline int wp_extract(vec2i v, int i) { return i == 0 ? v.x : v.y; }
+static inline int wp_extract(vec3i v, int i) { return i == 0 ? v.x : (i == 1 ? v.y : v.z); }
+static inline int wp_extract(vec4i v, int i) { return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : v.w)); }
+// assign_inplace (vec.h component_ref with negative-index wrap)
+static inline void wp_assign_inplace(thread vec2i& v, int i, int x) {
+    if (i < 0) i += 2;
+    if (i == 0) { v.x = x; } else { v.y = x; }
+}
+static inline void wp_assign_inplace(thread vec3i& v, int i, int x) {
+    if (i < 0) i += 3;
+    if (i == 0) { v.x = x; } else if (i == 1) { v.y = x; } else { v.z = x; }
+}
+static inline void wp_assign_inplace(thread vec4i& v, int i, int x) {
+    if (i < 0) i += 4;
+    if (i == 0) { v.x = x; } else if (i == 1) { v.y = x; } else if (i == 2) { v.z = x; } else { v.w = x; }
+}
 // extract-style component read with runtime index (vec.h extract + component_ref)
 static inline float wp_extract(vec2f v, int i) { return i == 0 ? v.x : v.y; }
 static inline float wp_extract(vec3f v, int i) { return i == 0 ? v.x : (i == 1 ? v.y : v.z); }
@@ -227,6 +258,22 @@ static inline vec4f operator/(vec4f a, float s) { return make_vec4f(a.x/s, a.y/s
 static inline vec2f operator-(vec2f a) { return make_vec2f(-a.x, -a.y); }
 static inline vec3f operator-(vec3f a) { return make_vec3f(-a.x, -a.y, -a.z); }
 static inline vec4f operator-(vec4f a) { return make_vec4f(-a.x, -a.y, -a.z, -a.w); }
+// integer vector operators (vec.h vec_t with int)
+static inline vec2i operator+(vec2i a, vec2i b) { return make_vec2i(a.x+b.x, a.y+b.y); }
+static inline vec2i operator-(vec2i a, vec2i b) { return make_vec2i(a.x-b.x, a.y-b.y); }
+static inline vec2i operator*(vec2i a, vec2i b) { return make_vec2i(a.x*b.x, a.y*b.y); }
+static inline vec2i operator/(vec2i a, vec2i b) { return make_vec2i(a.x/b.x, a.y/b.y); }
+static inline vec3i operator+(vec3i a, vec3i b) { return make_vec3i(a.x+b.x, a.y+b.y, a.z+b.z); }
+static inline vec3i operator-(vec3i a, vec3i b) { return make_vec3i(a.x-b.x, a.y-b.y, a.z-b.z); }
+static inline vec3i operator*(vec3i a, vec3i b) { return make_vec3i(a.x*b.x, a.y*b.y, a.z*b.z); }
+static inline vec3i operator/(vec3i a, vec3i b) { return make_vec3i(a.x/b.x, a.y/b.y, a.z/b.z); }
+static inline vec4i operator+(vec4i a, vec4i b) { return make_vec4i(a.x+b.x, a.y+b.y, a.z+b.z, a.w+b.w); }
+static inline vec4i operator-(vec4i a, vec4i b) { return make_vec4i(a.x-b.x, a.y-b.y, a.z-b.z, a.w-b.w); }
+static inline vec4i operator*(vec4i a, vec4i b) { return make_vec4i(a.x*b.x, a.y*b.y, a.z*b.z, a.w*b.w); }
+static inline vec4i operator/(vec4i a, vec4i b) { return make_vec4i(a.x/b.x, a.y/b.y, a.z/b.z, a.w/b.w); }
+static inline vec2i operator-(vec2i a) { return make_vec2i(-a.x, -a.y); }
+static inline vec3i operator-(vec3i a) { return make_vec3i(-a.x, -a.y, -a.z); }
+static inline vec4i operator-(vec4i a) { return make_vec4i(-a.x, -a.y, -a.z, -a.w); }
 
 // ---- reductions (vec.h dot/length/length_sq/normalize; exact formulas) ----
 static inline float dot(vec2f a, vec2f b) { return a.x*b.x + a.y*b.y; }
