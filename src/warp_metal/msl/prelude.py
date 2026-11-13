@@ -1186,6 +1186,7 @@ static inline float wp_ceil(float x) { return ceil(x); }
 static inline float wp_round(float x) { return round(x); }
 static inline float wp_trunc(float x) { return trunc(x); }
 static inline float wp_step(float x, float y) { return x < y ? 0.0f : 1.0f; }  // builtin.h: y < x ? 0 : 1
+static inline float wp_step(float x) { return x < 0.0f ? 1.0f : 0.0f; }  // 1-arg overload: 1.0 if x < 0
 static inline float wp_pow(float x, float y) { return pow(x, y); }
 static inline bool wp_isinf(float x) { return isinf(x) != 0; }
 static inline bool wp_isnan(float x) { return isnan(x) != 0; }
@@ -1194,6 +1195,7 @@ static inline int wp_neg(int x) { return -x; }
 static inline vec2f wp_neg(vec2f a) { return -a; }
 static inline vec3f wp_neg(vec3f a) { return -a; }
 static inline vec4f wp_neg(vec4f a) { return -a; }
+static inline spatial_vectorf wp_neg(spatial_vectorf s) { return make_spatial_vectorf(-s.w, -s.v); }
 // cw_mul/cw_div: component-wise vector ops (upstream sametypes constraint)
 static inline vec2f wp_cw_mul(vec2f a, vec2f b) { return make_vec2f(a.x * b.x, a.y * b.y); }
 static inline vec3f wp_cw_mul(vec3f a, vec3f b) { return make_vec3f(a.x * b.x, a.y * b.y, a.z * b.z); }

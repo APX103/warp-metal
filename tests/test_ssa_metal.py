@@ -180,6 +180,76 @@ class TestSSAKernels(unittest.TestCase):
             expected[i] = local + np.array([10.0, 4.5, float(n)], dtype=np.float32)
         np.testing.assert_allclose(out.numpy_view(), expected, rtol=TOL, atol=1e-6)
 
+    def test_mat6x6_spatial_mul_transpose(self):
+        # generic-size square mat ops (ensure_mat_def): Newton featherstone
+        # spatial-inertia mat6x6f wp.mul/wp.transpose vs prelude mat22-44.
+        @wp.kernel
+        def k(
+            a: wp.array(dtype=wp.spatial_matrix),
+            x: wp.array(dtype=wp.spatial_vector),
+            mm: wp.array(dtype=wp.spatial_matrix),
+            mv: wp.array(dtype=wp.spatial_vector),
+            mt: wp.array(dtype=wp.spatial_matrix),
+        ):
+            i = wp.tid()
+            m1 = a[i]
+            m2 = a[i + 1]
+            v = x[i]
+            mm[i] = wp.mul(m1, m2)
+            mv[i] = wp.mul(m1, v)
+            mt[i] = wp.transpose(m1)
+
+        rng = np.random.default_rng(7)
+        n = 3
+        Amat = rng.standard_normal((n + 1, 6, 6)).astype(np.float32)
+        Xvec = rng.standard_normal((n, 6)).astype(np.float32)
+        a = wp.empty(n + 1, dtype=wp.spatial_matrix, device="metal")
+        a.numpy_view()[:] = Amat.reshape(n + 1, 36)
+        x = wp.empty(n, dtype=wp.spatial_vector, device="metal")
+        x.numpy_view()[:] = Xvec
+        mm = wp.empty(n, dtype=wp.spatial_matrix, device="metal")
+        mv = wp.empty(n, dtype=wp.spatial_vector, device="metal")
+        mt = wp.empty(n, dtype=wp.spatial_matrix, device="metal")
+        wp.launch(k, dim=n, inputs=[a, x, mm, mv, mt], device="metal")
+        wp.synchronize()
+        np.testing.assert_allclose(
+            mm.numpy_view().reshape(n, 6, 6), Amat[:n] @ Amat[1:], rtol=TOL, atol=TOL
+        )
+        np.testing.assert_allclose(
+            mv.numpy_view().reshape(n, 6), (Amat[:n] @ Xvec[..., None])[..., 0], rtol=TOL, atol=TOL
+        )
+        np.testing.assert_allclose(
+            mt.numpy_view().reshape(n, 6, 6), Amat[:n].transpose(0, 2, 1), rtol=TOL, atol=TOL
+        )
+
+    def test_step1_and_spatial_neg(self):
+        # 1-arg wp.step overload (1.0 if x < 0, upstream builtins.py doc) and
+        # wp.neg on spatial_vectorf (featherstone body_f_ext negation).
+        @wp.kernel
+        def k(
+            x: wp.array(dtype=wp.float32),
+            s: wp.array(dtype=wp.spatial_vector),
+            o1: wp.array(dtype=wp.float32),
+            o2: wp.array(dtype=wp.spatial_vector),
+        ):
+            i = wp.tid()
+            o1[i] = wp.step(x[i])
+            o2[i] = wp.neg(s[i])
+
+        n = 4
+        X = np.array([-2.0, -0.5, 0.0, 3.0], dtype=np.float32)
+        S = rng = np.arange(n * 6, dtype=np.float32) - 4.0
+        x = wp.empty(n, dtype=wp.float32, device="metal")
+        x.numpy_view()[:] = X
+        s = wp.empty(n, dtype=wp.spatial_vector, device="metal")
+        s.numpy_view()[:] = S.reshape(n, 6)
+        o1 = wp.empty(n, dtype=wp.float32, device="metal")
+        o2 = wp.empty(n, dtype=wp.spatial_vector, device="metal")
+        wp.launch(k, dim=n, inputs=[x, s, o1, o2], device="metal")
+        wp.synchronize()
+        np.testing.assert_allclose(o1.numpy_view(), (X < 0).astype(np.float32), rtol=TOL)
+        np.testing.assert_allclose(o2.numpy_view().reshape(n, 6), -S.reshape(n, 6), rtol=TOL)
+
 
 if __name__ == "__main__":
     unittest.main()

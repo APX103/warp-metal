@@ -461,19 +461,31 @@ def func_native(snippet: str, adj_snippet: str | None = None, replay_snippet: st
 def func_grad(forward_fn):
     """Register the decorated function as the gradient of ``forward_fn``.
 
-    Forward-only backend: recorded so that a future adjoint backend can pick
-    it up; the Metal forward codegen never reads it. Mirrors the upstream
-    decoration form ``@wp.func_grad(forward_fn)``.
+    Mirrors upstream warp 1.19 ``wp.func_grad``: the grad function is wrapped
+    as a ``Function`` (same key as the forward, ``custom_reverse_mode=True``)
+    so callers that inspect ``custom_grad_func.adj`` — deferred parse in
+    codegen, deterministic reverse-call args — see the same object shape as
+    upstream. The Metal backend is forward-only: the custom grad is parsed but
+    its reverse codegen is never emitted.
     """
     def wrapper(grad_fn):
-        # record the linkage on the target Function if registered
-        try:
-            m = _get_module(forward_fn.__module__, forward_fn.__qualname__)
-            target = m.functions.get(codegen.make_full_qualified_name(forward_fn))
-            if target is not None:
-                target.custom_grad_func = grad_fn
-        except Exception:
-            pass  # target not registered yet — record nothing
+        m = _get_module(forward_fn.__module__, forward_fn.__qualname__)
+        target = m.functions.get(codegen.make_full_qualified_name(forward_fn))
+        if target is None:
+            return grad_fn  # forward not (yet) registered: record nothing
+        target.custom_grad_func = Function(
+            grad_fn,
+            key=target.key,
+            native_func=target.native_func,
+            namespace=target.namespace,
+            module=target.module,
+            skip_forward_codegen=True,
+            custom_reverse_mode=True,
+            custom_reverse_num_input_args=len(target.input_types),
+            skip_adding_overload=False,
+            code_transformers=list(getattr(target.adj, "transformers", None) or []),
+        )
+        target.adj.skip_reverse_codegen = True
         return grad_fn
 
     return wrapper

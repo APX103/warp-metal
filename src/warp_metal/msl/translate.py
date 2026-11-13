@@ -131,6 +131,38 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
     lines.append(
         f"static inline {msl_t} wp_where(bool c, {msl_t} a, {msl_t} b) {{ return c ? a : b; }}"
     )
+    if M == N:
+        # square-mat ops (prelude covers 2x2..4x4; generic sizes like Newton's
+        # spatial-inertia mat6x6f get the same warp-mul/transpose semantics:
+        # row-major r.c[i][j] = sum_k a.c[i][k]*b.c[k][j])
+        lines.append(f"static inline {msl_t} wp_mul({msl_t} a, {msl_t} b) {{")
+        lines.append(f"    {msl_t} r;")
+        terms = " + ".join(f"a.c[i][{k}]*b.c[{k}][j]" for k in range(N))
+        lines.append(f"    for (int i = 0; i < {N}; ++i)")
+        lines.append(f"        for (int j = 0; j < {N}; ++j)")
+        lines.append(f"            r.c[i][j] = {terms};")
+        lines.append("    return r;")
+        lines.append("}")
+        terms_mv = " + ".join(f"m.c[i][{j}]*wp_extract(v, {j})" for j in range(N))
+        lines.append(f"static inline {vec} wp_mul({msl_t} m, {vec} v) {{")
+        lines.append(f"    {vec} r = make_{vec}();")
+        lines.append(f"    for (int i = 0; i < {N}; ++i)")
+        lines.append(f"        r = wp_vec_insert(r, i, {terms_mv});")
+        lines.append("    return r;")
+        lines.append("}")
+        lines.append(f"static inline {msl_t} wp_mul(float s, {msl_t} m) {{")
+        lines.append(f"    {msl_t} r;")
+        lines.append(f"    for (int i = 0; i < {N}; ++i)")
+        lines.append(f"        for (int j = 0; j < {N}; ++j)")
+        lines.append("            r.c[i][j] = s*m.c[i][j];")
+        lines.append("    return r;")
+        lines.append("}")
+        lines.append(f"static inline {msl_t} wp_mul({msl_t} m, float s) {{ return wp_mul(s, m); }}")
+        lines.append(f"static inline {msl_t} wp_transpose({msl_t} m) {{")
+        lines.append(f"    {msl_t} r;")
+        lines.append(f"    for (int i = 0; i < {N}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = m.c[j][i];")
+        lines.append("    return r;")
+        lines.append("}")
     unit.structs[msl_t] = "\n".join(lines)
 
 
