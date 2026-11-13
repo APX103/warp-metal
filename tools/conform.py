@@ -46,6 +46,7 @@ import hashlib
 import importlib
 import inspect
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -661,8 +662,132 @@ def run_corpus(golden_npz: Path) -> str:
     return "\n".join(lines)
 
 
-def run_trajectory() -> dict:
-    sys.exit("error: trajectory layer not implemented yet (KEP-0001 M1.7(c))")
+# --------------------------------------------------------------------------
+# Layer (c) — trajectory: same example, cpu (real warp) vs metal (shim),
+# per-step body_q comparison. The golden side runs in the Newton venv WITHOUT
+# NEWTON_WARP_BACKEND (real warp, device cpu); the compare side runs in the
+# Newton venv WITH NEWTON_WARP_BACKEND=metal. Contact-free motion must match
+# at corpus tolerances (rtol 1e-5 / atol 1e-6); once contacts engage, the
+# reducer's atomic slot allocation makes per-thread export order a scheduling
+# artifact, and clustering picks different representatives — an anticipated
+# divergence class (ROADMAP M1.7(c)), bounded by an explicit drift cap.
+# --------------------------------------------------------------------------
+
+TRAJECTORY_CASES = {
+    # name -> (n_steps, drift cap on per-step max |Δbody_q| component; None = strict only)
+    "basic_pendulum": (120, None),  # contact-free: strict everywhere
+    "basic_shapes": (100, 0.10),  # primitives strict pre-contact; mesh contacts → cap
+}
+TRAJECTORY_RTOL = 1e-5
+TRAJECTORY_ATOL = 1e-6
+TRAJECTORY_NPZ = Path(__file__).resolve().parent / "trajectory_golden.npz"
+
+
+def _traj_example_args(device: str):
+    import argparse
+
+    return argparse.Namespace(
+        test=False,
+        viewer="null",
+        device=device,
+        benchmark=False,
+        headless=True,
+        stage=None,
+        num_frames=110,
+        render_fps=None,
+        solver="xpbd",
+        scale=1.0,
+    )
+
+
+def _traj_collect(device: str) -> dict[str, "np.ndarray"]:
+    """Run each example for N steps and snapshot state_0.body_q every step."""
+    import numpy as np
+
+    if os.environ.get("NEWTON_WARP_BACKEND") == "metal":
+        import warp_metal as wp
+    else:
+        import warp as wp
+    wp.set_device(device)
+
+    import newton  # noqa: F401 — must import with the backend switch already set
+    from newton.viewer import ViewerNull
+
+    cases = {}
+    for name, (n_steps, _cap) in TRAJECTORY_CASES.items():
+        mod = importlib.import_module(f"newton.examples.basic.example_{name}")
+        inst = mod.Example(ViewerNull(), _traj_example_args(device))
+        n_bodies = len(inst.model.body_q)
+        frames = [np.asarray(inst.state_0.body_q.numpy(), dtype=np.float64).copy()]
+        for _ in range(n_steps):
+            inst.step()
+            frames.append(np.asarray(inst.state_0.body_q.numpy(), dtype=np.float64).copy())
+        cases[name] = np.stack(frames)  # [n_steps+1, n_bodies, 7]
+        print(f"  trajectory[{device}] {name}: {n_steps} steps, {n_bodies} bodies")
+    return cases
+
+
+def run_trajectory() -> str:
+    import numpy as np
+
+    side = os.environ.get("NEWTON_WARP_BACKEND", "")
+    if side != "metal":
+        # golden phase: real warp, CPU
+        try:
+            import warp  # noqa: F401
+
+            if "warp_metal" in sys.modules:
+                raise ImportError
+        except ImportError:
+            sys.exit("error: trajectory golden phase requires real warp (unset NEWTON_WARP_BACKEND)")
+        cases = _traj_collect("cpu")
+        payload = {f"{k}::body_q": v for k, v in cases.items()}
+        meta = {k: {"n_steps": TRAJECTORY_CASES[k][0], "n_bodies": int(v.shape[1])} for k, v in cases.items()}
+        np.savez(TRAJECTORY_NPZ, **payload)
+        (TRAJECTORY_NPZ.parent / "trajectory_golden_meta.json").write_text(json.dumps(meta, indent=1))
+        print(f"trajectory golden -> {TRAJECTORY_NPZ}")
+        return "golden phase (cpu reference) written"
+
+    # compare phase: shim, metal device
+    try:
+        golden = np.load(TRAJECTORY_NPZ)
+    except FileNotFoundError:
+        sys.exit(f"error: trajectory golden missing — run the cpu phase first ({TRAJECTORY_NPZ})")
+
+    cases = _traj_collect("metal")
+    lines = []
+    n_pass = 0
+    for name, (n_steps, cap) in TRAJECTORY_CASES.items():
+        ref = golden[f"{name}::body_q"]
+        got = cases[name]
+        if got.shape != ref.shape:
+            lines.append(f"- **{name}**: FAIL — shape {got.shape} vs golden {ref.shape}")
+            continue
+        diff = np.abs(got - ref)
+        per_step_max = diff.reshape(n_steps + 1, -1).max(axis=1)
+        strict_ok = per_step_max <= TRAJECTORY_ATOL + TRAJECTORY_RTOL * np.abs(ref).reshape(n_steps + 1, -1).max(axis=1)
+        n_strict = int(strict_ok.sum())
+        max_drift = float(per_step_max.max())
+        if cap is None:
+            ok = bool(strict_ok.all())
+            verdict = "PASS（全步 strict）" if ok else "FAIL"
+        else:
+            # contact phase: every step must be either strict or within the cap
+            over = per_step_max[~strict_ok] > cap
+            ok = not bool(over.any())
+            verdict = "PASS" if ok else "FAIL"
+        n_pass += int(ok)
+        first_div = int(np.argmax(~strict_ok)) if not strict_ok.all() else "-"
+        lines.append(
+            f"- **{name}**: {verdict} — steps {n_steps + 1}, bodies {got.shape[1]}; "
+            f"strict {n_strict}/{n_steps + 1}（首个非严格步 {first_div}），"
+            f"max|Δbody_q|={max_drift:.3e}，cap={cap if cap is not None else 'strict-only'}"
+        )
+    total = len(TRAJECTORY_CASES)
+    lines.append(f"")
+    lines.append(f"**结果：{n_pass} / {total} 例程通过**（strict rtol={TRAJECTORY_RTOL} / atol={TRAJECTORY_ATOL}；"
+                 f"atomic-order 漂移上限见各例程 cap——reducer 原子槽序差异的预期发散类，ROADMAP M1.7(c)）")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -749,7 +874,12 @@ def main() -> None:
         results["corpus"] = run_corpus(args.corpus_golden)
         print(f"corpus: report section updated (see {args.report})")
     if args.layer in ("trajectory", "all"):
-        run_trajectory()
+        res = run_trajectory()
+        if res.startswith("golden phase"):
+            # golden side: nothing to report from this process (like corpus)
+            return
+        results["trajectory"] = res
+        print("trajectory: report section updated (see report)")
     write_report(args.report, SECTION_TITLES, results)
 
 

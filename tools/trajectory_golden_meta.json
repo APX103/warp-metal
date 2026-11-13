@@ -1,0 +1,10 @@
+{
+ "basic_pendulum": {
+  "n_steps": 120,
+  "n_bodies": 2
+ },
+ "basic_shapes": {
+  "n_steps": 100,
+  "n_bodies": 7
+ }
+}
