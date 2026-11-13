@@ -33,6 +33,22 @@ from .frontend import builtins as _builtins  # noqa: F401
 # equivalent since types.py carries the same public names.
 from .frontend.types import *  # noqa: F401,F403
 
+# @wp.struct decorator (M1.1, ported from upstream context.py). Imported
+# AFTER the star import on purpose: the vendored types.py leaks the stdlib
+# ``struct`` module, which would otherwise shadow the decorator.
+from .frontend.structs import struct  # noqa: F401
+from .frontend.codegen import Struct  # noqa: F401
+
+# Math constants (upstream warp exports plain floats of the same values).
+import math as _math  # noqa: E402
+
+pi = _math.pi  # noqa: F401
+PI = _math.pi  # noqa: F401
+tau = _math.tau  # noqa: F401
+inf = _math.inf  # noqa: F401
+nan = _math.nan  # noqa: F401
+HALF_PI = _math.pi / 2  # noqa: F401
+
 # Host runtime (M0.4 prototype): buffers, launch, synchronize. These also
 # serve as the registry's lazy runtime_symbol targets for vendored code.
 from .runtime import (  # noqa: F401
@@ -44,6 +60,7 @@ from .runtime import (  # noqa: F401
     launch,
     synchronize,
     device_name,
+    Module,
 )
 
 __all__ = [
@@ -59,4 +76,13 @@ __all__ = [
     "launch",
     "synchronize",
     "device_name",
+    "Module",
+    "struct",
+    "Struct",
+    "pi",
+    "PI",
+    "tau",
+    "inf",
+    "nan",
+    "HALF_PI",
 ]

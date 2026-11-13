@@ -160,6 +160,11 @@ class Module:
         self.structs = {}
         self.hashes = set()
 
+    def register_struct(self, struct):
+        """Track a Struct defined against this module (codegen.Struct calls
+        this at decoration time)."""
+        self.structs[struct.key] = struct
+
 
 class ModuleBuilder:
     """Placeholder for the runtime-side ModuleBuilder (M1.2 replaces this)."""

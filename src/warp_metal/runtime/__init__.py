@@ -21,6 +21,7 @@ from .host import (
     synchronize,
     device_name,
 )
+from .modules import Module  # noqa: F401  (placeholder hub, M1.2 replaces)
 
 __all__ = [
     "WarpArray",
@@ -31,4 +32,5 @@ __all__ = [
     "launch",
     "synchronize",
     "device_name",
+    "Module",
 ]
