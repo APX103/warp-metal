@@ -111,6 +111,10 @@ def _get_host_module():
     return host
 
 
+def _get_host_module_or_none():
+    return host
+
+
 class _CoreShim:
     """Dormant-CUDA stand-in for the warp native core (warp.so).
 

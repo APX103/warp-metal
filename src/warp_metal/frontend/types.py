@@ -5639,11 +5639,11 @@ class _ArrayAnnotationBase:
             # Struct instances carry a .key rather than a __name__
             return dtype.key
         name = getattr(dtype, "__name__", None)
-        if name and getattr(warp, name, None) is dtype:
+        if name and getattr(_pkg.registry._get_host_module_or_none(), name, None) is dtype:
             # Type with a matching public alias (e.g. wp.float32, wp.vec3f)
             return f"wp.{name}"
         repr_name = type_repr(dtype)
-        if getattr(warp, repr_name, None) is not None:
+        if getattr(_pkg.registry._get_host_module_or_none(), repr_name, None) is not None:
             # Canonical alias for an equivalent dynamic type (e.g. a freshly
             # built vector(3, float64) whose type_repr is the cached "vec3d")
             return f"wp.{repr_name}"
@@ -8643,11 +8643,11 @@ simple_type_codes = {
 def is_warp_function_annotation(annotation) -> bool:
     """Return whether an annotation denotes a type-erased Warp function."""
 
-    function_type = getattr(warp, "Function", None)
+    function_type = getattr(_pkg.registry._get_host_module_or_none(), "Function", None)
     if function_type is not None and annotation is function_type:
         return True
 
-    context = getattr(getattr(warp, "_src", None), "context", None)
+    context = getattr(getattr(_pkg.registry._get_host_module_or_none(), "_src", None), "context", None)
     context_function_type = getattr(context, "Function", None)
     return context_function_type is not None and annotation is context_function_type
 

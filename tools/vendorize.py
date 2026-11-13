@@ -160,6 +160,8 @@ FILE_RULES: dict[str, list[tuple[str, str]]] = {
     "types.py": [
         # types.py defines the scalar names itself; bare refs, not _pkg.types.X
         *[(rf"_pkg\.types\.({name})\b", rf"\1") for name in SCALAR_TYPE_NAMES],
+        # canonical-name repr falls back gracefully without a host module
+        (r"\bgetattr\(warp, ", "getattr(_pkg.registry._get_host_module_or_none(), "),
     ],
     "registry.py": [
         # add_builtin's export path attaches builtins to the host wp module
@@ -447,6 +449,10 @@ class _LazySymbol:
 def _get_host_module():
     if host is None:
         raise RuntimeError("frontend used before warp_metal package init (host unset)")
+    return host
+
+
+def _get_host_module_or_none():
     return host
 
 
