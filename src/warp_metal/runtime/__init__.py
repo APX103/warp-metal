@@ -5,17 +5,30 @@
 # of the License at http://www.apache.org/licenses/LICENSE-2.0.
 """Native Metal runtime + LLVM CPU fallback.
 
-Placeholder (M0.1 skeleton). Original work (not vendored). M0.4 lands the
-ObjC++ prototype:
-
-- ``MTLDevice`` / ``MTLBuffer`` management with ``storageModeShared``
-  (unified memory; CPU-side numpy zero-copy views over buffer contents)
-- PSO cache; runtime MSL → metallib compilation
-- single kernel dispatch + synchronize
-- (later phases) command buffer batching: per-step deferred commit
-
-The CPU backend reuses Warp's LLVM execution path, built without CUDA
-(KEP-0001 Goals: debugging backend and per-kernel fallback routing target).
-Build style follows warp native: pybind-style bindings, compiled by the
-package build; no CUDA toolkit required anywhere.
+M0.4 prototype: ObjC++ native module (native/), WarpArray over
+storageModeShared MTLBuffers with zero-copy numpy views, emit->compile->
+PSO-cache->dispatch launch path (host.py). The CPU LLVM fallback lands
+with bucket D in M1.2.
 """
+
+from .host import (
+    WarpArray,
+    zeros,
+    empty,
+    ones,
+    full,
+    launch,
+    synchronize,
+    device_name,
+)
+
+__all__ = [
+    "WarpArray",
+    "zeros",
+    "empty",
+    "ones",
+    "full",
+    "launch",
+    "synchronize",
+    "device_name",
+]

@@ -40,7 +40,8 @@ class TestSpikeEmission(unittest.TestCase):
     def test_copy_scale_body(self):
         body = self._body("k_copy_scale")
         self.assertIn("const int tid = int(_gid.x);", body)
-        self.assertIn("out[i] = (x * s);", body)
+        self.assertIn("float x = a[i];", body)
+        self.assertIn("out[i] = (x * s[0]);", body)  # scalar params via constant space
 
     def test_atomic_call(self):
         body = self._body("k_atomic_accum")
@@ -59,10 +60,10 @@ class TestSpikeEmission(unittest.TestCase):
 
     def test_vec_arithmetic(self):
         body = self._body("k_saxpy3")
-        self.assertIn("out[i] = ((a[i] * s) + b[i]);", body)
+        self.assertIn("out[i] = ((a[i] * s[0]) + b[i]);", body)
 
     def test_select_ternary(self):
-        self.assertIn("(x < lo) ? lo :", self._body("k_select_clip"))
+        self.assertIn("(x < lo[0]) ? lo[0] :", self._body("k_select_clip"))
 
     def test_registry_builtin_resolution(self):
         # every builtin named in the M0.3 acceptance list resolves

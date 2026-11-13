@@ -262,6 +262,14 @@ class MSLEmitter:
 
     # -- public entry -------------------------------------------------------
 
+    def param_layout(self, func):
+        """[(name, is_array, msl element type)] in kernel-buffer order."""
+        sig = _KernelSignature(func)
+        return [
+            (name, is_array, msl_type_name(dtype) if is_array else msl_type_name(wtype))
+            for name, wtype, is_array, dtype in sig.args
+        ]
+
     def emit(self, func) -> str:
         sig = _KernelSignature(func)
         self._sig = sig
@@ -269,6 +277,7 @@ class MSLEmitter:
         self._tmp = 0
         self._env: dict[str, tuple[str, type]] = {}  # py name -> (msl type, warp type)
         self._array_args: set[str] = set()
+        self._scalar_params: set[str] = set()
 
         tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
         fn_node = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
@@ -284,6 +293,10 @@ class MSLEmitter:
             self._env[name] = (msl_t, dtype if is_array else wtype)
             if is_array:
                 self._array_args.add(name)
+            else:
+                # MSL kernel params cannot be scalar values: they arrive via
+                # the constant address space and are read as name[0]
+                self._scalar_params.add(name)
 
         for node in body:
             self._emit_statement(node)
@@ -291,8 +304,9 @@ class MSLEmitter:
         args = []
         for i, (name, wtype, is_array, dtype) in enumerate(sig.args):
             msl_t = msl_type_name(dtype) if is_array else msl_type_name(wtype)
-            args.append(f"    device {msl_t}* {name} [[buffer({i})]],")
-        args.append(f"    uint3 _gid [[thread_position_in_grid]]")
+            space = "device" if is_array else "constant"
+            args.append(f"    {space} {msl_t}* {name} [[buffer({i})]],")
+        args.append("    uint3 _gid [[thread_position_in_grid]]")
 
         body_src = "\n".join(self._lines) or "    ;"
         return (
@@ -370,6 +384,8 @@ class MSLEmitter:
                 return f"{node.value!r}f", float32
             raise NotImplementedError(f"constant {node.value!r}")
         if isinstance(node, ast.Name):
+            if node.id in self._scalar_params:
+                return f"{node.id}[0]", self._env[node.id][1]
             entry = self._env.get(node.id)
             if entry is None:
                 raise NameError(f"unresolved kernel variable '{node.id}'")

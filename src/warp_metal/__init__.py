@@ -33,9 +33,30 @@ from .frontend import builtins as _builtins  # noqa: F401
 # equivalent since types.py carries the same public names.
 from .frontend.types import *  # noqa: F401,F403
 
+# Host runtime (M0.4 prototype): buffers, launch, synchronize. These also
+# serve as the registry's lazy runtime_symbol targets for vendored code.
+from .runtime import (  # noqa: F401
+    WarpArray,
+    zeros,
+    empty,
+    ones,
+    full,
+    launch,
+    synchronize,
+    device_name,
+)
+
 __all__ = [
     "__version__",
     "EXPECTED_VENDORED_WARP_VERSION",
     "VendoredVersionError",
     "check_vendored_version",
+    "WarpArray",
+    "zeros",
+    "empty",
+    "ones",
+    "full",
+    "launch",
+    "synchronize",
+    "device_name",
 ]
