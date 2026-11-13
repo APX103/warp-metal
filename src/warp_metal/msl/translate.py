@@ -135,6 +135,13 @@ _CALL_TABLE = {
     "min": "wp_min",
     "max": "wp_max",
     "clamp": "wp_clamp",
+    "nonzero": "wp_nonzero",
+    # bit ops (builtin.h bit_and/bit_or/bit_xor/lshift/rshift)
+    "bit_and": "wp_bit_and",
+    "bit_or": "wp_bit_or",
+    "bit_xor": "wp_bit_xor",
+    "lshift": "wp_lshift",
+    "rshift": "wp_rshift",
     # rounding/trig/scalar
     "sqrt": "wp_sqrt",
     "sin": "wp_sin",
@@ -485,6 +492,16 @@ class _BodyTranslator:
         if m := _RE_RETURN.match(line):
             return [f"return {self.expr(m.group(1))};".replace("return ;", "return;")]
 
+        # plain assignment `name = expr;` — must be tried before the decl
+        # regex, whose lazy `(\S.*?)` can otherwise swallow `ret_0 =` as a
+        # "type" on multi-output ref-assign lines (T & ret_0 params)
+        if m := re.match(r"^\s*(\w+)\s*=\s*(.+?);\s*$", line):
+            target, rhs = m.group(1), m.group(2)
+            if rhs.startswith("wp::address(") or rhs.startswith("&("):
+                self._alias(target, rhs)
+                return []  # alias collapsed: no MSL line, no decl (pointer decl was dropped)
+            return [f"{target} = {self.expr(rhs)};"]
+
         # alias creation: var_p = wp::address(...) / var_p = &(expr)
         if m := _RE_DECL.match(line):
             const, ctype, name, init = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -504,13 +521,6 @@ class _BodyTranslator:
             if init is not None:
                 return [f"{'const ' if const else ''}{msl_t} {name} = {self.expr(init)};"]
             return [f"{'const ' if const else ''}{msl_t} {name};"]
-
-        if m := re.match(r"^\s*(\w+)\s*=\s*(.+?);\s*$", line):
-            target, rhs = m.group(1), m.group(2)
-            if rhs.startswith("wp::address(") or rhs.startswith("&("):
-                self._alias(target, rhs)
-                return []  # alias collapsed: no MSL line, no decl (pointer decl was dropped)
-            return [f"{target} = {self.expr(rhs)};"]
 
         if m := re.match(r"^\s*(.+?);\s*$", line):
             return [self.call_stmt(m.group(1)) + ";"]
@@ -690,6 +700,13 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
         fname = f.native_func
         if fname in user_funcs:
             return
+        snippet = getattr(f, "native_snippet", None)
+        if snippet:
+            raise TranslationError(
+                f"@wp.func_native {fname!r} has no MSL translation: embedded CUDA/C++ source is "
+                f"not supported by the Metal backend (KEP-0001). Rewriting it as a plain @wp.func "
+                f"is the supported path; the calling kernel cannot launch on 'metal'."
+            )
         for callee in f.adj.called_user_functions:
             visit(callee)
         fn = _translate_function(f, unit, user_funcs, _codegen)

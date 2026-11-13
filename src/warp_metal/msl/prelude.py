@@ -146,11 +146,13 @@ static inline mat33f make_mat33f() { mat33f m = {{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0
 static inline mat44f make_mat44f() { mat44f m = {{{0.0f}}}; return m; }
 static inline transformf make_transformf() { transformf t; t.p = make_vec3f(); t.q = make_quatf(); return t; }
 static inline spatial_vectorf make_spatial_vectorf() { spatial_vectorf s; s.w = make_vec3f(); s.v = make_vec3f(); return s; }
+static inline spatial_vectorf make_spatial_vectorf(vec3f w, vec3f v) { spatial_vectorf s; s.w = w; s.v = v; return s; }
 
 static inline vec2f make_vec2f(float x, float y) { vec2f v; v.x = x; v.y = y; return v; }
 static inline vec3f make_vec3f(float x, float y, float z) { vec3f v; v.x = x; v.y = y; v.z = z; return v; }
 static inline vec4f make_vec4f(float x, float y, float z, float w) { vec4f v; v.x = x; v.y = y; v.z = z; v.w = w; return v; }
 static inline quatf make_quatf(float x, float y, float z, float w) { quatf v; v.x = x; v.y = y; v.z = z; v.w = w; return v; }
+static inline quatf make_quatf(vec3f v, float w) { quatf q; q.x = v.x; q.y = v.y; q.z = v.z; q.w = w; return q; }  // quat.h quat_t(vec_t<3>, Type)
 // fill constructors: wp.vec3(s) (vec.h operator vec_t(Type s) broadcast)
 static inline vec2f make_vec2f(float s) { return make_vec2f(s, s); }
 static inline vec3f make_vec3f(float s) { return make_vec3f(s, s, s); }
@@ -324,6 +326,11 @@ static inline vec4f wp_abs(vec4f a) { return make_vec4f(abs(a.x), abs(a.y), abs(
 static inline float wp_clamp(float x, float a, float b) { return min(max(a, x), b); }
 static inline int wp_clamp(int x, int a, int b) { return min(max(a, x), b); }
 static inline vec3f wp_clamp(vec3f x, float a, float b) { return wp_min(wp_max(make_vec3f(a), x), make_vec3f(b)); }
+// nonzero (builtin.h: x == T(0) ? T(0) : T(1))
+static inline float wp_nonzero(float x) { return x == 0.0f ? 0.0f : 1.0f; }
+static inline int wp_nonzero(int x) { return x == 0 ? 0 : 1; }
+static inline uint wp_nonzero(uint x) { return x == 0u ? 0u : 1u; }
+static inline bool wp_nonzero(bool x) { return x; }
 // where/select (builtins.py where overloads)
 static inline vec2f wp_where(bool c, vec2f a, vec2f b) { return c ? a : b; }
 static inline vec3f wp_where(bool c, vec3f a, vec3f b) { return c ? a : b; }
@@ -826,6 +833,8 @@ static inline quatf wp_mul(quatf a, quatf b) {
         a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
     );
 }
+static inline quatf wp_mul(quatf a, float s) { return a * s; }   // quat.h mul(quat_t, Type)
+static inline quatf wp_mul(float s, quatf a) { return a * s; }   // quat.h operator*(Type, quat_t)
 static inline transformf wp_mul(transformf a, float s) {  // spatial.h mul(transform, s)
     transformf r; r.p = a.p * s; r.q = a.q * s; return r;
 }

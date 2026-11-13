@@ -599,6 +599,23 @@ def main() -> None:
         vendored_file(warp_src, dst, name, version)
         print(f"vendored (rewritten): {name}")
 
+    # thirdparty helpers Newton imports through the warp surface
+    # (warp._src.thirdparty.appdirs -> frontend/thirdparty/appdirs.py)
+    tp = dst / "thirdparty"
+    tp.mkdir(exist_ok=True)
+    (tp / "__init__.py").write_text(
+        '# Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n'
+        '#\n'
+        '# Licensed under the Apache License, Version 2.0 (the "License"); you may not\n'
+        '# use this file except in compliance with the License. You may obtain a copy\n'
+        '# of the License at http://www.apache.org/licenses/LICENSE-2.0.\n'
+        '"""Vendored thirdparty helpers (upstream: warp/_src/thirdparty)."""\n'
+    )
+    for name in ["appdirs.py"]:
+        source = (warp_src / "_src" / "thirdparty" / name).read_text()
+        (tp / name).write_text(source)
+        print(f"vendored (thirdparty): {name}")
+
     (dst / "build.py").write_text(BUILD_STUB)
     print("stub: build.py")
 

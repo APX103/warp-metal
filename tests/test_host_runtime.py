@@ -65,8 +65,21 @@ class TestDecorators(unittest.TestCase):
                 pass
 
     def test_func_native_fails_loud(self):
-        with self.assertRaises(RuntimeError):
-            wp.func_native("float f(float x) { return x; }")
+        # decoration registers (module imports stay clean — Newton geometry
+        # imports support_function.py at package level), but any kernel that
+        # CALLS the native function fails loudly at translate time
+        @wp.func_native("return 1.0f / sqrtf(value);")
+        def rsqrt_native(value: wp.float32) -> wp.float32: ...
+
+        @wp.kernel
+        def k(out: wp.array(dtype=wp.float32)):
+            i = wp.tid()
+            out[i] = rsqrt_native(4.0)
+        from warp_metal.msl.translate import translate_kernel
+
+        with self.assertRaises(Exception) as ctx:
+            translate_kernel(k)
+        self.assertIn("func_native", str(ctx.exception))
 
     def test_generic_kernel_overload(self):
         from typing import Any

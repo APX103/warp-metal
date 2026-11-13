@@ -82,8 +82,7 @@ from .runtime.devices import (  # noqa: F401
     get_preferred_device,
     get_stream,
     set_stream,
-    synchronize_device,
-    synchronize_stream,
+    synchronize_device,    synchronize_stream,
     record_event,
     get_event_elapsed_time,
     is_cuda_available,
@@ -127,10 +126,17 @@ from .runtime.host import (  # noqa: F401
     device_name,
 )
 
+# DeviceLike: upstream context.py type alias Newton annotates with
+# (``from warp import DeviceLike``); Device | str | None.
+DeviceLike = Device | str | None  # noqa: F401
+
 # Upstream-internals aliases Newton relies on (``wp._src.context.runtime.core``).
 from .frontend import context as _frontend_context  # noqa: F401
 from .frontend import config as config  # noqa: F401
 from .frontend import utils as utils  # noqa: F401
+from .frontend import types as types  # noqa: F401  (upstream: wp.types.vector(...))
+from .frontend.config import DeterministicMode  # noqa: F401  (newton module_options)
+from .frontend.builtins import static as static  # noqa: F401  (upstream: plain identity fn, wp.static(expr))
 
 _src = _sys.modules["warp_metal.frontend"]  # upstream: warp._src
 _src.__name__ = "warp_metal._src"  # display parity with the upstream alias
@@ -144,10 +150,13 @@ _sys.modules.setdefault("warp", _sys.modules[__name__])
 for _name, _mod in list(_sys.modules.items()):
     if _name == "warp_metal" or _name.startswith("warp_metal."):
         _sys.modules.setdefault("warp" + _name[len("warp_metal") :], _mod)
-    if _name.startswith("warp_metal.frontend."):
-        # upstream layout: warp/<rest> is a top-level module; ours lives in
-        # frontend/<rest> (e.g. warp.config ← warp_metal.frontend.config)
-        _sys.modules.setdefault("warp." + _name[len("warp_metal.frontend.") :], _mod)
+    if _name.startswith("warp_metal.frontend"):
+        # upstream layout parity in both spellings: warp/<rest> (top-level,
+        # e.g. warp.config ← frontend/config) and warp._src/<rest> (e.g.
+        # warp._src.thirdparty.appdirs ← frontend/thirdparty/appdirs).
+        _rest = _name[len("warp_metal.frontend") :]
+        _sys.modules.setdefault("warp." + _rest.lstrip("."), _mod)
+        _sys.modules.setdefault("warp._src" + _rest, _mod)
 
 # Vendored codegen.resolve_path() looks unknown roots up on the ``warp``
 # module global (upstream: the installed package object). Bind it here so the

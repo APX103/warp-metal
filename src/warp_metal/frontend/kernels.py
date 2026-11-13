@@ -417,15 +417,45 @@ def _find_generic_kernel(fn, m):
 
 
 def func_native(snippet: str, adj_snippet: str | None = None, replay_snippet: str | None = None):
-    """Native source snippets are CUDA-only — unsupported on Metal.
+    """Register a Warp function implemented by a native C++/CUDA snippet.
 
-    warp-metal cannot compile embedded CUDA device code (KEP-0001: the CUDA
-    path is stripped entirely). Fail loudly at decoration time.
+    The registration itself succeeds (upstream parity: module imports and
+    non-GJK paths keep working — Newton imports support_function.py at the
+    geometry package level), but the snippet is CUDA/C++ source with no MSL
+    translation. Any kernel that CALLS the function fails loudly at
+    translate time with a clear message (KEP-0001: fail loud at the
+    capability boundary, not at unrelated import time).
     """
-    raise RuntimeError(
-        "wp.func_native is not supported by warp-metal: embedded CUDA source has no Metal translation. "
-        "Rewrite the function as a plain @wp.func (KEP-0001 Non-Goal: CUDA/NVIDIA dependencies)."
-    )
+    frame = inspect.currentframe()
+    try:
+        if frame is None or frame.f_back is None:
+            scope_locals = {}
+        else:
+            scope_locals = frame.f_back.f_locals
+    finally:
+        # Avoid a reference cycle that would retain the caller stack.
+        del frame
+
+    def wrapper(f, *args, **kwargs):
+        key = codegen.make_full_qualified_name(f)
+        m = _get_module(f.__module__, f.__qualname__)
+
+        Function(
+            func=f,
+            key=key,
+            namespace="",
+            module=m,
+            native_snippet=snippet,
+            adj_native_snippet=adj_snippet,
+            replay_snippet=replay_snippet,
+            scope_locals=scope_locals,
+        )  # value_type not known yet, will be inferred during Adjoint.build()
+
+        g = m.functions[key]
+        # copy over the function attributes, including docstring
+        return functools.update_wrapper(g, f)
+
+    return wrapper
 
 
 def func_grad(forward_fn):
