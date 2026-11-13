@@ -1447,24 +1447,44 @@ class Graph:
 class ScopedTimer:
     """Upstream-compatible host timing context (wall-clock only).
 
-    Warp's profiler plumbing (CUDA events, async timers) is out of scope;
-    timing lands on this process's wall clock, which is exact for the
-    synchronous Metal dispatch model.
+    Mirrors upstream ``warp._src.utils.ScopedTimer``: ``active`` (second
+    positional — Newton passes ``False``) disables the timer entirely,
+    ``print`` gates the exit print, ``dict`` receives per-name elapsed
+    lists. Warp's profiler plumbing (CUDA events, NVTX, cProfile) is out
+    of scope; timing lands on this process's wall clock, which is exact
+    for the synchronous Metal dispatch model.
     """
 
-    def __init__(self, name=None, silent=False, show_module=True, show_gpu=False, dict_output=None, **kwargs):
+    enabled = True
+
+    def __init__(
+        self,
+        name: str | None = None,
+        active: bool = True,
+        print: bool = True,  # noqa: A002 — upstream parameter name
+        detailed: bool = False,
+        dict: dict[str, list[float]] | None = None,  # noqa: A002 — upstream
+        use_nvtx: bool = False,
+        color: int | str = "rapids",
+        synchronize: bool = False,
+        cuda_filter: int = 0,
+        report_func=None,
+        skip_tape: bool = False,
+    ):
         self.name = name or "unnamed"
-        self.silent = silent
-        # upstream: active=False disables the timer entirely (no print, no
-        # dict entry) — Newton passes it for cold-path instrumentation
-        self.active = bool(kwargs.pop("active", True))
-        if kwargs:
-            raise RuntimeError(f"ScopedTimer does not support {sorted(kwargs)}")
-        self.dict_output = dict_output
+        self.active = active
+        self.print_enabled = print
+        self.dict = dict
+        self.elapsed = None
         self._start = None
+        if detailed or cuda_filter or report_func is not None:
+            raise RuntimeError(
+                "ScopedTimer: detailed/cuda_filter/report_func profiling is not "
+                "supported by warp-metal (KEP-0001 Non-Goal; warp profiling plumbing)"
+            )
 
     def __enter__(self):
-        if not self.active:
+        if not (type(self).enabled and self.active):
             return self
         import time as _time
 
@@ -1472,16 +1492,15 @@ class ScopedTimer:
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if not self.active or self._start is None:
+        if self._start is None:
             return False
         import time as _time
 
-        elapsed = _time.perf_counter() - self._start
-        self.elapsed = elapsed
-        if self.dict_output is not None:
-            self.dict_output[self.name] = elapsed * 1000.0
-        if not self.silent:
-            print(f"{self.name} took {elapsed * 1000.0:.2f} ms")
+        self.elapsed = _time.perf_counter() - self._start
+        if self.dict is not None:
+            self.dict.setdefault(self.name, []).append(self.elapsed)
+        if self.print_enabled:
+            print(f"{self.name} took {self.elapsed * 1000.0:.2f} ms")
         return False
 
 
