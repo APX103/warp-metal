@@ -20,7 +20,9 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Physics",
 ]
-dependencies = []
+dependencies = [
+    "numpy>=1.22",
+]
 
 [project.urls]
 # Upstream the vendored frontend is derived from (attribution; not a dependency):

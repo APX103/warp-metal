@@ -23,6 +23,16 @@ from .compat import (
     check_vendored_version,
 )
 
+# Importing the frontend registers the full builtin table, attaches the
+# exported ``wp.*`` callables to this package, and wires the host module
+# (see frontend/__init__.py).
+from .frontend import builtins as _builtins  # noqa: F401
+
+# Public type surface (scalar/vector/matrix/quat/array types): upstream
+# re-exports these per-name from warp/_src/types; a star import is
+# equivalent since types.py carries the same public names.
+from .frontend.types import *  # noqa: F401,F403
+
 __all__ = [
     "__version__",
     "EXPECTED_VENDORED_WARP_VERSION",
