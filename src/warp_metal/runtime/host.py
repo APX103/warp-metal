@@ -45,6 +45,8 @@ from ..frontend.types import (
     mat22f,
     mat33f,
     mat44f,
+    transformf,
+    spatial_vectorf,
 )
 from .. import native as _mm
 from ..msl.emitter import MSLEmitter
@@ -72,6 +74,8 @@ _COMPOSITE_FLOATS = {
     mat22f: 4,
     mat33f: 9,
     mat44f: 16,
+    transformf: 7,   # {vec3 p, quat q} imaginary-first quat
+    spatial_vectorf: 6,  # {vec3 w, vec3 v}
 }
 
 _CTYPES_PTR = {
@@ -145,9 +149,9 @@ class WarpArray:
         return self._buffer
 
     def numpy_view(self):
-        """Zero-copy view: (n,) for scalars, (n, k) for composite dtypes."""
+        """Zero-copy view: self.shape for scalar dtypes, (n, k) for composites."""
         if not self.is_composite:
-            return self.numpy
+            return self.numpy.reshape(self.shape)
         return self.numpy.reshape(self.n, -1)
 
     def to_numpy(self):
@@ -280,11 +284,12 @@ def device_name() -> str:
 
 
 # ---------------------------------------------------------------------------
-# launch: emit -> compile -> PSO cache -> synchronous dispatch
+# launch: Adjoint-SSA translate -> compile -> PSO cache -> synchronous dispatch
+# (KEP-0001 M1.3; the M0.4 spike emitter remains for plain-function kernels)
 # ---------------------------------------------------------------------------
 
 _PSO_LOCK = threading.Lock()
-_PSO_CACHE: dict[int, tuple] = {}  # id(kernel func) -> pso handle
+_PSO_CACHE: dict[int, tuple] = {}  # id(kernel) -> (pso handle, KernelUnit)
 _EMITTER: MSLEmitter | None = None
 
 
@@ -333,12 +338,156 @@ def _pso_for(kernel):
         return pso
 
 
+# ---- M1.3 Adjoint-SSA pipeline -------------------------------------------
+
+import ctypes as _ctypes
+
+from ..msl.translate import KernelUnit, translate_kernel
+
+# wp_arr_meta mirrors the MSL struct: int offset, ndim, shape[4], strides[4]
+# (strides in bytes, warp native array.h semantics)
+class _ArrMeta(_ctypes.Structure):
+    _fields_ = [
+        ("offset", _ctypes.c_int32),
+        ("ndim", _ctypes.c_int32),
+        ("shape", _ctypes.c_int32 * 4),
+        ("strides", _ctypes.c_int32 * 4),
+    ]
+
+
+_CTYPE_OF_SCALAR = {
+    "float": _ctypes.c_float,
+    "half": _ctypes.c_uint16,
+    "char": _ctypes.c_int8,
+    "uchar": _ctypes.c_uint8,
+    "short": _ctypes.c_int16,
+    "ushort": _ctypes.c_uint16,
+    "int": _ctypes.c_int32,
+    "int64_t": _ctypes.c_int64,
+    "uint": _ctypes.c_uint32,
+    "uint64_t": _ctypes.c_uint64,
+    "bool": _ctypes.c_bool,
+}
+
+
+def _params_struct(unit: KernelUnit):
+    """Build the ctypes mirror of the MSL ``Params_<name>`` struct."""
+    fields = []
+    for a in unit.args:
+        if a.kind == "scalar":
+            try:
+                fields.append((a.name, _CTYPE_OF_SCALAR[a.msl]))
+            except KeyError:
+                raise RuntimeError(f"launch: scalar param {a.name} has unsupported MSL type {a.msl}")
+        elif a.kind == "struct":
+            fields.append((a.name, _struct_ctypes(a)))
+        elif a.kind == "array":
+            fields.append((f"{a.name}_m", _ArrMeta))
+    fields.append(("_dims", _ArrMeta))
+
+    class Params(_ctypes.Structure):
+        _fields_ = fields or [("_dummy_", _ctypes.c_byte)]
+
+    return Params
+
+
+def _struct_ctypes(arg_spec):
+    """ctypes.Structure class mirroring a vendored struct's field layout."""
+    import warp_metal.frontend.codegen as _codegen
+
+    raise RuntimeError(
+        "launch: struct kernel params are not wired yet (M1.3 corpus scope: scalar/array params)"
+    )
+
+
+def _arr_meta(arr: WarpArray) -> _ArrMeta:
+    shape = arr.shape or (1,)
+    ndim = len(shape)
+    item = arr.item_bytes
+    strides = [0, 0, 0, 0]
+    acc = item
+    for i in range(ndim - 1, -1, -1):
+        strides[i] = acc
+        acc *= shape[i]
+    meta = _ArrMeta()
+    meta.offset = 0
+    meta.ndim = ndim
+    for i in range(4):
+        meta.shape[i] = shape[i] if i < ndim else 0
+        meta.strides[i] = strides[i]
+    return meta
+
+
+def _unit_for(kernel):
+    """Translate + compile + cache a PSO for a vendored Kernel."""
+    with _PSO_LOCK:
+        cached = _PSO_CACHE.get(id(kernel))
+        if cached is not None:
+            return cached
+        unit = translate_kernel(kernel)
+        source = unit.source()
+        lib = _mm.library_create(source)
+        fn = _mm.function_get(lib, unit.kernel.name)
+        pso = _mm.pso_create(fn)
+        _mm.function_release(fn)
+        _mm.library_release(lib)
+        entry = (pso, unit)
+        _PSO_CACHE[id(kernel)] = entry
+        return entry
+
+
+def _launch_ssa(kernel, dim, merged) -> None:
+    """Launch a vendored Kernel through the Adjoint-SSA MSL pipeline."""
+    pso, unit = _unit_for(kernel)
+    Params = _params_struct(unit)
+
+    handles: list[int] = []
+    params = Params()
+    values = list(merged)
+    for a in unit.args:
+        value = values.pop(0)
+        if a.kind == "array":
+            if not isinstance(value, WarpArray):
+                raise TypeError(f"kernel array parameter '{a.name}' got {type(value).__name__}, expected WarpArray")
+            handles.append(value.buffer)
+            meta = _arr_meta(value)
+            setattr(params, f"{a.name}_m", meta)
+        elif a.kind == "scalar":
+            setattr(params, a.name, value)
+        else:
+            raise RuntimeError(f"launch: struct param '{a.name}' not wired yet (M1.3 fail loud)")
+    if values:
+        raise ValueError("more launch arguments than kernel parameters")
+
+    dims = dim if isinstance(dim, (tuple, list)) else (dim,)
+    dims = tuple(int(d) for d in dims)
+    threads = 1
+    for d in dims:
+        threads *= d
+    params._dims.offset = 0
+    params._dims.ndim = len(dims)
+    for i in range(4):
+        d = dims[i] if i < len(dims) else 0
+        params._dims.shape[i] = d
+        params._dims.strides[i] = 0
+
+    handle = _mm.buffer_create(_ctypes.sizeof(params))
+    dst = (_ctypes.c_char * _ctypes.sizeof(params)).from_address(_mm.buffer_ptr(handle))
+    _ctypes.memmove(dst, _ctypes.byref(params), _ctypes.sizeof(params))
+    handles.append(handle)
+
+    try:
+        _mm.dispatch(pso, handles, threads)
+    finally:
+        _mm.buffer_release(handle)
+
+
 def _scalar_buffer(value) -> int:
-    """One constant-space buffer per scalar kernel param (4 bytes float)."""
+    """One 4-byte constant-space buffer per scalar kernel param."""
     packed = np.asarray([value], dtype=np.float32)
     handle = _mm.buffer_create(packed.nbytes)
     dst = np.ctypeslib.as_array(
-        ctypes.cast(_mm.buffer_ptr(handle), ctypes.POINTER(ctypes.c_float)),
+        _ctypes.cast(_mm.buffer_ptr(handle), _ctypes.POINTER(_ctypes.c_float)),
         shape=(1,),
     )
     dst[:] = packed
@@ -385,11 +534,17 @@ def launch(
 
     if dim is None:
         raise TypeError("launch() missing required argument 'dim'")
+
+    merged = list(inputs or []) + list(outputs or [])
+
+    if hasattr(kernel, "adj"):  # vendored Kernel (M1.2+): Adjoint-SSA pipeline
+        _launch_ssa(kernel, dim, merged)
+        return
+
+    # legacy spike path (M0.4 plain-function kernels)
     if isinstance(dim, (tuple, list)):
         dim = int(np.prod([int(d) for d in dim]))
     dim = int(dim)
-
-    merged = list(inputs or []) + list(outputs or [])
 
     pso = _pso_for(kernel)
     layout = _emitter().param_layout(_kernel_emit_target(kernel)[0])

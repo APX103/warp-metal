@@ -135,6 +135,27 @@ from .frontend import utils as utils  # noqa: F401
 _src = _sys.modules["warp_metal.frontend"]  # upstream: warp._src
 _src.__name__ = "warp_metal._src"  # display parity with the upstream alias
 
+# Vendored frontend modules occasionally ``import warp`` / ``import warp.x``
+# at runtime (deterministic.py static-call resolution, logger verbosity, …).
+# Alias this package and every ``warp_metal.*`` submodule under the ``warp``
+# name: warp-metal exposes the same symbol surface, and the CUDA-only
+# fallback paths those modules guard against are dormant (KEP-0001).
+_sys.modules.setdefault("warp", _sys.modules[__name__])
+for _name, _mod in list(_sys.modules.items()):
+    if _name == "warp_metal" or _name.startswith("warp_metal."):
+        _sys.modules.setdefault("warp" + _name[len("warp_metal") :], _mod)
+    if _name.startswith("warp_metal.frontend."):
+        # upstream layout: warp/<rest> is a top-level module; ours lives in
+        # frontend/<rest> (e.g. warp.config ← warp_metal.frontend.config)
+        _sys.modules.setdefault("warp." + _name[len("warp_metal.frontend.") :], _mod)
+
+# Vendored codegen.resolve_path() looks unknown roots up on the ``warp``
+# module global (upstream: the installed package object). Bind it here so the
+# vendored file stays byte-identical to upstream.
+from .frontend import codegen as _frontend_codegen  # noqa: E402
+
+_frontend_codegen.warp = _sys.modules[__name__]
+
 # Host-side transform helper (upstream signature: transform_expand(t)).
 from .frontend.types import transform as _transform_type  # noqa: E402
 
