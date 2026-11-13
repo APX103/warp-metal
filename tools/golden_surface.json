@@ -1,0 +1,1335 @@
+{
+ "generator": "conform.py --dump-golden",
+ "n_symbols": 356,
+ "symbols": {
+  "Bvh": {
+   "kind": "type",
+   "sig": "Bvh"
+  },
+  "DeterministicMode": {
+   "kind": "type",
+   "sig": "DeterministicMode"
+  },
+  "Device": {
+   "kind": "type",
+   "sig": "Device"
+  },
+  "DeviceLike": {
+   "kind": "other",
+   "sig": "UnionType"
+  },
+  "Event": {
+   "kind": "type",
+   "sig": "Event"
+  },
+  "Function": {
+   "kind": "type",
+   "sig": "Function"
+  },
+  "GLTextureResource": {
+   "kind": "type",
+   "sig": "GLTextureResource"
+  },
+  "Graph": {
+   "kind": "type",
+   "sig": "Graph"
+  },
+  "HALF_PI": {
+   "kind": "other",
+   "sig": "float"
+  },
+  "HashGrid": {
+   "kind": "type",
+   "sig": "HashGrid"
+  },
+  "JaxCallableGraphMode": {
+   "kind": "type",
+   "sig": "JaxCallableGraphMode"
+  },
+  "Kernel": {
+   "kind": "type",
+   "sig": "Kernel"
+  },
+  "LOG_DEBUG": {
+   "kind": "other",
+   "sig": "int"
+  },
+  "LOG_INFO": {
+   "kind": "other",
+   "sig": "int"
+  },
+  "LOG_WARNING": {
+   "kind": "other",
+   "sig": "int"
+  },
+  "Launch": {
+   "kind": "type",
+   "sig": "Launch"
+  },
+  "MarchingCubes": {
+   "kind": "type",
+   "sig": "IsoSurfaceMarchingCubes"
+  },
+  "Mesh": {
+   "kind": "type",
+   "sig": "Mesh"
+  },
+  "Module": {
+   "kind": "type",
+   "sig": "Module"
+  },
+  "PI": {
+   "kind": "other",
+   "sig": "float"
+  },
+  "RegisteredGLBuffer": {
+   "kind": "type",
+   "sig": "RegisteredGLBuffer"
+  },
+  "ScopedCapture": {
+   "kind": "type",
+   "sig": "ScopedCapture"
+  },
+  "ScopedDevice": {
+   "kind": "type",
+   "sig": "ScopedDevice"
+  },
+  "ScopedStream": {
+   "kind": "type",
+   "sig": "ScopedStream"
+  },
+  "ScopedTimer": {
+   "kind": "type",
+   "sig": "ScopedTimer"
+  },
+  "Stream": {
+   "kind": "type",
+   "sig": "Stream"
+  },
+  "Tape": {
+   "kind": "type",
+   "sig": "Tape"
+  },
+  "Texture2D": {
+   "kind": "type",
+   "sig": "Texture2D"
+  },
+  "Texture3D": {
+   "kind": "type",
+   "sig": "Texture3D"
+  },
+  "TextureAddressMode": {
+   "kind": "type",
+   "sig": "TextureAddressMode"
+  },
+  "TextureFilterMode": {
+   "kind": "type",
+   "sig": "TextureFilterMode"
+  },
+  "TextureResourceFlags": {
+   "kind": "type",
+   "sig": "TextureResourceFlags"
+  },
+  "Volume": {
+   "kind": "type",
+   "sig": "Volume"
+  },
+  "__file__": {
+   "kind": "other",
+   "sig": "str"
+  },
+  "__version__": {
+   "kind": "other",
+   "sig": "str"
+  },
+  "_src": {
+   "kind": "module",
+   "sig": "warp._src"
+  },
+  "abs": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "acos": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "add": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "adjoint": {
+   "kind": "missing"
+  },
+  "argmax": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "array": {
+   "kind": "type",
+   "sig": "array"
+  },
+  "array2d": {
+   "kind": "type",
+   "sig": "array2d"
+  },
+  "array3d": {
+   "kind": "type",
+   "sig": "array3d"
+  },
+  "array4d": {
+   "kind": "type",
+   "sig": "array4d"
+  },
+  "arrays": {
+   "kind": "missing"
+  },
+  "asin": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "atan": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "atan2": {
+   "kind": "builtin",
+   "sig": "y,x"
+  },
+  "atomic_add": {
+   "kind": "builtin",
+   "sig": "arr,i,value"
+  },
+  "atomic_and": {
+   "kind": "builtin",
+   "sig": "arr,i,value"
+  },
+  "atomic_cas": {
+   "kind": "builtin",
+   "sig": "arr,i,compare,value"
+  },
+  "atomic_exch": {
+   "kind": "builtin",
+   "sig": "arr,i,value"
+  },
+  "atomic_max": {
+   "kind": "builtin",
+   "sig": "arr,i,value"
+  },
+  "atomic_min": {
+   "kind": "builtin",
+   "sig": "arr,i,value"
+  },
+  "atomic_or": {
+   "kind": "builtin",
+   "sig": "arr,i,value"
+  },
+  "atomic_sub": {
+   "kind": "builtin",
+   "sig": "arr,i,value"
+  },
+  "bit_or": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "block_dim": {
+   "kind": "builtin",
+   "sig": ""
+  },
+  "bool": {
+   "kind": "type",
+   "sig": "bool"
+  },
+  "bvh_get_group_root": {
+   "kind": "missing"
+  },
+  "bvh_query_aabb": {
+   "kind": "missing"
+  },
+  "bvh_query_capsule": {
+   "kind": "missing"
+  },
+  "bvh_query_next": {
+   "kind": "missing"
+  },
+  "bvh_query_ray": {
+   "kind": "missing"
+  },
+  "bvh_query_sphere": {
+   "kind": "missing"
+  },
+  "capture_begin": {
+   "kind": "function",
+   "sig": "device,stream,force_module_load,external,apic,capture_mode"
+  },
+  "capture_end": {
+   "kind": "function",
+   "sig": "device,stream"
+  },
+  "capture_if": {
+   "kind": "function",
+   "sig": "condition,on_true,on_false,stream,kwargs"
+  },
+  "capture_launch": {
+   "kind": "function",
+   "sig": "graph,stream"
+  },
+  "capture_while": {
+   "kind": "function",
+   "sig": "condition,while_body,stream,kwargs"
+  },
+  "ceil": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "clamp": {
+   "kind": "builtin",
+   "sig": "x,low,high"
+  },
+  "clear_kernel_cache": {
+   "kind": "function",
+   "sig": ""
+  },
+  "clear_lto_cache": {
+   "kind": "function",
+   "sig": ""
+  },
+  "clone": {
+   "kind": "function",
+   "sig": "src,device,requires_grad,pinned,retain_grad"
+  },
+  "closest_point_edge_edge": {
+   "kind": "missing"
+  },
+  "config": {
+   "kind": "module",
+   "sig": "warp.config"
+  },
+  "constant": {
+   "kind": "function",
+   "sig": "x"
+  },
+  "context": {
+   "kind": "missing"
+  },
+  "copy": {
+   "kind": "function",
+   "sig": "dest,src,dest_offset,src_offset,count,stream"
+  },
+  "cos": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "cross": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "cw_div": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "cw_mul": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "ddot": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "determinant": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "device": {
+   "kind": "missing"
+  },
+  "diag": {
+   "kind": "builtin",
+   "sig": "vec"
+  },
+  "div": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "dot": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "dtype": {
+   "kind": "missing"
+  },
+  "dtype_to_numpy": {
+   "kind": "function",
+   "sig": "warp_dtype"
+  },
+  "eig3": {
+   "kind": "builtin",
+   "sig": "A"
+  },
+  "empty": {
+   "kind": "function",
+   "sig": "shape,dtype,device,requires_grad,pinned,retain_grad,kwargs"
+  },
+  "empty_like": {
+   "kind": "function",
+   "sig": "src,device,requires_grad,pinned,retain_grad"
+  },
+  "exp": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "expect_eq": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "expect_neq": {
+   "kind": "missing"
+  },
+  "fabricarray": {
+   "kind": "type",
+   "sig": "fabricarray"
+  },
+  "fill_": {
+   "kind": "missing"
+  },
+  "flatten": {
+   "kind": "missing"
+  },
+  "float16": {
+   "kind": "type",
+   "sig": "float16"
+  },
+  "float32": {
+   "kind": "type",
+   "sig": "float32"
+  },
+  "float64": {
+   "kind": "type",
+   "sig": "float64"
+  },
+  "floor": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "from_dlpack": {
+   "kind": "function",
+   "sig": "source,dtype,hint"
+  },
+  "from_numpy": {
+   "kind": "function",
+   "sig": "arr,dtype,shape,device,requires_grad,retain_grad"
+  },
+  "from_torch": {
+   "kind": "function",
+   "sig": "t,dtype,requires_grad,grad,return_ctype,retain_grad"
+  },
+  "full": {
+   "kind": "function",
+   "sig": "shape,value,dtype,device,requires_grad,pinned,retain_grad,kwargs"
+  },
+  "full_like": {
+   "kind": "function",
+   "sig": "src,value,device,requires_grad,pinned,retain_grad"
+  },
+  "func": {
+   "kind": "function",
+   "sig": "f,name,module,inline"
+  },
+  "func_grad": {
+   "kind": "function",
+   "sig": "forward_fn"
+  },
+  "func_native": {
+   "kind": "function",
+   "sig": "snippet,adj_snippet,replay_snippet"
+  },
+  "func_replay": {
+   "kind": "function",
+   "sig": "forward_fn"
+  },
+  "get_cuda_toolkit_version": {
+   "kind": "function",
+   "sig": ""
+  },
+  "get_device": {
+   "kind": "function",
+   "sig": "ident"
+  },
+  "get_diag": {
+   "kind": "builtin",
+   "sig": "mat"
+  },
+  "get_event_elapsed_time": {
+   "kind": "function",
+   "sig": "start_event,end_event,synchronize"
+  },
+  "get_mempool_used_mem_current": {
+   "kind": "function",
+   "sig": "device"
+  },
+  "get_mempool_used_mem_high": {
+   "kind": "function",
+   "sig": "device"
+  },
+  "get_module": {
+   "kind": "function",
+   "sig": "name"
+  },
+  "get_module_options": {
+   "kind": "function",
+   "sig": "module"
+  },
+  "get_preferred_device": {
+   "kind": "function",
+   "sig": ""
+  },
+  "get_stream": {
+   "kind": "function",
+   "sig": "device"
+  },
+  "get_suggested_block_size": {
+   "kind": "function",
+   "sig": "kernel,device"
+  },
+  "hash_grid_point_id": {
+   "kind": "missing"
+  },
+  "hash_grid_query": {
+   "kind": "missing"
+  },
+  "hash_grid_query_next": {
+   "kind": "missing"
+  },
+  "identity": {
+   "kind": "missing"
+  },
+  "indexedarray": {
+   "kind": "type",
+   "sig": "indexedarray"
+  },
+  "inf": {
+   "kind": "other",
+   "sig": "float"
+  },
+  "init": {
+   "kind": "function",
+   "sig": ""
+  },
+  "int16": {
+   "kind": "type",
+   "sig": "int16"
+  },
+  "int32": {
+   "kind": "type",
+   "sig": "int32"
+  },
+  "int64": {
+   "kind": "type",
+   "sig": "int64"
+  },
+  "int8": {
+   "kind": "type",
+   "sig": "int8"
+  },
+  "intersect_tri_tri": {
+   "kind": "missing"
+  },
+  "inverse": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "is_conditional_graph_supported": {
+   "kind": "function",
+   "sig": ""
+  },
+  "is_cuda_available": {
+   "kind": "function",
+   "sig": ""
+  },
+  "is_mempool_enabled": {
+   "kind": "function",
+   "sig": "device"
+  },
+  "isfinite": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "isinf": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "isnan": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "jax_callable": {
+   "kind": "function",
+   "sig": "func,num_outputs,graph_mode,vmap_method,output_dims,in_out_argnames,stage_in_argnames,stage_out_argnames,graph_cache_max,module_preload_mode,has_side_effect"
+  },
+  "kernel": {
+   "kind": "function",
+   "sig": "f,name,enable_backward,launch_bounds,cuda_max_registers,enable_cuda_smem_spilling,cluster_dim,module,module_options,entry_point_abi,grid_stride"
+  },
+  "launch": {
+   "kind": "function",
+   "sig": "kernel,dim,inputs,outputs,adj_inputs,adj_outputs,device,stream,adjoint,record_tape,record_cmd,max_blocks,block_dim"
+  },
+  "launch_tiled": {
+   "kind": "function",
+   "sig": "*args,kwargs"
+  },
+  "leaky_min": {
+   "kind": "missing"
+  },
+  "length": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "length_sq": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "lerp": {
+   "kind": "builtin",
+   "sig": "a,b,t"
+  },
+  "load_module": {
+   "kind": "function",
+   "sig": "module,device,recursive,block_dim,max_workers"
+  },
+  "log": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "log2": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "lower_bound": {
+   "kind": "builtin",
+   "sig": "arr,value"
+  },
+  "mat22": {
+   "kind": "type",
+   "sig": "mat22f"
+  },
+  "mat33": {
+   "kind": "type",
+   "sig": "mat33f"
+  },
+  "mat33d": {
+   "kind": "type",
+   "sig": "mat33d"
+  },
+  "mat33f": {
+   "kind": "type",
+   "sig": "mat33f"
+  },
+  "mat3x3": {
+   "kind": "missing"
+  },
+  "mat44": {
+   "kind": "type",
+   "sig": "mat44f"
+  },
+  "mat44d": {
+   "kind": "type",
+   "sig": "mat44d"
+  },
+  "mat44f": {
+   "kind": "type",
+   "sig": "mat44f"
+  },
+  "matrix": {
+   "kind": "missing"
+  },
+  "matrix_from_cols": {
+   "kind": "function",
+   "sig": "*args"
+  },
+  "matrix_from_rows": {
+   "kind": "function",
+   "sig": "*args"
+  },
+  "max": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "mesh_eval_face_normal": {
+   "kind": "missing"
+  },
+  "mesh_eval_position": {
+   "kind": "missing"
+  },
+  "mesh_eval_velocity": {
+   "kind": "missing"
+  },
+  "mesh_get": {
+   "kind": "missing"
+  },
+  "mesh_get_bvh": {
+   "kind": "missing"
+  },
+  "mesh_get_group_root": {
+   "kind": "missing"
+  },
+  "mesh_get_index": {
+   "kind": "missing"
+  },
+  "mesh_get_point": {
+   "kind": "missing"
+  },
+  "mesh_query_aabb": {
+   "kind": "missing"
+  },
+  "mesh_query_aabb_next": {
+   "kind": "missing"
+  },
+  "mesh_query_point": {
+   "kind": "missing"
+  },
+  "mesh_query_point_no_sign": {
+   "kind": "missing"
+  },
+  "mesh_query_point_sign_normal": {
+   "kind": "missing"
+  },
+  "mesh_query_point_sign_parity": {
+   "kind": "missing"
+  },
+  "mesh_query_point_sign_winding_number": {
+   "kind": "missing"
+  },
+  "mesh_query_ray": {
+   "kind": "missing"
+  },
+  "mesh_query_ray_anyhit": {
+   "kind": "missing"
+  },
+  "min": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "mod": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "mul": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "nan": {
+   "kind": "other",
+   "sig": "float"
+  },
+  "ndim": {
+   "kind": "missing"
+  },
+  "neg": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "nonzero": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "norm_l2": {
+   "kind": "builtin",
+   "sig": "v"
+  },
+  "normalize": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "numpy": {
+   "kind": "missing"
+  },
+  "ones": {
+   "kind": "function",
+   "sig": "shape,dtype,device,requires_grad,pinned,retain_grad,kwargs"
+  },
+  "ones_like": {
+   "kind": "function",
+   "sig": "src,device,requires_grad,pinned,retain_grad"
+  },
+  "outer": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "overload": {
+   "kind": "function",
+   "sig": "kernel,arg_types"
+  },
+  "pi": {
+   "kind": "other",
+   "sig": "float"
+  },
+  "pow": {
+   "kind": "builtin",
+   "sig": "x,y"
+  },
+  "print": {
+   "kind": "missing"
+  },
+  "printf": {
+   "kind": "builtin",
+   "sig": "fmt,*args"
+  },
+  "q": {
+   "kind": "missing"
+  },
+  "quat": {
+   "kind": "type",
+   "sig": "quatf"
+  },
+  "quat_between_vectors": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "quat_from_axis_angle": {
+   "kind": "builtin",
+   "sig": "axis,angle"
+  },
+  "quat_from_euler": {
+   "kind": "builtin",
+   "sig": "e,i,j,k"
+  },
+  "quat_from_matrix": {
+   "kind": "builtin",
+   "sig": "mat"
+  },
+  "quat_identity": {
+   "kind": "builtin",
+   "sig": "dtype"
+  },
+  "quat_inverse": {
+   "kind": "builtin",
+   "sig": "quat"
+  },
+  "quat_rotate": {
+   "kind": "builtin",
+   "sig": "quat,vec"
+  },
+  "quat_rotate_inv": {
+   "kind": "builtin",
+   "sig": "quat,vec"
+  },
+  "quat_rpy": {
+   "kind": "builtin",
+   "sig": "roll,pitch,yaw"
+  },
+  "quat_to_axis_angle": {
+   "kind": "builtin",
+   "sig": "quat"
+  },
+  "quat_to_euler": {
+   "kind": "builtin",
+   "sig": "q,i,j,k"
+  },
+  "quat_to_matrix": {
+   "kind": "builtin",
+   "sig": "quat"
+  },
+  "quat_twist_angle_signed": {
+   "kind": "builtin",
+   "sig": "axis,q"
+  },
+  "quatd": {
+   "kind": "type",
+   "sig": "quatd"
+  },
+  "quatf": {
+   "kind": "type",
+   "sig": "quatf"
+  },
+  "rand_init": {
+   "kind": "builtin",
+   "sig": "seed"
+  },
+  "randf": {
+   "kind": "builtin",
+   "sig": "state"
+  },
+  "randn": {
+   "kind": "builtin",
+   "sig": "state"
+  },
+  "record_event": {
+   "kind": "function",
+   "sig": "event,external"
+  },
+  "reshape": {
+   "kind": "missing"
+  },
+  "round": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "set_device": {
+   "kind": "function",
+   "sig": "ident"
+  },
+  "set_module_options": {
+   "kind": "function",
+   "sig": "options,module"
+  },
+  "shape": {
+   "kind": "missing"
+  },
+  "sign": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "sin": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "sinh": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "skew": {
+   "kind": "builtin",
+   "sig": "vec"
+  },
+  "spatial_bottom": {
+   "kind": "builtin",
+   "sig": "svec"
+  },
+  "spatial_matrix": {
+   "kind": "type",
+   "sig": "spatial_matrixf"
+  },
+  "spatial_matrixf": {
+   "kind": "type",
+   "sig": "spatial_matrixf"
+  },
+  "spatial_top": {
+   "kind": "builtin",
+   "sig": "svec"
+  },
+  "spatial_vector": {
+   "kind": "type",
+   "sig": "spatial_vectorf"
+  },
+  "spatial_vectorf": {
+   "kind": "type",
+   "sig": "spatial_vectorf"
+  },
+  "sqrt": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "static": {
+   "kind": "function",
+   "sig": "expr"
+  },
+  "step": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "struct": {
+   "kind": "function",
+   "sig": "c,module"
+  },
+  "sub": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "svd3": {
+   "kind": "builtin",
+   "sig": "A"
+  },
+  "synchronize": {
+   "kind": "function",
+   "sig": ""
+  },
+  "synchronize_stream": {
+   "kind": "function",
+   "sig": "stream_or_device"
+  },
+  "tan": {
+   "kind": "builtin",
+   "sig": "x"
+  },
+  "tau": {
+   "kind": "other",
+   "sig": "float"
+  },
+  "texture_sample": {
+   "kind": "missing"
+  },
+  "tid": {
+   "kind": "missing"
+  },
+  "tile": {
+   "kind": "type",
+   "sig": "tile"
+  },
+  "tile_arange": {
+   "kind": "missing"
+  },
+  "tile_argmin": {
+   "kind": "missing"
+  },
+  "tile_assign": {
+   "kind": "missing"
+  },
+  "tile_broadcast": {
+   "kind": "missing"
+  },
+  "tile_cholesky": {
+   "kind": "missing"
+  },
+  "tile_cholesky_inplace": {
+   "kind": "missing"
+  },
+  "tile_cholesky_solve": {
+   "kind": "missing"
+  },
+  "tile_cholesky_solve_inplace": {
+   "kind": "missing"
+  },
+  "tile_diag_add": {
+   "kind": "missing"
+  },
+  "tile_extract": {
+   "kind": "missing"
+  },
+  "tile_load": {
+   "kind": "missing"
+  },
+  "tile_load_indexed": {
+   "kind": "missing"
+  },
+  "tile_lower_solve": {
+   "kind": "missing"
+  },
+  "tile_lower_solve_inplace": {
+   "kind": "missing"
+  },
+  "tile_map": {
+   "kind": "missing"
+  },
+  "tile_matmul": {
+   "kind": "missing"
+  },
+  "tile_matmul_left_transpose_update": {
+   "kind": "missing"
+  },
+  "tile_matmul_transpose_update": {
+   "kind": "missing"
+  },
+  "tile_max": {
+   "kind": "missing"
+  },
+  "tile_mesh_query_aabb": {
+   "kind": "missing"
+  },
+  "tile_mesh_query_aabb_next": {
+   "kind": "missing"
+  },
+  "tile_min": {
+   "kind": "missing"
+  },
+  "tile_ones": {
+   "kind": "missing"
+  },
+  "tile_query_valid": {
+   "kind": "missing"
+  },
+  "tile_reduce": {
+   "kind": "missing"
+  },
+  "tile_reshape": {
+   "kind": "missing"
+  },
+  "tile_scan_exclusive": {
+   "kind": "missing"
+  },
+  "tile_scan_inclusive": {
+   "kind": "missing"
+  },
+  "tile_scatter_add": {
+   "kind": "missing"
+  },
+  "tile_scatter_masked": {
+   "kind": "missing"
+  },
+  "tile_sort": {
+   "kind": "missing"
+  },
+  "tile_stack": {
+   "kind": "type",
+   "sig": "tile_stack"
+  },
+  "tile_stack_clear": {
+   "kind": "missing"
+  },
+  "tile_stack_count": {
+   "kind": "missing"
+  },
+  "tile_stack_pop": {
+   "kind": "missing"
+  },
+  "tile_stack_push": {
+   "kind": "missing"
+  },
+  "tile_store": {
+   "kind": "missing"
+  },
+  "tile_sum": {
+   "kind": "missing"
+  },
+  "tile_transpose": {
+   "kind": "missing"
+  },
+  "tile_upper_solve": {
+   "kind": "missing"
+  },
+  "tile_upper_solve_inplace": {
+   "kind": "missing"
+  },
+  "tile_view": {
+   "kind": "missing"
+  },
+  "tile_zeros": {
+   "kind": "missing"
+  },
+  "to_torch": {
+   "kind": "function",
+   "sig": "a,requires_grad"
+  },
+  "trace": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "transform": {
+   "kind": "type",
+   "sig": "transformf"
+  },
+  "transform_compose": {
+   "kind": "builtin",
+   "sig": "position,rotation,scale"
+  },
+  "transform_decompose": {
+   "kind": "builtin",
+   "sig": "m"
+  },
+  "transform_expand": {
+   "kind": "function",
+   "sig": "t"
+  },
+  "transform_get_rotation": {
+   "kind": "builtin",
+   "sig": "xform"
+  },
+  "transform_get_translation": {
+   "kind": "builtin",
+   "sig": "xform"
+  },
+  "transform_identity": {
+   "kind": "builtin",
+   "sig": "dtype"
+  },
+  "transform_inverse": {
+   "kind": "builtin",
+   "sig": "xform"
+  },
+  "transform_multiply": {
+   "kind": "builtin",
+   "sig": "a,b"
+  },
+  "transform_point": {
+   "kind": "builtin",
+   "sig": "xform,point"
+  },
+  "transform_twist": {
+   "kind": "builtin",
+   "sig": "t,x"
+  },
+  "transform_vector": {
+   "kind": "builtin",
+   "sig": "xform,vec"
+  },
+  "transform_wrench": {
+   "kind": "builtin",
+   "sig": "t,x"
+  },
+  "transformation": {
+   "kind": "missing"
+  },
+  "transformf": {
+   "kind": "type",
+   "sig": "transformf"
+  },
+  "transpose": {
+   "kind": "builtin",
+   "sig": "a"
+  },
+  "types": {
+   "kind": "module",
+   "sig": "warp.types"
+  },
+  "uint16": {
+   "kind": "type",
+   "sig": "uint16"
+  },
+  "uint32": {
+   "kind": "type",
+   "sig": "uint32"
+  },
+  "uint64": {
+   "kind": "type",
+   "sig": "uint64"
+  },
+  "uint8": {
+   "kind": "type",
+   "sig": "uint8"
+  },
+  "untile": {
+   "kind": "missing"
+  },
+  "utils": {
+   "kind": "module",
+   "sig": "warp.utils"
+  },
+  "vec2": {
+   "kind": "type",
+   "sig": "vec2f"
+  },
+  "vec2d": {
+   "kind": "type",
+   "sig": "vec2d"
+  },
+  "vec2f": {
+   "kind": "type",
+   "sig": "vec2f"
+  },
+  "vec2i": {
+   "kind": "type",
+   "sig": "vec2i"
+  },
+  "vec2l": {
+   "kind": "type",
+   "sig": "vec2l"
+  },
+  "vec2s": {
+   "kind": "type",
+   "sig": "vec2s"
+  },
+  "vec2ub": {
+   "kind": "type",
+   "sig": "vec2ub"
+  },
+  "vec3": {
+   "kind": "type",
+   "sig": "vec3f"
+  },
+  "vec3d": {
+   "kind": "type",
+   "sig": "vec3d"
+  },
+  "vec3f": {
+   "kind": "type",
+   "sig": "vec3f"
+  },
+  "vec3i": {
+   "kind": "type",
+   "sig": "vec3i"
+  },
+  "vec3ub": {
+   "kind": "type",
+   "sig": "vec3ub"
+  },
+  "vec3ui": {
+   "kind": "type",
+   "sig": "vec3ui"
+  },
+  "vec3us": {
+   "kind": "type",
+   "sig": "vec3us"
+  },
+  "vec4": {
+   "kind": "type",
+   "sig": "vec4f"
+  },
+  "vec4d": {
+   "kind": "type",
+   "sig": "vec4d"
+  },
+  "vec4f": {
+   "kind": "type",
+   "sig": "vec4f"
+  },
+  "vec4i": {
+   "kind": "type",
+   "sig": "vec4i"
+  },
+  "vec4ub": {
+   "kind": "type",
+   "sig": "vec4ub"
+  },
+  "vector": {
+   "kind": "missing"
+  },
+  "velocity_at_point": {
+   "kind": "builtin",
+   "sig": "qd,r"
+  },
+  "view": {
+   "kind": "builtin",
+   "sig": "arr,i,j,k,l"
+  },
+  "volume_index_to_world": {
+   "kind": "builtin",
+   "sig": "id,uvw"
+  },
+  "volume_lookup_f": {
+   "kind": "builtin",
+   "sig": "id,i,j,k"
+  },
+  "volume_lookup_index": {
+   "kind": "builtin",
+   "sig": "id,i,j,k"
+  },
+  "volume_sample_f": {
+   "kind": "builtin",
+   "sig": "id,uvw,sampling_mode"
+  },
+  "volume_sample_grad_f": {
+   "kind": "builtin",
+   "sig": "id,uvw,sampling_mode,grad"
+  },
+  "volume_sample_index": {
+   "kind": "missing"
+  },
+  "volume_store": {
+   "kind": "missing"
+  },
+  "volume_voxel_count": {
+   "kind": "builtin",
+   "sig": "id"
+  },
+  "volume_world_to_index": {
+   "kind": "builtin",
+   "sig": "id,xyz"
+  },
+  "where": {
+   "kind": "builtin",
+   "sig": "cond,value_if_true,value_if_false"
+  },
+  "zero_": {
+   "kind": "missing"
+  },
+  "zeros": {
+   "kind": "function",
+   "sig": "shape,dtype,device,requires_grad,pinned,retain_grad,kwargs"
+  },
+  "zeros_like": {
+   "kind": "function",
+   "sig": "src,device,requires_grad,pinned,retain_grad"
+  }
+ },
+ "warp_version": "1.19.0"
+}
