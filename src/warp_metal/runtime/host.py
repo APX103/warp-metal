@@ -165,6 +165,41 @@ class WarpArray:
     def buffer(self):
         return self._buffer
 
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    @property
+    def requires_grad(self):
+        return False
+
+    @property
+    def strides(self):
+        """Row-major dense element strides (warp convention)."""
+        out = []
+        for i in range(len(self.shape)):
+            n = 1
+            for s in self.shape[i + 1 :]:
+                n *= s
+            out.append(n)
+        return tuple(out)
+
+    def __ctype__(self):
+        """C-representation for vendored frontend machinery (struct field
+        setters, launch arg normalization). ``data`` is the CPU-side shared
+        storage pointer; the device-side binding goes through the buffer
+        handle at dispatch (see ``_launch_ssa``)."""
+        from ..frontend.types import array_t
+
+        return array_t(
+            data=ctypes.c_uint64(self._ptr),
+            grad=0,
+            ndim=len(self.shape),
+            shape=self.shape,
+            strides=self.strides,
+            flags=0,
+        )
+
     def numpy_view(self):
         """Zero-copy view: self.shape for scalar dtypes, (n, k) for composites."""
         if not self.is_composite:
@@ -197,6 +232,13 @@ class WarpArray:
 
 def _allocate(shape, dtype, device, requires_grad=False, pinned=False, retain_grad=False) -> WarpArray:
     return WarpArray(shape, dtype, shape=shape, device=device, requires_grad=requires_grad, pinned=pinned, retain_grad=retain_grad)
+
+
+# the runtime array is the native wp.array family on Metal (see
+# frontend.types.register_runtime_array_family)
+from ..frontend.types import array as _wp_array, register_runtime_array_family  # noqa: E402
+
+register_runtime_array_family(WarpArray, _wp_array)
 
 
 def zeros(shape, dtype=float32, device=None, requires_grad=False, pinned=False, retain_grad=False, **kwargs):
@@ -283,12 +325,25 @@ def from_numpy(arr, dtype=None, shape=None, device=None, requires_grad=False, re
         else:
             raise NotImplementedError(f"from_numpy: numpy dtype {np_arr.dtype} not mapped")
     target_shape = tuple(np_arr.shape) if shape is None else _normalize_shape(shape)
+    if shape is None:
+        _np_t, item_bytes_probe, composite_probe = _dtype_layout(dtype)
+        if composite_probe and np_arr.ndim > 1:
+            probe_comps = item_bytes_probe // np.dtype(_np_t).itemsize
+            if np_arr.shape[-1] == probe_comps:
+                # 2-D numpy + composite dtype: trailing axis is the component
+                # axis (warp semantics: wp.array(np((4,3)), dtype=wp.vec3))
+                target_shape = tuple(np_arr.shape[:-1])
     out = _allocate(target_shape or (1,), dtype, device)
-    expected = int(np.prod(target_shape)) if target_shape else 1
+    np_itemsize = np.dtype(out.np_dtype).itemsize
+    comps = max(1, out.item_bytes // np_itemsize)
+    total_scalars = out.n * comps
     flat = np_arr.reshape(-1)
-    if flat.size * np.dtype(out.np_dtype).itemsize * (out.item_bytes // np.dtype(out.np_dtype).itemsize) != out.n * out.item_bytes or flat.size != expected:
-        raise ValueError(f"from_numpy shape mismatch: numpy has {flat.size} elements, target {target_shape} needs {expected}")
-    out.numpy[:expected] = flat
+    if flat.size != total_scalars:
+        raise ValueError(
+            f"from_numpy shape mismatch: numpy has {flat.size} scalars, "
+            f"target {out.shape} of {getattr(dtype, '__name__', dtype)} needs {total_scalars}"
+        )
+    out.numpy[:total_scalars] = flat
     return out
 
 
@@ -426,7 +481,12 @@ def _builtin_value_struct(msl_t: str):
 
 
 def _params_struct(unit: KernelUnit):
-    """Build the ctypes mirror of the MSL ``Params_<name>`` struct."""
+    """Build the ctypes mirror of the MSL ``Params_<name>`` struct.
+
+    Field order must match ``KernelUnit.kernel_src`` exactly: per arg in
+    declaration order — scalar → value; struct → value + one ``wp_arr_meta``
+    per split array field; array → one ``wp_arr_meta`` — then ``_dims``.
+    """
     fields = []
     for a in unit.args:
         if a.kind == "scalar":
@@ -437,6 +497,8 @@ def _params_struct(unit: KernelUnit):
                 fields.append((a.name, _builtin_value_struct(a.msl)))
         elif a.kind == "struct":
             fields.append((a.name, _user_struct_ctypes(a, unit)))
+            for field, _elem_ctype in unit.struct_array_fields.get(a.ctype, []):
+                fields.append((f"{a.name}__{field}_m", _ArrMeta))
         elif a.kind == "array":
             fields.append((f"{a.name}_m", _ArrMeta))
     fields.append(("_dims", _ArrMeta))
@@ -556,20 +618,58 @@ def _unit_for(kernel):
         return entry
 
 
+def _concretize_generic_kernel(kernel, args):
+    """Resolve a generic kernel overload from launch argument values.
+
+    Upstream launch does the same dance (``kernel.is_generic`` → infer →
+    ``_add_normalized_overload``); the vendored ``infer_argument_types``
+    speaks upstream-array dialects, so the warp-metal ``WarpArray`` maps to
+    the vendored lightweight array annotation here — the exact type object
+    upstream's infer produces for a real array.
+    """
+    from ..frontend.types import _ArrayAnnotation, type_to_warp
+
+    def _compiler_type(v):
+        if isinstance(v, WarpArray):
+            return _ArrayAnnotation(v.dtype, len(v.shape))
+        if isinstance(v, bool):
+            return type_to_warp(bool)
+        if isinstance(v, int):
+            return type_to_warp(int)
+        if isinstance(v, float):
+            return type_to_warp(float)
+        if hasattr(v, "_cls"):  # vendored struct instance
+            return v._cls
+        return type(v)  # vector/matrix value types pass as classes
+
+    fwd_types = [_compiler_type(v) for v in args]
+    return kernel._add_normalized_overload(fwd_types)
+
+
 def _launch_ssa(kernel, dim, merged) -> None:
     """Launch a vendored Kernel through the Adjoint-SSA MSL pipeline."""
+    if getattr(kernel, "is_generic", False):
+        kernel = _concretize_generic_kernel(kernel, merged)
     pso, unit = _unit_for(kernel)
     Params = _params_struct(unit)
 
     handles: list[int] = []
+    # device-pointer bindings in emitter order (name, buffer handle); when the
+    # kernel uses the argument-buffer form these become GPU addresses in a
+    # single shared buffer, in exactly the emitter's binding order
+    device_bindings: list[tuple[str, int]] = []
     params = Params()
     values = list(merged)
+    if len(values) != len(unit.args):
+        raise ValueError(
+            f"launch: kernel '{kernel.key}' expects {len(unit.args)} argument(s), got {len(values)}"
+        )
     for a in unit.args:
         value = values.pop(0)
         if a.kind == "array":
             if not isinstance(value, WarpArray):
                 raise TypeError(f"kernel array parameter '{a.name}' got {type(value).__name__}, expected WarpArray")
-            handles.append(value.buffer)
+            device_bindings.append((f"{a.name}_data", value.buffer))
             meta = _arr_meta(value)
             setattr(params, f"{a.name}_m", meta)
         elif a.kind == "scalar":
@@ -577,10 +677,40 @@ def _launch_ssa(kernel, dim, merged) -> None:
                 setattr(params, a.name, value)
             else:  # builtin value type (vec/quat/transform/mat/spatial)
                 _pack_value(getattr(params, a.name), a.msl, value)
-        else:
+        elif a.kind == "struct":
             _pack_user_struct(getattr(params, a.name), a.msl, value, unit)
+            # split array fields: one buffer binding + one Params meta each
+            for field, _elem_ctype in unit.struct_array_fields.get(a.ctype, []):
+                field_arr = getattr(value, field)
+                if not isinstance(field_arr, WarpArray):
+                    raise TypeError(
+                        f"kernel struct parameter '{a.name}' field '{field}' got "
+                        f"{type(field_arr).__name__}, expected WarpArray"
+                    )
+                device_bindings.append((f"{a.name}__{field}_data", field_arr.buffer))
+                setattr(params, f"{a.name}__{field}_m", _arr_meta(field_arr))
+        else:
+            raise RuntimeError(f"launch: unknown arg kind {a.kind!r}")
     if values:
         raise ValueError("more launch arguments than kernel parameters")
+
+    # Metal caps plain buffer bindings at 30; beyond that the emitter switches
+    # the kernel to an argument buffer of device pointers (tier 2)
+    argbuf_handle = None
+    if unit.uses_argbuf:
+        argbuf_handle = _mm.buffer_create(8 * len(device_bindings))
+        dst = (_ctypes.c_uint64 * len(device_bindings)).from_address(_mm.buffer_ptr(argbuf_handle))
+        expected_order = [b for b, _ in unit.device_bindings]
+        actual_order = [b for b, _ in device_bindings]
+        if expected_order != actual_order:
+            raise RuntimeError(
+                f"launch: device binding order mismatch vs MSL: {actual_order} != {expected_order}"
+            )
+        for i, (_name, h) in enumerate(device_bindings):
+            dst[i] = _mm.buffer_gpu_address(h)
+        handles.append(argbuf_handle)
+    else:
+        handles.extend(h for _name, h in device_bindings)
 
     dims = dim if isinstance(dim, (tuple, list)) else (dim,)
     dims = tuple(int(d) for d in dims)
@@ -603,6 +733,8 @@ def _launch_ssa(kernel, dim, merged) -> None:
         _mm.dispatch(pso, handles, threads)
     finally:
         _mm.buffer_release(handle)
+        if argbuf_handle is not None:
+            _mm.buffer_release(argbuf_handle)
 
 
 def _scalar_buffer(value) -> int:

@@ -6746,7 +6746,7 @@ class Adjoint:
     def is_static_expression(adj, func):
         return (
             isinstance(func, types.FunctionType)
-            and func.__module__ == "_pkg.builtins"
+            and func.__module__ == "warp_metal.frontend.builtins"
             and func.__qualname__ == "static"
         )
 

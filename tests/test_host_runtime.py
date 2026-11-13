@@ -35,6 +35,21 @@ class _Particle:
     mass: wp.float32
 
 
+@wp.struct
+class _Bin:
+    vals: wp.array(dtype=wp.float32)
+    keys: wp.array(dtype=wp.int32)
+    scale: wp.float32
+
+
+@wp.kernel
+def _struct_fill(b: _Bin, n: wp.int32):
+    i = wp.tid()
+    if i < n:
+        b.vals[i] = b.vals[i] * b.scale
+        b.keys[i] = b.keys[i] + i
+
+
 class TestDecorators(unittest.TestCase):
     def test_kernel_record(self):
         self.assertIsInstance(_scale_kernel, wp.Kernel)
@@ -64,22 +79,42 @@ class TestDecorators(unittest.TestCase):
             def k(x):
                 pass
 
-    def test_func_native_fails_loud(self):
-        # decoration registers (module imports stay clean — Newton geometry
-        # imports support_function.py at package level), but any kernel that
-        # CALLS the native function fails loudly at translate time
-        @wp.func_native("return 1.0f / sqrtf(value);")
-        def rsqrt_native(value: wp.float32) -> wp.float32: ...
+    def test_func_native_policy(self):
+        # func_native snippets are portable C++ (upstream runs the same text
+        # on the CPU backend), so the MSL emitter includes them verbatim; MSL
+        # is C++14-based. Plain-C++ snippets work; CUDA-only constructs fail
+        # loudly at Metal library compile — never silently.
+        @wp.func_native(
+            "uint32_t i = reinterpret_cast<uint32_t&>(f);\n"
+            "uint32_t mask = (uint32_t)(-(int)(i >> 31)) | 0x80000000u;\n"
+            "return i ^ mask;"
+        )
+        def float_flip(f: wp.float32) -> wp.uint32: ...
 
         @wp.kernel
-        def k(out: wp.array(dtype=wp.float32)):
+        def k(out: wp.array(dtype=wp.uint32)):
             i = wp.tid()
-            out[i] = rsqrt_native(4.0)
-        from warp_metal.msl.translate import translate_kernel
+            out[i] = float_flip(4.5)
 
-        with self.assertRaises(Exception) as ctx:
-            translate_kernel(k)
-        self.assertIn("func_native", str(ctx.exception))
+        arr = wp.zeros(1, dtype=wp.uint32, device="metal")
+        wp.launch(k, 1, inputs=[arr], device="metal")
+        wp.synchronize()
+        # stereopsis radix key for a positive float: 0x80000000 | bits
+        expected = 0x80000000 | int(np.array([4.5], dtype=np.float32).view(np.uint32)[0])
+        self.assertEqual(int(arr.numpy_view()[0]), expected)
+
+        @wp.func_native("return __shfl_down_sync(0xffffffffu, value, 1);")
+        def shfl_native(value: wp.float32) -> wp.float32: ...
+
+        @wp.kernel
+        def k2(out: wp.array(dtype=wp.float32)):
+            out[wp.tid()] = shfl_native(1.0)
+
+        with self.assertRaises(Exception):
+            # CUDA intrinsic survives translation (verbatim inclusion) but
+            # the Metal compiler rejects it — loud, at the compile boundary
+            wp.launch(k2, 1, inputs=[wp.zeros(1, dtype=wp.float32, device="metal")], device="metal")
+            wp.synchronize()
 
     def test_generic_kernel_overload(self):
         from typing import Any
@@ -159,9 +194,59 @@ class TestArrayConstructors(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             wp.from_numpy(np.zeros(2, dtype=np.float32), requires_grad=True)
 
+    def test_from_numpy_composite(self):
+        # 2-D numpy + composite dtype -> 1-D array of elements (warp semantics)
+        v = wp.from_numpy(np.arange(12, dtype=np.float32).reshape(4, 3), dtype=wp.vec3)
+        self.assertEqual(v.shape, (4,))
+        self.assertEqual(v.ndim, 1)
+        np.testing.assert_allclose(v.numpy_view(), np.arange(12, dtype=np.float32).reshape(4, 3))
+        t = wp.from_numpy(np.tile([1, 2, 3, 0, 0, 0, 1], (2, 1)).astype(np.float32), dtype=wp.transform)
+        self.assertEqual(t.shape, (2,))
+        np.testing.assert_allclose(t.numpy_view()[1], [1, 2, 3, 0, 0, 0, 1])
+        with self.assertRaises(ValueError):
+            wp.from_numpy(np.zeros(5, dtype=np.float32), dtype=wp.vec3)
+
+    def test_runtime_array_is_native_family(self):
+        # runtime WarpArray substitutes for the vendored wp.array family:
+        # accepted by struct field setters and exposed via __ctype__
+        @wp.struct
+        class _Buf:
+            data: wp.array(dtype=wp.float32)
+            count: wp.int32
+
+        b = _Buf()
+        b.data = wp.zeros(3, dtype=wp.float32)
+        b.count = 3
+        self.assertEqual(b.data.ndim, 1)
+        self.assertFalse(b.data.requires_grad)
+        desc = b.data.__ctype__()
+        self.assertEqual(int(desc.ndim), 1)
+        self.assertNotEqual(int(desc.data), 0)
+
     def test_full(self):
         v = wp.full((2,), 3.0, dtype=wp.float32)
         self.assertTrue(np.all(v.numpy == 3.0))
+
+
+class TestStructArrayFieldLaunch(unittest.TestCase):
+    """M1.4: struct params with array fields split into their own bindings."""
+
+    def test_struct_array_fields_launch(self):
+        b = _Bin()
+        b.vals = wp.zeros(3, dtype=wp.float32)
+        b.vals.numpy[:] = [1.0, 2.0, 3.0]
+        b.keys = wp.zeros(3, dtype=wp.int32)
+        b.keys.numpy[:] = [10, 20, 30]
+        b.scale = 2.0
+        wp.launch(_struct_fill, 3, inputs=[b, 3], device="metal")
+        wp.synchronize()
+        np.testing.assert_allclose(b.vals.numpy_view(), [2.0, 4.0, 6.0])
+        self.assertEqual(b.keys.numpy_view().tolist(), [10, 21, 32])
+
+    def test_struct_array_field_dtype_check(self):
+        b = _Bin()
+        with self.assertRaises(TypeError):
+            b.vals = wp.zeros(3, dtype=wp.int32)  # field expects float32
 
 
 class TestLaunchAdjointFails(unittest.TestCase):

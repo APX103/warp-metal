@@ -39,6 +39,8 @@ def _load() -> ctypes.CDLL:
                 lib.wmm_buffer_create.argtypes = [ctypes.c_uint64]
                 lib.wmm_buffer_ptr.restype = ctypes.c_void_p
                 lib.wmm_buffer_ptr.argtypes = [ctypes.c_void_p]
+                lib.wmm_buffer_gpu_address.restype = ctypes.c_uint64
+                lib.wmm_buffer_gpu_address.argtypes = [ctypes.c_void_p]
                 lib.wmm_buffer_length.restype = ctypes.c_uint64
                 lib.wmm_buffer_length.argtypes = [ctypes.c_void_p]
                 lib.wmm_buffer_release.restype = None
@@ -93,6 +95,10 @@ def buffer_create(bytes_len: int):
 
 def buffer_ptr(handle) -> int:
     return _load().wmm_buffer_ptr(handle)
+
+
+def buffer_gpu_address(handle) -> int:
+    return _load().wmm_buffer_gpu_address(handle)
 
 
 def buffer_length(handle) -> int:

@@ -554,21 +554,217 @@ def b_compute_block_counts_from_weights(rng):
     )
 
 
-# factory kernels: resolved by calling a module-level factory at collection
-# time (golden/compare both call it under their own warp package)
-FACTORY_BUILDS = {
-    "newton._src.solvers.narrow_phase": {
-        "create_narrow_phase_primitive_kernel.<locals>.narrow_phase_primitive_kernel": [
-            ("primitive_kernel", ("sphere_plane",)),
-            ("__builder__", "b_narrow_phase_primitive_kernel"),
+def _encode_oct(n):
+    """numpy port of contact_reduction_global.encode_oct (float32 throughout)."""
+    n = np.asarray(n, dtype=np.float32)
+    l1 = np.float32(np.abs(n[0]) + np.abs(n[1]) + np.abs(n[2]))
+    if l1 < np.float32(1.0e-20):
+        return np.zeros(2, dtype=np.float32)
+    ox, oy, oz = np.float32(n[0] / l1), np.float32(n[1] / l1), np.float32(n[2] / l1)
+    if oz < 0.0:
+        sign_x = np.float32(-1.0) if ox < 0.0 else np.float32(1.0)
+        sign_y = np.float32(-1.0) if oy < 0.0 else np.float32(1.0)
+        new_x = np.float32((1.0 - abs(oy)) * sign_x)
+        new_y = np.float32((1.0 - abs(ox)) * sign_y)
+        ox, oy = new_x, new_y
+    return np.array([ox, oy], dtype=np.float32)
+
+
+# contact_reduction.py _ICOSAHEDEDRON face normals (NORMAL_BINNING_POLYHEDRON
+# = "icosahedron", NUM_NORMAL_BINS = 20). Fixture normals snap to exact face
+# normals so get_slot() resolves each contact to a distinct, construction-time
+# known bin — no CAS contention on hashtable entries.
+_ICOSA_NORMALS = np.array([
+    0.80103071, 0.29640806, -0.52008851,
+    0.29640808, 0.80103070, -0.52008851,
+    -0.29640806, 0.52008851, -0.80103071,
+    -0.15816595, -0.15816596, -0.97466254,
+    0.52008851, -0.29640808, -0.80103070,
+    0.80103070, -0.52008851, 0.29640808,
+    0.52008851, -0.80103071, -0.29640806,
+    0.57735027, 0.57735027, 0.57735027,
+    0.97466254, 0.15816595, 0.15816596,
+    -0.52008851, 0.80103071, 0.29640806,
+    0.15816596, 0.97466254, 0.15816595,
+    -0.97466254, -0.15816595, -0.15816596,
+    -0.80103070, 0.52008851, -0.29640808,
+    -0.15816596, -0.97466254, -0.15816595,
+    -0.57735027, -0.57735027, -0.57735027,
+    0.15816595, 0.15816596, 0.97466254,
+    -0.52008851, 0.29640808, 0.80103070,
+    -0.80103071, -0.29640806, 0.52008851,
+    -0.29640808, -0.80103070, 0.52008851,
+    0.29640806, -0.52008851, 0.80103071,
+], dtype=np.float32).reshape(20, 3)
+
+
+def b_reduce_buffered_contacts_kernel(rng):
+    """reduce_buffered_contacts_kernel: 4 buffered contacts on one pair.
+
+    Contacts use distinct icosahedron face normals (distinct normal-bin
+    entries) and distinct voxel positions; dim=1 with total_num_threads=1 so
+    the grid-stride loop is sequential on both sides — atomic ticket order
+    and hashtable CAS outcomes are deterministic without contention.
+    Contact 3 carries a large positive depth (use_beta False branch).
+    Buffer index 0 is reserved (the kernel reads contacts 1..N).
+    """
+    cap = 16  # ht capacity (power of two)
+    n = 4     # buffered contacts, ids 1..4
+    slots = 7  # NUM_SPATIAL_DIRECTIONS + 1
+
+    pd = np.zeros((n + 1, 4), dtype=np.float32)
+    pd[1] = [0.5, 0.5, 0.5, -0.02]
+    pd[2] = [1.5, -0.5, 2.0, -0.5]
+    pd[3] = [-2.0, 1.0, 0.0, 0.5]   # separating: use_beta False
+    pd[4] = [0.0, -2.5, -1.5, -0.01]
+
+    normals = np.zeros((n + 1, 2), dtype=np.float32)
+    for i, face in enumerate((0, 7, 14, 19)):
+        normals[i + 1] = _encode_oct(_ICOSA_NORMALS[face])
+
+    pairs = np.zeros((n + 1, 2), dtype=np.int32)
+    pairs[1:] = (0, 1)
+
+    reducer = {
+        "position_depth": ("arr:vec4", pd),
+        "normal": ("arr:vec2", normals),
+        "shape_pairs": ("arr:vec2i", pairs),
+        "contact_count": ("arr:i32", np.full(1, n, dtype=np.int32)),
+        "exported_flags": ("arr:i32", np.zeros(n + 1, dtype=np.int32)),
+        "reclaimed_contact_bits": ("arr:u32", np.zeros(n + 1, dtype=np.uint32)),
+        "reclaimed_contact_count": ("arr:i32", np.zeros(1, dtype=np.int32)),
+        "capacity": ("scalar:i32", n + 1),
+        "contact_max": ("scalar:i32", 64),
+        "shape_gap": ("arr:f32", np.zeros(n + 1, dtype=np.float32)),
+        "contact_fingerprints": ("arr:i32", np.array([0, 101, 202, 303, 404], dtype=np.int32)),
+        "contact_area": ("arr:f32", np.zeros(n + 1, dtype=np.float32)),
+        "contact_pressure": ("arr:f32", np.zeros(n + 1, dtype=np.float32)),
+        "contact_nbin_entry": ("arr:i32", np.zeros(n + 1, dtype=np.int32)),
+        "agg_force": ("arr:vec3", np.zeros((cap, 3), dtype=np.float32)),
+        "agg_depth_volume": ("arr:vec3", np.zeros((cap, 3), dtype=np.float32)),
+        "weighted_pos_sum": ("arr:vec3", np.zeros((cap, 3), dtype=np.float32)),
+        "weight_sum": ("arr:f32", np.zeros(cap, dtype=np.float32)),
+        "total_depth_reduced": ("arr:f32", np.zeros(cap, dtype=np.float32)),
+        "total_normal_reduced": ("arr:vec3", np.zeros((cap, 3), dtype=np.float32)),
+        "ht_keys": ("out:u64", cap),
+        "ht_values": ("out:u64", slots * cap),
+        "ht_active_slots": ("out:i32", cap + 1),
+        "ht_insert_failures": ("out:i32", 1),
+        "buffer_overflows": ("arr:i32", np.zeros(1, dtype=np.int32)),
+        "ht_capacity": ("scalar:i32", cap),
+        "ht_values_per_key": ("scalar:i32", slots),
+        "deterministic": ("scalar:i32", 1),
+    }
+
+    # shape 0 (mesh): identity transform, unit-cube-ish grid AABB;
+    # shape 1 (convex): translated so voxel positions exercise transform_point
+    xforms = np.zeros((2, 7), dtype=np.float32)
+    xforms[0] = [0, 0, 0, 0, 0, 0, 1]
+    xforms[1] = [1, 2, 3, 0, 0, 0, 1]
+    aabb_lo = np.array([[-5.0, -5.0, -5.0], [-3.0, -3.0, -3.0]], dtype=np.float32)
+    aabb_hi = np.array([[5.0, 5.0, 5.0], [3.0, 3.0, 3.0]], dtype=np.float32)
+    voxel_res = np.array([[4, 4, 4], [4, 4, 4]], dtype=np.int32)
+
+    return (
+        [
+            ("reducer_data", "struct:GlobalContactReducerData", reducer),
+            ("shape_transform", "arr:transform", xforms),
+            ("shape_collision_aabb_lower", "arr:vec3", aabb_lo),
+            ("shape_collision_aabb_upper", "arr:vec3", aabb_hi),
+            ("shape_voxel_resolution", "arr:vec3i", voxel_res),
+            ("total_num_threads", "scalar:i32", 1),
+            ("__dim__", "scalar:i32", 1),
         ],
-    },
-}
+        [],
+    )
 
 
 def b_narrow_phase_primitive_kernel(rng):
-    # filled in after factory probe (shapes/args depend on factory closure)
-    return ([], ["narrow_phase factory kernel: builder pending (M1.4 scope)"])
+    """narrow_phase_primitive_kernel (write_contact_simple, non-speculative).
+
+    Plane/sphere/sphere/capsule/box scene, 4 candidate pairs: one analytical
+    contact (plane-sphere), one filtered far pair (sphere-sphere), two
+    plane-capsule contacts, four plane-box contacts (mat4x3f path). dim=1 /
+    total_num_threads=1 keeps atomic ticket order deterministic.
+    """
+    import math
+
+    ns, npairs, cap = 5, 4, 64
+
+    def _q_yaw_quarter():
+        return [0.0, math.sin(math.pi / 4), 0.0, math.cos(math.pi / 4)]
+
+    types = np.array([1, 3, 3, 4, 7], dtype=np.int32)  # PLANE SPHERE SPHERE CAPSULE BOX
+    data = np.array([
+        [0, 0, 0, 0],
+        [0.1, 0, 0, 0],
+        [0.1, 0, 0, 0],
+        [0.05, 0.2, 0, 0],
+        [0.1, 0.1, 0.1, 0],
+    ], dtype=np.float32)
+    xf = np.zeros((ns, 7), dtype=np.float32)
+    xf[0] = [0, 0, 0, 0, 0, 0, 1]
+    xf[1] = [0, 0, 0.05, 0, 0, 0, 1]
+    xf[2] = [0, 0, 5.0, 0, 0, 0, 1]
+    xf[3] = [0, 0, 0.03, *_q_yaw_quarter()]
+    xf[4] = [0, 0, 0.05, 0, 0, 0, 1]
+
+    writer = {
+        "contact_max": ("scalar:i32", cap),
+        "shape_index_bits": ("scalar:i32", 32),
+        "sub_key_bits": ("scalar:i32", 16),
+        "contact_count": ("out:i32", 1),
+        "contact_pair": ("out2:vec2i", (cap,)),
+        "contact_position": ("out2:vec3", (cap,)),
+        "contact_normal": ("out2:vec3", (cap,)),
+        "contact_penetration": ("out:f32", cap),
+        "contact_tangent": ("out2:vec3", (cap,)),
+        "contact_sort_key": ("out:i64", (cap,)),
+        "shape_gap": ("arr:f32", np.zeros(ns, dtype=np.float32)),
+        "shape_transform": ("arr:transform", xf),
+        "shape_linear_velocity": ("arr:vec3", np.zeros((ns, 3), dtype=np.float32)),
+        "shape_angular_velocity": ("arr:vec3", np.zeros((ns, 3), dtype=np.float32)),
+        "collision_update_dt": ("scalar:f32", np.float32(1.0 / 60.0)),
+        "max_speculative_extension": ("scalar:f32", np.float32(0.0)),
+    }
+
+    cand = np.array([[0, 1], [1, 2], [0, 3], [0, 4]], dtype=np.int32)
+    return (
+        [
+            ("candidate_pair", "arr:vec2i", cand),
+            ("candidate_pair_count", "arr:i32", np.full(1, npairs, dtype=np.int32)),
+            ("shape_types", "arr:i32", types),
+            ("shape_data", "arr:vec4", data),
+            ("shape_transform", "arr:transform", xf),
+            ("shape_linear_velocity", "arr:vec3", np.zeros((ns, 3), dtype=np.float32)),
+            ("shape_angular_velocity", "arr:vec3", np.zeros((ns, 3), dtype=np.float32)),
+            ("collision_update_dt", "scalar:f32", 1.0 / 60.0),
+            ("max_speculative_extension", "scalar:f32", 0.0),
+            ("shape_source", "arr:u64", np.zeros(ns, dtype=np.uint64)),
+            ("shape_gap", "arr:f32", np.zeros(ns, dtype=np.float32)),
+            ("shape_flags", "arr:i32", np.zeros(ns, dtype=np.int32)),
+            ("shape_sdf_index", "arr:i32", np.full(ns, -1, dtype=np.int32)),
+            ("shape_edge_range", "arr:vec2i", np.zeros((ns, 2), dtype=np.int32)),
+            ("shape_unit_scale_sdf", "arr:i32", np.zeros(ns, dtype=np.int32)),
+            ("writer_data", "struct:ContactWriterData", writer),
+            ("total_num_threads", "scalar:i32", 1),
+            ("gjk_candidate_pairs", "arr:vec2i", np.zeros((npairs, 2), dtype=np.int32)),
+            ("gjk_candidate_pairs_count", "out:i32", 1),
+            ("shape_pairs_mesh", "arr:vec2i", np.zeros((npairs, 2), dtype=np.int32)),
+            ("shape_pairs_mesh_count", "out:i32", 1),
+            ("shape_pairs_mesh_plane", "arr:vec2i", np.zeros((npairs, 2), dtype=np.int32)),
+            ("shape_pairs_mesh_plane_cumsum", "arr:i32", np.zeros(npairs, dtype=np.int32)),
+            ("shape_pairs_mesh_plane_count", "out:i32", 1),
+            ("mesh_plane_vertex_total_count", "out:i32", 1),
+            ("shape_pairs_mesh_mesh", "arr:vec2i", np.zeros((npairs, 2), dtype=np.int32)),
+            ("shape_pairs_mesh_mesh_count", "out:i32", 1),
+            ("shape_pairs_sdf_sdf", "arr:vec2i", np.zeros((npairs, 2), dtype=np.int32)),
+            ("shape_pairs_sdf_sdf_count", "out:i32", 1),
+            ("unit_scale_sdf_rescaled", "out:i32", ns),
+            ("__dim__", "scalar:i32", 1),
+        ],
+        [],
+    )
 
 
 BUILDERS = {

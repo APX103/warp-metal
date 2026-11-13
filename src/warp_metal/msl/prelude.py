@@ -66,6 +66,20 @@ static inline wp_range wp_range_3(int start, int stop, int step) {
     r.i = start; return r;
 }
 
+// ---- wp.Mesh Phase-1 stub (KEP-0001: real mesh path is Phase 2, M2.1/M2.2)
+// The only Phase-1 mesh reference in the Newton closure is narrow-phase
+// vertex counting (points.shape[0]) under a `mesh_id != 0` guard. Phase 1
+// has no mesh registration (wp.Mesh construction fails loudly on the host),
+// so shape_source is all-zero and wp_mesh_get is provably never executed;
+// zero shapes keep the unreachable branch a no-op.
+struct wp_mesh_array_stub { int4 shape; };
+struct wp_mesh { wp_mesh_array_stub points; };
+static inline wp_mesh wp_mesh_get(uint64_t id) {
+    wp_mesh m = {};
+    (void)id;
+    return m;
+}
+
 // ---- array binding: host-side metadata + device data pointer ----
 // Mirrors warp native array_t (data/offset/shape/strides); strides are in
 // BYTES (array.h byte_offset), contiguous row-major only.
@@ -347,6 +361,9 @@ static inline transformf wp_where(bool c, transformf a, transformf b) { return c
 static inline spatial_vectorf wp_where(bool c, spatial_vectorf a, spatial_vectorf b) { return c ? a : b; }
 static inline float wp_where(bool c, float a, float b) { return c ? a : b; }
 static inline int wp_where(bool c, int a, int b) { return c ? a : b; }
+static inline vec2i wp_where(bool c, vec2i a, vec2i b) { return c ? a : b; }
+static inline vec3i wp_where(bool c, vec3i a, vec3i b) { return c ? a : b; }
+static inline vec4i wp_where(bool c, vec4i a, vec4i b) { return c ? a : b; }
 static inline uint wp_where(bool c, uint a, uint b) { return c ? a : b; }
 static inline uint64_t wp_where(bool c, uint64_t a, uint64_t b) { return c ? a : b; }
 static inline int64_t wp_where(bool c, int64_t a, int64_t b) { return c ? a : b; }
@@ -756,6 +773,91 @@ static inline float wp_atomic_max_ret(device atomic_float* addr, float value) {
     return old;
 }
 
+// 64-bit atomics: this Metal runtime exposes the atomic_ulong TYPE but NO
+// 64-bit atomic functions (probed on M4/Metal 4, language version pinned to
+// 4.0 — atomic_fetch/cas/store with 64-bit operands all fail to resolve).
+// Emulated via 32-bit CAS pairs below. Guarantees: convergent (unique-key
+// inserts and monotone max loops retry on unexpected old values) — not
+// linearizable under adversarial same-word contention, unlike CUDA's native
+// 64-bit CAS. Any warp kernel doing arbitrary 64-bit atomics gets this
+// emulation; corpus/trajectory layers validate the reducer's usage patterns.
+static inline uint64_t wp_atomic_u64_load(device atomic_uint* halves) {
+    for (;;) {
+        uint lo = atomic_load_explicit(halves, memory_order_relaxed);
+        uint hi = atomic_load_explicit(halves + 1, memory_order_relaxed);
+        uint lo2 = atomic_load_explicit(halves, memory_order_relaxed);
+        uint hi2 = atomic_load_explicit(halves + 1, memory_order_relaxed);
+        if (lo == lo2 && hi == hi2) {
+            return ((uint64_t)hi << 32) | (uint64_t)lo;
+        }
+    }
+}
+static inline uint64_t wp_atomic_u64_cas(device atomic_uint* halves, uint64_t expected, uint64_t desired) {
+    for (;;) {
+        uint lo = atomic_load_explicit(halves, memory_order_relaxed);
+        uint hi = atomic_load_explicit(halves + 1, memory_order_relaxed);
+        uint64_t old = ((uint64_t)hi << 32) | (uint64_t)lo;
+        if (old != expected) {
+            return old;
+        }
+        uint new_lo = (uint)(desired & 0xffffffffull);
+        uint new_hi = (uint)(desired >> 32);
+        if (atomic_compare_exchange_weak_explicit(halves, &lo, new_lo, memory_order_relaxed, memory_order_relaxed)) {
+            uint hi_old = hi;
+            if (atomic_compare_exchange_weak_explicit(halves + 1, &hi_old, new_hi, memory_order_relaxed, memory_order_relaxed)) {
+                return expected;
+            }
+            // high word raced past us: restore low, retry (convergent)
+            atomic_store_explicit(halves, lo, memory_order_relaxed);
+        }
+    }
+}
+static inline uint64_t wp_atomic_max_u64(device atomic_uint* halves, uint64_t value) {
+    for (;;) {
+        uint64_t old = wp_atomic_u64_load(halves);
+        if (value <= old) {
+            return old;
+        }
+        if (wp_atomic_u64_cas(halves, old, value) == old) {
+            return old;
+        }
+    }
+}
+static inline uint64_t wp_atomic_min_u64(device atomic_uint* halves, uint64_t value) {
+    for (;;) {
+        uint64_t old = wp_atomic_u64_load(halves);
+        if (value >= old) {
+            return old;
+        }
+        if (wp_atomic_u64_cas(halves, old, value) == old) {
+            return old;
+        }
+    }
+}
+// compare-and-swap (upstream atomic_compare_swap returns the OLD value);
+static inline uint64_t wp_atomic_cas_ret(device atomic_ulong* addr, uint64_t expected, uint64_t desired) {
+    return wp_atomic_u64_cas((device atomic_uint*)addr, expected, desired);
+}
+static inline int wp_atomic_cas_ret(device atomic_int* addr, int expected, int desired) {
+    atomic_compare_exchange_weak_explicit(addr, &expected, desired, memory_order_relaxed, memory_order_relaxed);
+    return expected;
+}
+static inline uint64_t wp_atomic_cas_ret_at(device uint64_t* d, constant wp_arr_meta& m, int i, uint64_t expected, uint64_t desired) {
+    return wp_atomic_cas_ret((device atomic_ulong*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), expected, desired);
+}
+static inline int wp_atomic_cas_ret_at(device int* d, constant wp_arr_meta& m, int i, int expected, int desired) {
+    return wp_atomic_cas_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), expected, desired);
+}
+static inline uint64_t wp_atomic_max_ret_at(device uint64_t* d, constant wp_arr_meta& m, int i, uint64_t v) {
+    device atomic_uint* halves = (device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    wp_atomic_max_u64(halves, v);
+    return wp_atomic_u64_load(halves);
+}
+static inline uint64_t wp_atomic_min_ret_at(device uint64_t* d, constant wp_arr_meta& m, int i, uint64_t v) {
+    device atomic_uint* halves = (device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    wp_atomic_min_u64(halves, v);
+    return wp_atomic_u64_load(halves);
+}
 // ---- wp_*_at: array-indexed atomic entry points (translator emits these) ----
 // exact-match overloads only: calling on an unsupported element type is a
 // compile error (fail loud), never a silent non-atomic path.
@@ -887,16 +989,24 @@ static inline spatial_vectorf wp_atomic_sub_ret_at(device spatial_vectorf* d, co
 // ---- bit ops (builtin.h bit_and/bit_or/bit_xor/lshift/rshift) ----
 static inline int wp_bit_and(int a, int b) { return a & b; }
 static inline uint wp_bit_and(uint a, uint b) { return a & b; }
+static inline int64_t wp_bit_and(int64_t a, int64_t b) { return a & b; }
 static inline uint64_t wp_bit_and(uint64_t a, uint64_t b) { return a & b; }
 static inline int wp_bit_or(int a, int b) { return a | b; }
 static inline uint wp_bit_or(uint a, uint b) { return a | b; }
+static inline int64_t wp_bit_or(int64_t a, int64_t b) { return a | b; }
 static inline uint64_t wp_bit_or(uint64_t a, uint64_t b) { return a | b; }
 static inline int wp_bit_xor(int a, int b) { return a ^ b; }
 static inline uint wp_bit_xor(uint a, uint b) { return a ^ b; }
+static inline int64_t wp_bit_xor(int64_t a, int64_t b) { return a ^ b; }
+static inline uint64_t wp_bit_xor(uint64_t a, uint64_t b) { return a ^ b; }
 static inline int wp_lshift(int a, int b) { return a << b; }
 static inline uint wp_lshift(uint a, int b) { return a << b; }
+static inline int64_t wp_lshift(int64_t a, int b) { return a << b; }
+static inline uint64_t wp_lshift(uint64_t a, int b) { return a << b; }
 static inline int wp_rshift(int a, int b) { return a >> b; }
 static inline uint wp_rshift(uint a, int b) { return a >> b; }
+static inline int64_t wp_rshift(int64_t a, int b) { return a >> b; }
+static inline uint64_t wp_rshift(uint64_t a, int b) { return a >> b; }
 // invert (builtin.h: bitwise complement, Int types)
 static inline int wp_invert(int a) { return ~a; }
 static inline uint wp_invert(uint a) { return ~a; }
@@ -914,8 +1024,36 @@ static inline int wp_neg(int x) { return -x; }
 static inline vec2f wp_neg(vec2f a) { return -a; }
 static inline vec3f wp_neg(vec3f a) { return -a; }
 static inline vec4f wp_neg(vec4f a) { return -a; }
+// cw_mul/cw_div: component-wise vector ops (upstream sametypes constraint)
+static inline vec2f wp_cw_mul(vec2f a, vec2f b) { return make_vec2f(a.x * b.x, a.y * b.y); }
+static inline vec3f wp_cw_mul(vec3f a, vec3f b) { return make_vec3f(a.x * b.x, a.y * b.y, a.z * b.z); }
+static inline vec4f wp_cw_mul(vec4f a, vec4f b) { return make_vec4f(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w); }
+static inline vec2i wp_cw_mul(vec2i a, vec2i b) { return make_vec2i(a.x * b.x, a.y * b.y); }
+static inline vec3i wp_cw_mul(vec3i a, vec3i b) { return make_vec3i(a.x * b.x, a.y * b.y, a.z * b.z); }
+static inline vec4i wp_cw_mul(vec4i a, vec4i b) { return make_vec4i(a.x * b.x, a.y * b.y, a.z * b.z, a.w * b.w); }
+static inline vec2f wp_cw_div(vec2f a, vec2f b) { return make_vec2f(a.x / b.x, a.y / b.y); }
+static inline vec3f wp_cw_div(vec3f a, vec3f b) { return make_vec3f(a.x / b.x, a.y / b.y, a.z / b.z); }
+static inline vec4f wp_cw_div(vec4f a, vec4f b) { return make_vec4f(a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w); }
+static inline vec2i wp_cw_div(vec2i a, vec2i b) { return make_vec2i(a.x / b.x, a.y / b.y); }
+static inline vec3i wp_cw_div(vec3i a, vec3i b) { return make_vec3i(a.x / b.x, a.y / b.y, a.z / b.z); }
+static inline vec4i wp_cw_div(vec4i a, vec4i b) { return make_vec4i(a.x / b.x, a.y / b.y, a.z / b.z, a.w / b.w); }
 static inline float wp_div(float a, float b) { return a / b; }
 static inline int wp_div(int a, int b) { return a / b; }
+// floordiv (warp native builtin.h floordiv_signed, ported verbatim):
+// C++ division truncates toward zero; warp floors — correct when signs differ
+// and the remainder is nonzero.
+static inline int wp_floordiv(int a, int b) {
+    int q = a / b;
+    int r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) q -= 1;
+    return q;
+}
+static inline int64_t wp_floordiv(int64_t a, int64_t b) {
+    int64_t q = a / b;
+    int64_t r = a % b;
+    if (r != 0 && ((r < 0) != (b < 0))) q -= 1;
+    return q;
+}
 static inline float wp_add(float a, float b) { return a + b; }
 static inline int wp_add(int a, int b) { return a + b; }
 static inline float wp_sub(float a, float b) { return a - b; }

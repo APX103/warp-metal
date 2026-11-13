@@ -65,6 +65,12 @@ void *wmm_buffer_ptr(void *handle) {
     return buf.contents;
 }
 
+uint64_t wmm_buffer_gpu_address(void *handle) {
+    if (!handle) return 0;
+    id<MTLBuffer> buf = (__bridge id<MTLBuffer>)handle;
+    return buf.gpuAddress;
+}
+
 uint64_t wmm_buffer_length(void *handle) {
     if (!handle) return 0;
     id<MTLBuffer> buf = (__bridge id<MTLBuffer>)handle;
@@ -86,8 +92,17 @@ void *wmm_library_create(const char *msl_source) {
         return NULL;
     }
     NSString *src = [NSString stringWithUTF8String:msl_source];
+    // KEP-0001 baseline: macOS 26+ / Metal 4 (fallback Metal 3). Pin the
+    // language version so 64-bit atomics (atomic_ulong, Metal 3.1+) resolve
+    // instead of silently missing overloads under the default (nil) version.
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    if (@available(macOS 26.0, *)) {
+        opts.languageVersion = MTLLanguageVersion4_0;
+    } else {
+        opts.languageVersion = MTLLanguageVersion3_2;
+    }
     NSError *err = nil;
-    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:nil error:&err];
+    id<MTLLibrary> lib = [dev newLibraryWithSource:src options:opts error:&err];
     if (!lib) {
         _set_error(err.localizedDescription ?: @"library compile failed");
         return NULL;

@@ -67,9 +67,65 @@ _MAT_SIZES = {(2, 2): "mat22f", (3, 3): "mat33f", (4, 4): "mat44f"}
 
 _RE_VEC_T = re.compile(r"^wp::vec_t<(\d+),\s*wp::(float32|int32)>$")
 _RE_MAT_T = re.compile(r"^wp::mat_t<(\d+),\s*(\d+),\s*wp::float32>$")
+_RE_GEN_MAT = re.compile(r"^mat(\d+)x(\d+)f$")
 _RE_QUAT_T = re.compile(r"^wp::quat_t<wp::float32>$")
 _RE_TRANSFORM_T = re.compile(r"^wp::transform_t<wp::float32>$")
 _RE_ARRAY_T = re.compile(r"^wp::array_t<(.+)>$")
+
+
+def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
+    """Emit the struct def + row-extract for a generic ``mat<M>x<N>f``.
+
+    The fixed 2x2/3x3/4x4 mats live in the prelude; sizes beyond those
+    (Newton's FACE_NORMALS icosahedron table is 20x3) are generated per
+    translation unit on first use. Rows extract to vec2/3/4 — anything else
+    fails loud.
+    """
+    m = _RE_GEN_MAT.match(msl_t)
+    if m is None or msl_t in unit.structs:
+        return
+    M, N = int(m.group(1)), int(m.group(2))
+    vec = _VEC_SIZES.get(N)
+    if vec is None:
+        raise TranslationError(f"generic mat {msl_t}: row extract has no vec{N} mapping")
+    lines = [f"struct {msl_t} {{ float c[{M}][{N}]; }};"]
+    ctor_args = ", ".join(
+        f"float a{r}{c}" for r in range(M) for c in range(N)
+    )
+    ctor_body = "\n".join(
+        f"    v.c[{r}][{c}] = a{r}{c};" for r in range(M) for c in range(N)
+    )
+    lines.append(f"static inline {msl_t} make_{msl_t}({ctor_args}) {{")
+    lines.append(f"    {msl_t} v;")
+    lines.append(ctor_body)
+    lines.append("    return v;")
+    lines.append("}")
+    lines.append(f"static inline {msl_t} make_{msl_t}() {{")
+    lines.append(f"    {msl_t} v = {{}};")
+    lines.append("    return v;")
+    lines.append("}")
+    comps = ", ".join(f"m.c[i][{j}]" for j in range(N))
+    lines.append(
+        f"static inline {vec} wp_extract({msl_t} m, int i) {{ return make_{vec}({comps}); }}"
+    )
+    # element form (warp extract(m, i, j) -> scalar)
+    lines.append(
+        f"static inline float wp_extract({msl_t} m, int i, int j) {{ return m.c[i][j]; }}"
+    )
+    # row assign (warp assign_inplace(m, i, vec))
+    assign_body = "; ".join(f"m.c[i][{j}] = v.{comp}" for j, comp in enumerate(
+        ["x", "y", "z", "w"][:N]))
+    lines.append(
+        f"static inline void wp_assign_inplace(thread {msl_t}& m, int i, {vec} v) {{ {assign_body}; }}"
+    )
+    # scalar element assign (warp assign_inplace(m, i, j, scalar))
+    lines.append(
+        f"static inline void wp_assign_inplace(thread {msl_t}& m, int i, int j, float v) {{ m.c[i][j] = v; }}"
+    )
+    lines.append(
+        f"static inline {msl_t} wp_where(bool c, {msl_t} a, {msl_t} b) {{ return c ? a : b; }}"
+    )
+    unit.structs[msl_t] = "\n".join(lines)
 
 
 def msl_type(ctype: str) -> str:
@@ -87,7 +143,7 @@ def msl_type(ctype: str) -> str:
         key = (int(m.group(1)), int(m.group(2)))
         if key in _MAT_SIZES:
             return _MAT_SIZES[key]
-        raise TranslationError(f"wp::mat_t<{key[0]},{key[1]}> has no MSL mapping")
+        return f"mat{key[0]}x{key[1]}f"  # generic size; def emitted per unit
     if _RE_QUAT_T.match(ctype):
         return "quatf"
     if _RE_TRANSFORM_T.match(ctype):
@@ -96,6 +152,8 @@ def msl_type(ctype: str) -> str:
         return "wp_range"
     if ctype == "wp::shape_t":
         return "int4"  # loaded shape vectors index via wp_extract(int4, i)
+    if ctype == "wp::Mesh":
+        return "wp_mesh"  # Phase-1 stub (see prelude) — never executed
     if ctype == "wp::spatial_vector_t<wp::float32>":
         return "spatial_vectorf"
     if m := _RE_ARRAY_T.match(ctype):
@@ -128,6 +186,9 @@ _CALL_TABLE = {
     "sub": "wp_sub",
     "mul": "wp_mul",
     "div": "wp_div",
+    "floordiv": "wp_floordiv",
+    "cw_mul": "wp_cw_mul",
+    "cw_div": "wp_cw_div",
     "mod": "wp_mod",
     "neg": "wp_neg",
     "abs": "wp_abs",
@@ -282,10 +343,13 @@ _RE_RETURN = re.compile(r"^\s*return\s*(.*?);\s*$")
 class ArgSpec:
     """One kernel/function argument, classified for MSL emission."""
 
-    def __init__(self, name: str, kind: str, ctype: str):
+    def __init__(self, name: str, kind: str, ctype: str, array_fields: list[tuple[str, str]] | None = None):
         self.name = name  # launch-level arg name (from _wp_args->name)
         self.kind = kind  # 'array' | 'scalar' | 'struct'
         self.ctype = ctype  # warp-native C++ type string from the SSA text
+        # for kind == 'struct': [(field, elem ctype)] array fields split out
+        # into their own buffer bindings (not part of the MSL struct value)
+        self.array_fields = array_fields or []
 
     @property
     def msl_elem(self) -> str:
@@ -299,10 +363,13 @@ class ArgSpec:
 class Param:
     """MSL parameter of a device function."""
 
-    def __init__(self, kind: str, msl: str, name: str):
-        self.kind = kind  # 'value' | 'array' | 'ref' (thread T&)
+    def __init__(self, kind: str, msl: str, name: str, array_fields: list[tuple[str, str]] | None = None):
+        self.kind = kind  # 'value' | 'array' | 'ref' (thread T&) | 'struct'
         self.msl = msl  # MSL type (elem type for arrays)
         self.name = name
+        # for kind == 'struct': [(field, elem ctype)] split array fields
+        # expanded into extra data+meta params right after the value param
+        self.array_fields = array_fields or []
 
 
 class MSLFunction:
@@ -321,10 +388,17 @@ class KernelUnit:
     def __init__(self, kernel_name: str):
         self.structs: dict[str, str] = {}  # native_name -> MSL struct def
         self.struct_fields: dict[str, list[tuple[str, str]]] = {}  # name -> [(field, msl type)]
+        # struct name -> [(field, elem ctype)] for array fields SPLIT OUT of
+        # the MSL struct: each becomes its own buffer binding + Params meta
+        self.struct_array_fields: dict[str, list[tuple[str, str]]] = {}
         self.functions: list[MSLFunction] = []  # callees first
         self.kernel = MSLFunction(kernel_name, None)
         self.args: list[ArgSpec] = []  # kernel args in order
         self.param_fields: list[tuple[str, str]] = []  # (msl type, field name)
+        # set by kernel_src: True when device pointers bind through a tier-2
+        # argument buffer (Metal plain-buffer cap is 30)
+        self.uses_argbuf = False
+        self.device_bindings: list[tuple[str, str]] = []  # [(binding, elem msl)]
 
     def source(self) -> str:
         parts = ["// generated by warp-metal MSL translator (Adjoint SSA)\n", PRELUDE, "\n"]
@@ -338,11 +412,37 @@ class KernelUnit:
 
     def kernel_src(self) -> str:
         fn = self.kernel
+        # Metal caps plain buffer bindings at index 30. Kernels with many
+        # arrays (Newton's primitive narrow phase: 34 device pointers) bind
+        # them through a tier-2 argument buffer instead: one constant struct
+        # of `device T*` members (GPU addresses written host-side), plus
+        # textual defines so every `{binding}_data` reference in the emitted
+        # body keeps working unchanged.
+        self.device_bindings = list(self._iter_device_bindings())
+        use_argbuf = len(self.device_bindings) > 30
+        self.uses_argbuf = use_argbuf
+
         params, idx = [], 0
+        defines: list[str] = []
         for a in self.args:
             if a.kind == "array":
-                params.append(f"    device {a.msl_elem}* {a.name}_data [[buffer({idx})]]")
-                idx += 1
+                binding = f"{a.name}_data"
+                if use_argbuf:
+                    defines.append(f"#define {binding} _abuf.{binding}")
+                else:
+                    params.append(f"    device {a.msl_elem}* {binding} [[buffer({idx})]]")
+                    idx += 1
+            elif a.kind == "struct":
+                for field, elem_msl in self._struct_field_elems(a):
+                    binding = f"{a.name}__{field}_data"
+                    if use_argbuf:
+                        defines.append(f"#define {binding} _abuf.{binding}")
+                    else:
+                        params.append(f"    device {elem_msl}* {binding} [[buffer({idx})]]")
+                        idx += 1
+        if use_argbuf:
+            params.insert(0, f"    constant Args_{self.kernel.name}& _abuf [[buffer({idx})]]")
+            idx += 1
         params.append(f"    constant Params_{self.kernel.name}& _wp_args [[buffer({idx})]]")
         params.append("    uint3 _gid [[thread_position_in_grid]]")
         fields = []
@@ -351,17 +451,48 @@ class KernelUnit:
                 fields.append(f"    {a.msl} {a.name};")
             elif a.kind == "struct":
                 fields.append(f"    {a.msl} {a.name};")
+                for field, _ in self._struct_field_specs(a):
+                    fields.append(f"    wp_arr_meta {a.name}__{field}_m;")
             elif a.kind == "array":
                 fields.append(f"    wp_arr_meta {a.name}_m;")
         fields.append("    wp_arr_meta _dims;  // launch bounds for multi-dim tid")
         body = "\n".join(fn.lines) or "    ;"
+        defines_text = "\n".join(defines) + "\n" if defines else ""
         return (
-            f"struct Params_{self.kernel.name} {{\n" + "\n".join(fields) + "\n};\n\n"
+            self._argbuf_struct(use_argbuf) + "\n\n"
+            + f"struct Params_{self.kernel.name} {{\n" + "\n".join(fields) + "\n};\n\n"
+            + defines_text
             + f"kernel void {self.kernel.name}(\n" + ",\n".join(params) + ")\n{\n"
             + "    const int _idx = (int)_gid.x;\n"
             + body
             + "\n}\n"
         )
+
+    def _iter_device_bindings(self):
+        """(binding, elem msl) for every device-pointer binding, in order."""
+        for a in self.args:
+            if a.kind == "array":
+                yield f"{a.name}_data", a.msl_elem
+            elif a.kind == "struct":
+                for field, elem_msl in self._struct_field_elems(a):
+                    yield f"{a.name}__{field}_data", elem_msl
+
+    def _argbuf_struct(self, use_argbuf: bool) -> str:
+        if not use_argbuf:
+            return ""
+        lines = [f"struct Args_{self.kernel.name} {{"]
+        for binding, elem in self._iter_device_bindings():
+            lines.append(f"    device {elem}* {binding};")
+        lines.append("};")
+        return "\n".join(lines)
+
+    def _struct_field_specs(self, a: ArgSpec) -> list[tuple[str, str]]:
+        """[(field, elem ctype)] of ``a``'s split array fields."""
+        return self.struct_array_fields.get(a.ctype, [])
+
+    def _struct_field_elems(self, a: ArgSpec) -> list[tuple[str, str]]:
+        """[(field, elem MSL type)] of ``a``'s split array fields."""
+        return [(field, msl_type(elem_ctype)) for field, elem_ctype in self._struct_field_specs(a)]
 
 
 def fn_src(fn: MSLFunction) -> str:
@@ -372,6 +503,14 @@ def fn_src(fn: MSLFunction) -> str:
             params.append(f"    constant wp_arr_meta& {p.name}_m")
         elif p.kind == "ref":
             params.append(f"    thread {p.msl}& {p.name}")
+        elif p.kind == "struct" and p.array_fields:
+            # split array fields expand into extra data+meta params here, at
+            # emission — fn.params mirrors the C++ SSA parameter list so the
+            # call-site argument zip stays aligned
+            params.append(f"    {p.msl} {p.name}")
+            for field, elem_ctype in p.array_fields:
+                params.append(f"    device {msl_type(elem_ctype)}* {p.name}__{field}_data")
+                params.append(f"    constant wp_arr_meta& {p.name}__{field}_m")
         else:
             params.append(f"    {p.msl} {p.name}")
     body = "\n".join(fn.lines) or "    ;"
@@ -384,16 +523,15 @@ def fn_src(fn: MSLFunction) -> str:
 # ---------------------------------------------------------------------------
 
 class _BodyTranslator:
-    def __init__(self, unit: KernelUnit, args: dict[str, ArgSpec], user_funcs: dict[str, "MSLFunction"],
+    def __init__(self, unit: KernelUnit, array_args: dict[str, ArgSpec], user_funcs: dict[str, "MSLFunction"],
                  scope: str = "kernel"):
         self.unit = unit
         self.scope = scope  # "kernel" (Params buffer) | "func" (meta params)
-        self.array_args = {}
-        for a in args.values():
-            if a.kind != "array":
-                continue
-            key = a.name if a.name.startswith("var_") else f"var_{a.name}"
-            self.array_args[key] = a
+        # array bindings visible in this scope, keyed by every SSA form that
+        # can reference them: ``var_<arg>`` for top-level arrays,
+        # ``var_<struct>.<field>`` for split struct array fields, and (added
+        # by _alias) the ``var_N = &((var_x).field)`` alias vars themselves
+        self.array_args = array_args
         self.user_funcs = user_funcs  # native name -> translation (param kinds)
         self.aliases: dict[str, tuple[bool, str]] = {}  # var -> (is_pointer, value expr)
         # `wp::Any var_N;` decls (wp.static temps) — typed at first assignment
@@ -484,6 +622,11 @@ class _BodyTranslator:
             return f"(({_CAST_TABLE[key]})({self.expr(args[0])}))"
         if key in _CTOR_TABLE:
             return f"{_CTOR_TABLE[key]}({', '.join(self.expr(a) for a in args)})"
+        m_ctor = re.match(r"^wp::mat_t<(\d+), (\d+), wp::float32>$", key)
+        if m_ctor:  # generic-size matrix constructor (e.g. FACE_NORMALS tables)
+            msl_t = f"mat{m_ctor.group(1)}x{m_ctor.group(2)}f"
+            ensure_mat_def(self.unit, msl_t)
+            return f"make_{msl_t}({', '.join(self.expr(a) for a in args)})"
         if key == "wp::copy":
             return self.expr(args[0])
         if key == "wp::load":
@@ -505,9 +648,14 @@ class _BodyTranslator:
             # so elide it in MSL (Metal device printf is host-tool-dependent).
             # The generated line keeps a marker so the elision stays visible.
             return "/* wp.print elided (Metal) */ 0"
-        if key in ("wp::mesh_get", "wp::bvh_get_group_root", "wp::hash_grid_query", "wp::mesh_query"):
+        if key == "wp::mesh_get":
+            # Phase-1 stub (see prelude): returns a zeroed wp_mesh. Provable
+            # no-op — mesh registration doesn't exist in Phase 1, so every
+            # caller is guarded by mesh_id != 0.
+            return "wp_mesh_get(" + self.expr(args[0]) + ")"
+        if key in ("wp::bvh_get_group_root", "wp::hash_grid_query", "wp::mesh_query"):
             raise TranslationError(
-                f"{key}: BVH/Mesh device builtins are Phase 2 (KEP-0001); not available in M1.3"
+                f"{key}: BVH/Mesh device builtins are Phase 2 (KEP-0001); not available in M1.4"
             )
         if key == "wp::static":
             # wp.static(x): compile-time constant expression — emit the arg
@@ -562,18 +710,29 @@ class _BodyTranslator:
         if m := _RE_RETURN.match(line):
             return [f"return {self.expr(m.group(1))};".replace("return ;", "return;")]
 
-        # plain assignment `name = expr;` — must be tried before the decl
+        # plain assignment `name = expr;` (targets may be struct members:
+        # `var_contact_data.field = ...`) — must be tried before the decl
         # regex, whose lazy `(\S.*?)` can otherwise swallow `ret_0 =` as a
         # "type" on multi-output ref-assign lines (T & ret_0 params)
-        if m := re.match(r"^\s*(\w+)\s*=\s*(.+?);\s*$", line):
+        if m := re.match(r"^\s*(\w+(?:\.\w+)*)\s*=\s*(.+?);\s*$", line):
             target, rhs = m.group(1), m.group(2)
             if rhs.startswith("wp::address(") or rhs.startswith("&("):
                 self._alias(target, rhs)
                 return []  # alias collapsed: no MSL line, no decl (pointer decl was dropped)
+            if rhs.startswith("wp::load("):
+                spec = self._resolve_array_load(rhs)
+                if spec is not None:
+                    # array-typed value copy (`t = wp::load(arr_alias)`): the
+                    # target becomes another name for the same binding pair
+                    self.array_args[target] = spec
+                    return []
+                # otherwise fall through: a value-alias load (normal path)
             if rhs in self.array_args:
-                # array-truthiness temp (`t = arr;` then `if (t)`) — upstream
-                # tests the array data pointer non-null; always bound here
-                self.aliases[target] = (False, "true")
+                # array value copy (`t = arr;`): register as another name for
+                # the same binding pair. Bool contexts still resolve (expr
+                # treats any array binding as statically true — upstream tests
+                # the data pointer, always bound here).
+                self.array_args[target] = self.array_args[rhs]
                 return []
             if target in self.deferred_any:
                 # first assignment to a `wp::Any` temp (wp.static lowering):
@@ -592,6 +751,15 @@ class _BodyTranslator:
             # are dropped (address-of aliases collapse to direct reads)
             if ctype.rstrip().endswith("*"):
                 return []
+            if _RE_ARRAY_T.match(ctype.strip()):
+                # array-typed value decls carry no data (the binding pair is
+                # registered when the var is assigned a load of another array)
+                if init is not None and init.startswith("wp::load("):
+                    spec = self._resolve_array_load(init)
+                    if spec is None:
+                        raise TranslationError(f"array decl from non-array load {init!r}")
+                    self.array_args[name] = spec
+                return []
             if ctype.strip() == "wp::Any":
                 # wp.static temps: type-erased in the SSA; declared as
                 # `const auto` at the first (only) assignment instead
@@ -606,6 +774,30 @@ class _BodyTranslator:
                 msl_t = msl_type(ctype)
             except TranslationError as e:
                 raise TranslationError(f"decl line {line!r}: {e}")
+            if _RE_GEN_MAT.match(msl_t):
+                ensure_mat_def(self.unit, msl_t)
+            # warp constant tables arrive as flattened brace initializers
+            # (row-major linear, matching the struct's c[M][N] layout); MSL
+            # wants per-row braces, so reshape flat → rows for generic mats
+            if init is not None and init.startswith("wp::initializer_array<"):
+                brace = init.index("{")
+                elems = init[brace + 1 : -1].strip()
+                m_gen = _RE_GEN_MAT.match(msl_t)
+                if m_gen:
+                    rows, cols = int(m_gen.group(1)), int(m_gen.group(2))
+                    flat = [e.strip() for e in elems.split(",")]
+                    if len(flat) != rows * cols:
+                        raise TranslationError(
+                            f"initializer_array<{len(flat)}> does not fill {msl_t} ({rows}x{cols})"
+                        )
+                    row_inits = ", ".join(
+                        "{" + ", ".join(flat[r * cols : (r + 1) * cols]) + "}" for r in range(rows)
+                    )
+                    # struct → c[M][N] member → rows: full bracing silences
+                    # -Wmissing-braces (Metal surfaces warnings before errors
+                    # and the 1KB error buffer would clip the real failure)
+                    elems = "{" + row_inits + "}"
+                return [f"{'const ' if const else ''}{msl_t} {name} = {{{elems}}};"]
             if init is not None:
                 return [f"{'const ' if const else ''}{msl_t} {name} = {self.expr(init)};"]
             # zero-init: Metal promotes -Wsometimes-uninitialized to an error
@@ -613,7 +805,7 @@ class _BodyTranslator:
             # so a static zero is never observable
             if msl_t in ("vec2f", "vec3f", "vec4f", "quatf", "mat22f", "mat33f", "mat44f",
                          "transformf", "spatial_vectorf", "vec2i", "vec3i", "vec4i",
-                         "wp_range") or msl_t in self.unit.structs:
+                         "wp_range", "wp_mesh") or msl_t in self.unit.structs:
                 return [f"{'const ' if const else ''}{msl_t} {name} = {{}};"]
             return [f"{'const ' if const else ''}{msl_t} {name} = 0;"]
 
@@ -621,6 +813,13 @@ class _BodyTranslator:
             return [self.call_stmt(m.group(1)) + ";"]
 
         raise TranslationError(f"unparsed statement {line!r}")
+
+    def _resolve_array_load(self, rhs: str) -> ArgSpec | None:
+        """Spec behind ``wp::load(<var>)`` when the load yields an array."""
+        inner = rhs[len("wp::load(") : -1].strip() if rhs.endswith(")") else None
+        if inner is None:
+            return None
+        return self.array_args.get(inner)
 
     def _alias(self, var: str, init: str) -> None:
         if init.startswith("wp::address("):
@@ -644,10 +843,33 @@ class _BodyTranslator:
             expr = f"int4({s}[0], {s}[1], {s}[2], {s}[3])"
             self.aliases[var] = (False, expr)
             return
-        # struct member reference &((var).field) — value alias
-        member = re.match(r"^\((\w+)\)(\.\w+)+$", inner)
+        # struct member reference &((var).field)
+        member = re.match(r"^\((\w+)\)((?:\.\w+)+)$", inner)
         if not member:
+            # pointer-dereference member form &(var_x->field): var_x is a
+            # value alias → (alias_expr).field; var_x is an array binding →
+            # the array's shape vector (same as the &(arr.shape) form)
+            arrow = re.match(r"^(\w+)->(\w+)$", inner)
+            if arrow:
+                base = arrow.group(1)
+                if arrow.group(2) == "shape" and base in self.array_args:
+                    s = f"{self._meta_ref(self.array_args[base])}.shape"
+                    self.aliases[var] = (False, f"int4({s}[0], {s}[1], {s}[2], {s}[3])")
+                    return
+                alias = self.aliases.get(base)
+                if alias is None or alias[0]:
+                    raise TranslationError(f"&(...->...) on non-value alias {inner!r}")
+                self.aliases[var] = (False, f"{alias[1]}.{arrow.group(2)}")
+                return
             raise TranslationError(f"unsupported reference form {init!r}")
+        # split struct array fields bind like arrays: the alias var becomes a
+        # name for the field's own (data ptr, meta) binding pair. Scalar
+        # fields fall through to a plain value alias of the member expression.
+        key = member.group(1) + member.group(2)
+        spec = self.array_args.get(key)
+        if spec is not None:
+            self.array_args[var] = spec
+            return
         self.aliases[var] = (False, self.expr(inner))
 
     def call_stmt(self, src: str) -> str:
@@ -696,6 +918,15 @@ class _BodyTranslator:
         suffix = "_ret_at" if ret else "_at"
         return f"wp_{op}{suffix}({spec.name}_data, {self._meta_ref(spec)}{', ' + idx if idx else ''}, {value})"
 
+    def _array_arg_spec(self, arg: str) -> ArgSpec | None:
+        """Binding spec for an SSA array argument (direct var or load of one)."""
+        spec = self.array_args.get(arg.strip())
+        if spec is not None:
+            return spec
+        if arg.strip().startswith("wp::load("):
+            return self._resolve_array_load(arg.strip())
+        return None
+
     def _call_user(self, src: str) -> str:
         name = src.split("(", 1)[0]
         close = _find_balanced(src, len(name))
@@ -717,11 +948,22 @@ class _BodyTranslator:
             arg = args[vi]
             vi += 1
             if p.kind == "array":
-                spec = self.array_args.get(arg.strip())
+                spec = self._array_arg_spec(arg)
                 if spec is None:
                     raise TranslationError(f"array param {p.name} of {name} got non-array {arg!r}")
                 out.append(f"{spec.name}_data")
                 out.append(self._meta_ref(spec))
+            elif p.kind == "struct" and p.array_fields:
+                # struct value + one (data, meta) pair per split array field
+                out.append(self.expr(arg))
+                for field, _elem_ctype in p.array_fields:
+                    spec = self.array_args.get(f"{arg.strip()}.{field}")
+                    if spec is None:
+                        raise TranslationError(
+                            f"struct param {p.name} of {name}: array field {field!r} has no binding"
+                        )
+                    out.append(f"{spec.name}_data")
+                    out.append(self._meta_ref(spec))
             else:
                 out.append(self.expr(arg))
         if vi != len(args):
@@ -797,15 +1039,20 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
     # ---- classify kernel args from the vendored type objects ----
     from ..frontend.codegen import Var as _Var
 
+    array_args: dict[str, ArgSpec] = {}
     for var in adj.args:
         ctype = _Var.type_to_ctype(var.type)
         kind = _classify_ctype(ctype)
         spec = ArgSpec(var.label, kind, ctype)
         unit.args.append(spec)
         if kind == "struct":
-            _emit_struct_def(var.type, unit, _codegen)
-
-    args_by_var = {f"var_{a.name}": a for a in unit.args}
+            spec.array_fields = _emit_struct_def(var.type, unit, _codegen, split_arrays=True)
+            for field, elem_ctype in spec.array_fields:
+                array_args[f"var_{var.label}.{field}"] = ArgSpec(
+                    f"{var.label}__{field}", "array", elem_ctype
+                )
+        elif kind == "array":
+            array_args[f"var_{var.label}"] = spec
 
     # ---- transitive user functions, callees first ----
     user_funcs: dict[str, MSLFunction] = {}
@@ -816,11 +1063,10 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
             return
         snippet = getattr(f, "native_snippet", None)
         if snippet:
-            raise TranslationError(
-                f"@wp.func_native {fname!r} has no MSL translation: embedded CUDA/C++ source is "
-                f"not supported by the Metal backend (KEP-0001). Rewriting it as a plain @wp.func "
-                f"is the supported path; the calling kernel cannot launch on 'metal'."
-            )
+            fn = _translate_native_function(f, snippet, unit, _codegen)
+            user_funcs[fname] = fn
+            unit.functions.append(fn)
+            return
         for callee in f.adj.called_user_functions:
             visit(callee)
         fn = _translate_function(f, unit, user_funcs, _codegen)
@@ -832,7 +1078,7 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
 
     # ---- kernel body ----
     src = _codegen.codegen_func_forward(adj, func_type="kernel", device="cpu")
-    tr = _BodyTranslator(unit, args_by_var, user_funcs)
+    tr = _BodyTranslator(unit, array_args, user_funcs)
     body: list[str] = []
     section = None
     for line in src.splitlines():
@@ -851,6 +1097,35 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
     bindings = [f"{a.msl} var_{a.name} = _wp_args.{a.name};" for a in unit.args if a.kind in ("scalar", "struct")]
     unit.kernel.lines = bindings + body
     return unit
+
+
+def _translate_native_function(f, snippet: str, unit: KernelUnit, _codegen) -> MSLFunction:
+    """Include a ``@wp.func_native`` snippet verbatim as an MSL function.
+
+    func_native snippets are portable C++ by construction (upstream runs the
+    same text on the CPU backend). MSL is C++14-based, so a plain-C++ snippet
+    compiles verbatim; one using CUDA intrinsics fails loudly at Metal
+    library compile — never silently. The registered snippet references the
+    Python parameter names, so the MSL signature keeps them.
+    """
+    from ..frontend.codegen import Var as _Var
+
+    fname = f.native_func
+    params: list[Param] = []
+    for var in f.adj.args:
+        ctype = _Var.type_to_ctype(var.type)
+        params.append(Param("value", msl_type(ctype), var.label))
+    ret_ctype = _Var.type_to_ctype(f.adj.arg_types["return"]) if "return" in f.adj.arg_types else None
+    ret_msl = None if ret_ctype is None else msl_type(ret_ctype)
+    fn = MSLFunction(fname, ret_msl)
+    fn.params = params
+    body = snippet.strip("\n")
+    # MSL dialect adapter: references must carry an address space qualifier;
+    # a local lvalue's only legal address space is `thread` (semantics equal
+    # to the unqualified CPU C++ form the snippets are written against)
+    body = re.sub(r"reinterpret_cast<\s*([^<>]+?)\s*&\s*>", r"reinterpret_cast<thread \1&>", body)
+    fn.lines = [f"    {ln}" for ln in body.splitlines()]
+    return fn
 
 
 def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLFunction:
@@ -888,7 +1163,7 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
     ret_msl = None if ret_cpp == "void" else msl_type(ret_cpp)
 
     fn = MSLFunction(fn_name, ret_msl)
-    args_by_var: dict[str, ArgSpec] = {}
+    array_args: dict[str, ArgSpec] = {}
 
     for arg_src in split_args(header[open_idx + 1 : close_idx]):
         if "&" in arg_src:
@@ -900,15 +1175,28 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
             fn.params.append(Param("array", array_elem_msl(ctype), pname))
             # C++ SSA function params already carry the var_ prefix
             key = pname if pname.startswith("var_") else f"var_{pname}"
-            args_by_var[key] = ArgSpec(pname, "array", ctype)
+            array_args[key] = ArgSpec(pname, "array", ctype)
+        elif _classify_ctype(ctype) == "struct":
+            if ctype in unit.struct_array_fields:
+                split_fields = unit.struct_array_fields[ctype]
+            else:
+                struct_type = next(
+                    (v.type for v in f.adj.args if v.label == pname.removeprefix("var_")), None
+                )
+                if struct_type is None:
+                    raise TranslationError(
+                        f"function {fname}: struct param {pname!r} ({ctype}) has no matching adjoint arg"
+                    )
+                split_fields = _emit_struct_def(struct_type, unit, _codegen, split_arrays=True)
+            fn.params.append(Param("struct", msl_type(ctype), pname, array_fields=split_fields))
+            for field, elem_ctype in split_fields:
+                # composite key so the body resolves field array references
+                binding = f"{pname}__{field}"
+                array_args[f"{pname}.{field}"] = ArgSpec(binding, "array", elem_ctype)
         else:
             fn.params.append(Param("value", msl_type(ctype), pname))
-            if _classify_ctype(ctype) == "struct":
-                for var in f.adj.args:
-                    if var.label == pname:
-                        _emit_struct_def(var.type, unit, _codegen)
 
-    tr = _BodyTranslator(unit, args_by_var, user_funcs, scope="func")
+    tr = _BodyTranslator(unit, array_args, user_funcs, scope="func")
     section = None
     depth = 0  # emitted-brace depth; 0 → the C++ function's closing brace
     for line in lines[body_start:]:
@@ -930,23 +1218,35 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
     return fn
 
 
-def _emit_struct_def(s, unit: KernelUnit, _codegen) -> None:
-    """Emit an MSL struct definition (warp-native layout) + constructors."""
+def _emit_struct_def(s, unit: KernelUnit, _codegen, split_arrays: bool = False) -> list[tuple[str, str]]:
+    """Emit an MSL struct definition (warp-native layout) + constructors.
+
+    With ``split_arrays`` (parameter context), array-typed fields are excluded
+    from the MSL struct — Metal cannot store device pointers inside a
+    ``constant`` buffer struct — and returned as ``[(field, elem ctype)]`` for
+    per-field buffer binding. Nested struct fields always emit recursively
+    with ``split_arrays=False``: a nested array field has no binding path and
+    fails loud.
+    """
     from ..frontend.codegen import Var as _Var
 
     if s.native_name in unit.structs:
-        return
+        return unit.struct_array_fields.get(s.native_name, [])
     fields: list[tuple[str, str]] = []
-    nested: list = []
+    split: list[tuple[str, str]] = []
     for label, var in s.vars.items():
         ctype = _Var.type_to_ctype(var.type)
         if _RE_ARRAY_T.match(ctype):
-            raise TranslationError(
-                f"struct {s.native_name} field {label!r}: array fields are not supported by the "
-                "M1.3 MSL emitter (fail loud; needed by mesh/narrow-phase paths in M1.4+)"
-            )
+            if not split_arrays:
+                raise TranslationError(
+                    f"struct {s.native_name} field {label!r}: array fields are only supported on "
+                    "kernel/function parameters, where each field gets its own buffer binding "
+                    "(KEP-0001 M1.4); a struct value cannot embed an array"
+                )
+            # record the ELEMENT type (the array_t wrapper becomes a binding)
+            split.append((label, _RE_ARRAY_T.match(ctype).group(1)))
+            continue
         if isinstance(var.type, type(s)):
-            nested.append(var.type)
             _emit_struct_def(var.type, unit, _codegen)
         fields.append((label, msl_type(ctype)))
 
@@ -971,3 +1271,6 @@ def _emit_struct_def(s, unit: KernelUnit, _codegen) -> None:
     unit.structs[s.native_name] = "\n".join(lines)
     # host-side ctypes mirror spec (packed in declaration order, matching MSL)
     unit.struct_fields[s.native_name] = fields
+    if split:
+        unit.struct_array_fields[s.native_name] = split
+    return split

@@ -360,26 +360,53 @@ CORPUS_TABLE = [
     ("newton._src.solvers.xpbd.kernels", "copy_kinematic_body_state_kernel", "copy_kinematic_body_state_kernel"),
     ("newton._src.geometry.contact_reduction_global", "_clear_active_kernel", "clear_active_kernel"),
     ("newton._src.geometry.contact_reduction_global", "_zero_active_count_kernel", "zero_active_count_kernel"),
-    ("newton._src.geometry.contact_reduction_global", "reduce_buffered_contacts_kernel", None),
-    ("newton._src.geometry.contact_reduction_global", "mesh_triangle_contacts_to_reducer_kernel", None),
-    ("newton._src.geometry.narrow_phase", "create_narrow_phase_primitive_kernel.<locals>.narrow_phase_primitive_kernel", None),
-    ("newton._src.geometry.narrow_phase", "create_narrow_phase_kernel_gjk_mpr.<locals>.narrow_phase_kernel_gjk_mpr", None),
-    ("newton._src.geometry.narrow_phase", "_create_find_mesh_triangle_overlaps_kernel.<locals>.narrow_phase_find_mesh_triangle_overlaps_kernel", None),
+    ("newton._src.geometry.contact_reduction_global", "reduce_buffered_contacts_kernel", "reduce_buffered_contacts_kernel"),
+    (
+        "newton._src.geometry.narrow_phase",
+        "narrow_phase_primitive_kernel",
+        "narrow_phase_primitive_kernel",
+        ("create_narrow_phase_primitive_kernel", ["write_contact_simple", False, False, False]),
+    ),
+    ("newton._src.geometry.narrow_phase", "narrow_phase_kernel_gjk_mpr", None),
+    ("newton._src.geometry.narrow_phase", "narrow_phase_find_mesh_triangle_overlaps_kernel", None),
+    ("newton._src.geometry.narrow_phase", "mesh_triangle_contacts_to_reducer_kernel", None),
     ("newton._src.sim.articulation", "eval_articulation_fk", None),
 ]
 
 _GJK_SKIP = "GJK/MPR factory kernel calls @wp.func_native support functions (Metal translation: Phase 2)"
-_STRUCT_SKIP = "kernel takes a struct param with array fields (GlobalContactReducerData) — fail loud in the M1.3 emitter"
 _ARTICULATION_SKIP = "articulation FK needs a joint-model fixture (builder pending)"
+# explicit exemptions for builder-None rows (ratchet: each must stay justified)
+_SKIP_BY_KERNEL = {
+    "narrow_phase_kernel_gjk_mpr": _GJK_SKIP,
+    "narrow_phase_find_mesh_triangle_overlaps_kernel": _GJK_SKIP,
+    "mesh_triangle_contacts_to_reducer_kernel": _GJK_SKIP,
+    "eval_articulation_fk": _ARTICULATION_SKIP,
+}
 _DEFAULT_SEED = 20261113
 CORPUS_NPZ = Path(__file__).resolve().parent / "corpus_golden.npz"
+
+
+def _resolve_kernel(mod, qualname, factory):
+    """Module-level kernel by qualname, or a factory-built kernel.
+
+    Factory rows carry ``(factory_name, [args])``; string args resolve as
+    module attributes (e.g. the writer @wp.func), everything else passes
+    verbatim. The factory is called under each side's own warp package so
+    both sides build the identical kernel object.
+    """
+    if factory is None:
+        return getattr(mod, qualname)
+    fname, fargs = factory
+    fn = getattr(mod, fname)
+    args = [getattr(mod, a) if isinstance(a, str) else a for a in fargs]
+    return fn(*args)
 
 
 def _corpus_dtype(pkg, key: str):
     """Element dtype object for a corpus dtype key, per side's wp package."""
     return {
-        "f32": pkg.float32, "i32": pkg.int32, "u32": pkg.uint32, "u64": pkg.uint64,
-        "bool": pkg.bool, "vec3": pkg.vec3, "vec4": pkg.vec4, "vec2i": pkg.vec2i,
+        "f32": pkg.float32, "i32": pkg.int32, "i64": pkg.int64, "u32": pkg.uint32, "u64": pkg.uint64,
+        "bool": pkg.bool, "vec2": pkg.vec2, "vec3": pkg.vec3, "vec4": pkg.vec4, "vec2i": pkg.vec2i,
         "vec3i": pkg.vec3i, "vec4i": pkg.vec4i, "mat33": pkg.mat33,
         "transform": pkg.transform, "spatial_vector": pkg.spatial_vector,
     }[key]
@@ -405,13 +432,45 @@ def _arr_view(arr):
     v = getattr(arr, "numpy_view", None)
     return v() if v is not None else arr.numpy()
 
-def _pack_args(pkg, args, device="cpu"):
+def _alloc_array(pkg, key, val, device="cpu"):
+    """Allocate + fill a WarpArray for an arr:/arr2:/out:/out2: builder key."""
+    if key.startswith(("arr:", "io:")):
+        off = 4 if key.startswith("arr:") else 3
+        elem = _corpus_dtype(pkg, key[off:])
+        arr = pkg.zeros(int(val.shape[0]), dtype=elem, device=device)
+        view = _arr_view(arr)
+        view[:] = val.reshape(view.shape)
+        return arr
+    if key.startswith("arr2:"):
+        elem = _corpus_dtype(pkg, key[5:])
+        arr = pkg.zeros(val.shape, dtype=elem, device=device)
+        view = _arr_view(arr)
+        view[:] = val.reshape(view.shape)
+        return arr
+    if key.startswith("out2:"):
+        elem = _corpus_dtype(pkg, key[5:])
+        out_arr = pkg.zeros(val, dtype=elem, device=device)
+        return out_arr
+    if key.startswith("out:"):
+        elem = _corpus_dtype(pkg, key[4:])
+        shape = val if isinstance(val, tuple) else int(val)
+        out_arr = pkg.zeros(shape, dtype=elem, device=device)
+        return out_arr
+    raise ValueError(f"bad array dtype key {key!r}")
+
+
+def _pack_args(pkg, args, device="cpu", mod=None):
     """(launch_args, dim, out_arrays, out_names) from builder triples.
 
     Every argument is passed through ``inputs`` in signature order (upstream
     warp treats ``outputs`` as pure convenience — Newton's own call sites
     pass output arrays via ``inputs`` too). ``out_arrays``/``out_names``
     capture the buffers to compare after the launch.
+
+    ``mod`` is the kernel's module (needed to resolve ``struct:<ClassName>``
+    annotations); struct values are ``{field: (key, val)}`` dicts using the
+    same keys, with ``out:``-prefixed fields registered for comparison as
+    ``"<arg>.<field>"``.
     """
     import numpy as np
 
@@ -420,31 +479,30 @@ def _pack_args(pkg, args, device="cpu"):
     for name, key, val in args:
         if name == "__dim__":
             continue
-        if key.startswith("arr:") or key.startswith("io:"):
-            off = 4 if key.startswith("arr:") else 3
-            elem = _corpus_dtype(pkg, key[off:])
-            arr = pkg.zeros(int(val.shape[0]), dtype=elem, device=device)
-            view = _arr_view(arr)
-            view[:] = val.reshape(view.shape)
+        if key.startswith("struct:"):
+            cls = getattr(mod, key[7:])
+            inst = cls()
+            for fname, (fkey, fval) in val.items():
+                if fkey.startswith("scalar:"):
+                    setattr(inst, fname, bool(fval) if fkey[7:] == "bool" else fval)
+                elif fkey.startswith("value:"):
+                    t = pkg.transform()
+                    for i, v in enumerate(np.asarray(fval, dtype=np.float32).ravel()):
+                        t[i] = v
+                    setattr(inst, fname, t)
+                else:
+                    farr = _alloc_array(pkg, fkey, fval, device)
+                    setattr(inst, fname, farr)
+                    if fkey.startswith("out"):
+                        out_arrays.append(farr)
+                        out_names.append(f"{name}.{fname}")
+            launch_args.append(inst)
+        elif key.startswith("arr:") or key.startswith("io:") or key.startswith(("arr2:", "out2:", "out:")):
+            arr = _alloc_array(pkg, key, val, device)
             launch_args.append(arr)
-        elif key.startswith("arr2:"):
-            elem = _corpus_dtype(pkg, key[5:])
-            arr = pkg.zeros(val.shape, dtype=elem, device=device)
-            view = _arr_view(arr)
-            view[:] = val.reshape(view.shape)
-            launch_args.append(arr)
-        elif key.startswith("out2:"):
-            elem = _corpus_dtype(pkg, key[5:])
-            out_arr = pkg.zeros(val, dtype=elem, device=device)
-            launch_args.append(out_arr)
-            out_arrays.append(out_arr)
-            out_names.append(name)
-        elif key.startswith("out:"):
-            elem = _corpus_dtype(pkg, key[4:])
-            out_arr = pkg.zeros(int(val), dtype=elem, device=device)
-            launch_args.append(out_arr)
-            out_arrays.append(out_arr)
-            out_names.append(name)
+            if key.startswith("out"):
+                out_arrays.append(arr)
+                out_names.append(name)
         elif key.startswith("scalar:"):
             launch_args.append(bool(val) if key[7:] == "bool" else val)
         elif key.startswith("value:"):
@@ -479,20 +537,20 @@ def run_corpus_golden(out_npz: Path) -> dict:
 
     meta = {}
     payload = {}
-    for module, qualname, builder in CORPUS_TABLE:
+    for row in CORPUS_TABLE:
+        module, qualname, builder, *rest = row
+        factory = rest[0] if rest else None
         entry = f"{module}.{qualname}"
         if builder is None:
-            reason = (_GJK_SKIP if "<locals>" in qualname else
-                      (_STRUCT_SKIP if "contact" in qualname else _ARTICULATION_SKIP))
-            meta[entry] = {"skip": reason}
+            meta[entry] = {"skip": _SKIP_BY_KERNEL[qualname]}
             continue
         args, skips = cb.BUILDERS[builder](np.random.default_rng(_DEFAULT_SEED))
         if skips:
             meta[entry] = {"skip": "; ".join(skips)}
             continue
         mod = importlib.import_module(module)
-        kern = getattr(mod, qualname)
-        launch_args, dim, out_arrays, out_names = _pack_args(wp, args)
+        kern = _resolve_kernel(mod, qualname, factory)
+        launch_args, dim, out_arrays, out_names = _pack_args(wp, args, device="cpu", mod=mod)
         wp.launch(kern, dim, inputs=launch_args, outputs=[], device="cpu")
         wp.synchronize()
         for i, name in enumerate(out_names):
@@ -542,7 +600,9 @@ def run_corpus(golden_npz: Path) -> str:
     import corpus_builders as cb
 
     passed, failed, skipped = [], [], []
-    for module, qualname, builder in CORPUS_TABLE:
+    for row in CORPUS_TABLE:
+        module, qualname, builder, *rest = row
+        factory = rest[0] if rest else None
         entry = f"{module}.{qualname}"
         short = qualname.split(".")[-1]
         m = meta.get(entry, {})
@@ -552,8 +612,8 @@ def run_corpus(golden_npz: Path) -> str:
         args, _skips = cb.BUILDERS[builder](np.random.default_rng(_DEFAULT_SEED))
         try:
             mod = importlib.import_module(module)
-            kern = getattr(mod, qualname)
-            launch_args, dim, out_arrays, out_names = _pack_args(wp, args, device="metal")
+            kern = _resolve_kernel(mod, qualname, factory)
+            launch_args, dim, out_arrays, out_names = _pack_args(wp, args, device="metal", mod=mod)
             wp.launch(kern, dim, inputs=launch_args, outputs=[], device="metal")
             wp.synchronize()
             ok, detail = True, []

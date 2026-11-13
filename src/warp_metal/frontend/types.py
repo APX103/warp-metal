@@ -5779,6 +5779,18 @@ _ARRAY_ANNOTATION_MAP = {
 # Registered classes are retained by array_types. Compare identities without invoking
 # application metaclass hashing or equality; this is not a cache of user classes.
 _ARRAY_FAMILY_IDS = frozenset(id(cls) for cls in array_types)
+
+# warp-metal runtime arrays (warp_metal.runtime.host.WarpArray, MTLBuffer-backed)
+# are the native wp.array family at launch time: the vendored frontend `array`
+# class itself is not constructible on Metal (device allocators are a Phase 2
+# surface). Registered by runtime.host so family resolution (struct field
+# checks, launch arg normalization) treats runtime instances as `array`.
+_RUNTIME_ARRAY_FAMILY: dict[int, type] = {}
+
+
+def register_runtime_array_family(cls: type, family: type) -> None:
+    """Teach family resolution that instances of ``cls`` are ``family`` arrays."""
+    _RUNTIME_ARRAY_FAMILY[id(cls)] = family
 _ARRAY_CTYPE_MAP = {
     array: array_t,
     indexedarray: indexedarray_t,
@@ -5798,6 +5810,10 @@ def _resolve_array_family(value) -> type | None:
     cls = type(value)
     if id(cls) in _ARRAY_FAMILY_IDS:
         return cls
+
+    fam = _RUNTIME_ARRAY_FAMILY.get(id(cls))
+    if fam is not None:
+        return fam
 
     # Most inputs are regular arrays or unrelated objects, requiring no MRO scan.
     if not issubclass(cls, (indexedarray, fabricarray, indexedfabricarray, fixedarray, _ArrayAnnotationBase)):
