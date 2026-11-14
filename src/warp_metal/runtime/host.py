@@ -11,7 +11,10 @@ Built on the M0.4 prototype:
   - array constructors with upstream signatures (shape tuple, device kwarg),
     ``*_like`` variants, ``copy``/``clone``/``from_numpy``
   - ``launch`` with the upstream signature (adjoint kwargs fail loudly)
-  - capture passthrough (``capture_begin``/``capture_end``/``capture_launch``)
+  - graph capture (``capture_begin``/``capture_end``/``capture_launch``):
+    launches inside a capture are recorded, not executed; ``capture_launch``
+    replays the records in order, batching consecutive kernel records into
+    one Metal command buffer per run
   - ``init``/``synchronize``/device module
 
 Arrays live in unified memory regardless of the allocating device, so a
@@ -1631,8 +1634,10 @@ def launch(
 
 
 # ---------------------------------------------------------------------------
-# capture passthrough (KEP-0001: MVP 直通 — dispatch is synchronous, so
-# "captured" kernels run immediately; the returned graph is an empty record)
+# graph capture (record/replay): ops inside capture_begin..capture_end are
+# appended to a record list instead of executing; capture_launch re-executes
+# the records in order, batching consecutive kernel records into one command
+# buffer per run
 # ---------------------------------------------------------------------------
 
 
@@ -1730,13 +1735,21 @@ class ScopedTimer:
 class ScopedCapture:
     """Context manager mirroring upstream: ``with wp.ScopedCapture() as c:``.
 
-    Passthrough (KEP-0001 MVP): the captured launches run immediately and
-    ``capture.graph`` is an empty record; ``capture_launch`` replays nothing.
+    Record/replay (upstream CUDA graph semantics; KEP-0001 M2.5). Kernel
+    launches, ``zero_``/``fill_``, ``wp.copy``/``clone`` and CPU-fallback
+    launches inside the block are appended to ``c.graph`` in order and are
+    NOT executed here (deferred until replay, like a CUDA capture).
+    ``wp.capture_launch(c.graph)`` executes the records: consecutive kernel
+    records replay through one Metal command buffer (single commit + watchdog
+    wait per run); fill/copy/fallback records are host ops that split the
+    batch. One documented divergence from upstream: a fill also writes its
+    array immediately at record time (shared storage makes that harmless, and
+    replay re-runs it in order).
     """
 
     def __init__(self, device=None, stream=None, force_module_load=False, **kwargs):
         if kwargs:
-            raise RuntimeError(f"ScopedCapture does not support {sorted(kwargs)} (KEP-0001 passthrough capture)")
+            raise RuntimeError(f"ScopedCapture does not support {sorted(kwargs)} (KEP-0001 record/replay capture)")
         self.device = device
         self.stream = stream
         self.force_module_load = force_module_load
@@ -1793,13 +1806,57 @@ def capture_end(device=None, stream=None) -> Graph:
     return graph
 
 
+def _batching_enabled() -> bool:
+    """``WARP_METAL_BATCH=0`` replays record-by-record (one commit+wait per
+    dispatch, the pre-batching path) for fault triage; any other value — or
+    unset — batches consecutive kernel records into one command buffer."""
+    return os.environ.get("WARP_METAL_BATCH", "") != "0"
+
+
+def _replay_batch(batch, base_index: int, total: int) -> None:
+    """Replay one run of consecutive kernel records through a single command
+    buffer (``wmm_dispatch_batch``). On native failure, extend the error with
+    the graph-record range the run covered (the native message already
+    reports the batch size and points at record-by-record replay for
+    isolation)."""
+    try:
+        _mm.dispatch_batch(batch)
+    except _mm.MetalError as e:
+        raise _mm.MetalError(
+            f"{e} [batched run covered graph records {base_index}.."
+            f"{base_index + len(batch) - 1} of {total}]"
+        ) from None
+
+
 def capture_launch(graph, stream=None):
-    """Replay a captured graph: re-dispatch every recorded operation in
-    order (synchronous, like the original launches)."""
+    """Replay a captured graph: execute every recorded operation in order.
+
+    Consecutive ``"metal"`` records replay through one command buffer (single
+    commit + watchdog wait per run — this is what gives a captured Newton
+    step its one-commit replay). ``fill``/``copy``/``fallback`` records are
+    host operations: they split the batch, applying their host side effects
+    between batch waits so record order is preserved exactly.
+    ``WARP_METAL_BATCH=0`` replays record-by-record (one commit+wait per
+    dispatch, the pre-batching path) for fault triage.
+    """
     if isinstance(graph, Graph):
-        for record in getattr(graph, "_records", []):
+        records = getattr(graph, "_records", [])
+        batch: list = []
+        batch_base = 0
+        for index, record in enumerate(records):
             kind = record[0]
+            if kind == "metal" and _batching_enabled():
+                _, pso, handles, threads, block_dim, _owned, _refs, tiled = record
+                # native record: (pso, handles, threads, tg, require_tg) —
+                # plain launches keep the auto threadgroup size (tg 0), tiled
+                # launches pin block_dim and require it exactly
+                batch.append((pso, handles, threads, block_dim if tiled else 0, 1 if tiled else 0))
+                continue
+            if batch:
+                _replay_batch(batch, batch_base, len(records))
+                batch = []
             if kind == "metal":
+                # escape hatch: the pre-batching path, one commit+wait per record
                 _, pso, handles, threads, block_dim, _owned, _refs, tiled = record
                 if tiled:
                     _mm.dispatch_tiled(pso, handles, threads, block_dim)
@@ -1817,6 +1874,9 @@ def capture_launch(graph, stream=None):
                 fb(kernel, dim, merged)
             else:
                 raise RuntimeError(f"capture_launch: unknown record kind {kind!r}")
+            batch_base = index + 1
+        if batch:
+            _replay_batch(batch, batch_base, len(records))
         return
     raise RuntimeError(f"capture_launch: cannot replay {type(graph).__name__}")
 

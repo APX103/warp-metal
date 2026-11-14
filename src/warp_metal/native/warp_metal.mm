@@ -9,8 +9,9 @@
 //   - MTLBuffer allocation with storageModeShared (unified memory, CPU-side
 //     numpy views are plain pointers into the buffer)
 //   - runtime MSL -> MTLLibrary compilation, PSO cache is Python-side
-//   - single synchronous compute dispatch (batched command buffers land in
-//     M2.5; every dispatch here commits and waits)
+//   - synchronous compute dispatch: eager launches commit and wait per
+//     kernel; capture replay (M2.5) batches consecutive records into one
+//     command buffer via wmm_dispatch_batch
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -211,29 +212,60 @@ uint64_t wmm_pso_max_threads_per_group(void *pso_handle) {
     return pso.maxTotalThreadsPerThreadgroup;
 }
 
-// ---- dispatch (synchronous single kernel; batched commit is M2.5) ----
+// ---- dispatch (synchronous; batched capture replay below) ----
 
 // Watchdog window for the completion wait, in seconds, read on EVERY
-// dispatch so tests can tune it via the environment. Default 120 s;
-// WARP_METAL_DISPATCH_TIMEOUT_S overrides (0 disables the watchdog and
-// restores the unbounded waitUntilCompleted). Without this bound a faulted
-// dispatch (out-of-bounds device access etc.) hangs the host forever inside
-// waitUntilCompleted — a fast, named failure is far more actionable.
-static double _dispatch_timeout_seconds(void) {
+// dispatch so tests can tune it via the environment. Default 120 s per
+// record — a batch of n records gets 120*n so each record keeps its
+// unbatched watchdog budget. WARP_METAL_DISPATCH_TIMEOUT_S overrides
+// absolutely (0 disables the watchdog and restores the unbounded
+// waitUntilCompleted). Without this bound a faulted dispatch (out-of-bounds
+// device access etc.) hangs the host forever inside waitUntilCompleted —
+// a fast, named failure is far more actionable.
+static double _dispatch_timeout_seconds(uint32_t n_records) {
     const char *s = getenv("WARP_METAL_DISPATCH_TIMEOUT_S");
     if (s && *s) {
         char *end = NULL;
         double v = strtod(s, &end);
         if (end != s && v >= 0.0) return v;
     }
-    return 120.0;
+    return 120.0 * n_records;
 }
 
-// Encode, commit, and wait bounded by the watchdog. Shared by every dispatch
-// entry point. tg_x == 0 → threadgroup size auto (PSO max, clamped to the
-// grid); tg_x > 0 → exact threadgroup size (tiled launches and plain-launch
-// block_dim scheduling hints), validated against the PSO limit. require_tg
-// selects the tiled entry point's strict validation (0 is an error there).
+// Encode one dispatch section: pipeline state, buffer bindings, threadgroup
+// sizing, grid. Shared by every dispatch entry point (the batched replay
+// path loops this per record onto one encoder instead of duplicating the
+// binding code). Does NOT end the encoding — the caller owns the encoder
+// lifecycle and ends it once, after its last section. tg_x == 0 →
+// threadgroup size auto (PSO max, clamped to the grid); tg_x > 0 → exact
+// threadgroup size (tiled launches and plain-launch block_dim scheduling
+// hints), validated against the PSO limit by the caller.
+static void _encode_section(id<MTLComputeCommandEncoder> enc,
+                            id<MTLComputePipelineState> pso,
+                            void **buffer_handles, uint32_t n_buffers,
+                            uint32_t threads_x, uint32_t tg_x) {
+    [enc setComputePipelineState:pso];
+
+    for (uint32_t i = 0; i < n_buffers; i++) {
+        id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer_handles[i];
+        [enc setBuffer:buf offset:0 atIndex:i];
+    }
+
+    NSUInteger tg = tg_x;
+    if (tg == 0) {
+        // 1-D dispatch; threadgroup size clamped to PSO limit and grid
+        tg = pso.maxTotalThreadsPerThreadgroup;
+        if (tg > threads_x) tg = threads_x;
+    }
+    MTLSize grid = MTLSizeMake(threads_x, 1, 1);
+    MTLSize tgs = MTLSizeMake(tg, 1, 1);
+    [enc dispatchThreads:grid threadsPerThreadgroup:tgs];
+}
+
+// Encode, commit, and wait bounded by the watchdog. Single-record entry
+// point (eager launches; also the WARP_METAL_BATCH=0 replay path).
+// require_tg selects the tiled entry point's strict validation (0 is an
+// error there).
 static int _dispatch_sync(void *pso_handle, void **buffer_handles, uint32_t n_buffers,
                           uint32_t threads_x, uint32_t tg_x, const char *api, bool require_tg) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
@@ -256,7 +288,7 @@ static int _dispatch_sync(void *pso_handle, void **buffer_handles, uint32_t n_bu
     // Completion handler must be attached BEFORE commit; it gives a
     // deadline-bounded wait without polling latency (waitUntilCompleted
     // has no timeout form).
-    double timeout = _dispatch_timeout_seconds();
+    double timeout = _dispatch_timeout_seconds(1);
     dispatch_semaphore_t done = nil;
     if (timeout > 0.0) {
         done = dispatch_semaphore_create(0);
@@ -267,22 +299,7 @@ static int _dispatch_sync(void *pso_handle, void **buffer_handles, uint32_t n_bu
 
     _residency_use(cb);
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-
-    for (uint32_t i = 0; i < n_buffers; i++) {
-        id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer_handles[i];
-        [enc setBuffer:buf offset:0 atIndex:i];
-    }
-
-    NSUInteger tg = tg_x;
-    if (tg == 0) {
-        // 1-D dispatch; threadgroup size clamped to PSO limit and grid
-        tg = pso.maxTotalThreadsPerThreadgroup;
-        if (tg > threads_x) tg = threads_x;
-    }
-    MTLSize grid = MTLSizeMake(threads_x, 1, 1);
-    MTLSize tgs = MTLSizeMake(tg, 1, 1);
-    [enc dispatchThreads:grid threadsPerThreadgroup:tgs];
+    _encode_section(enc, pso, buffer_handles, n_buffers, threads_x, tg_x);
     [enc endEncoding];
 
     [cb commit];
@@ -301,6 +318,11 @@ static int _dispatch_sync(void *pso_handle, void **buffer_handles, uint32_t n_bu
                         api, timeout, (long)cb.status]);
             return -4;
         }
+    } else {
+        // watchdog disabled: the documented unbounded waitUntilCompleted
+        // (without a wait, the status check below would race the in-flight
+        // command buffer and report "command buffer failed" for healthy work)
+        [cb waitUntilCompleted];
     }
     if (cb.status != MTLCommandBufferStatusCompleted || cb.error) {
         _set_error(cb.error.localizedDescription ?: @"command buffer failed");
@@ -323,9 +345,116 @@ int wmm_dispatch_tiled(void *pso_handle, void **buffer_handles, uint32_t n_buffe
                           "dispatch_tiled", true);
 }
 
+// Batched dispatch (M2.5 capture replay): one command queue and one command
+// buffer for a whole run of recorded kernels. Record r encodes one compute
+// section over buffer_handles[offset..offset+record_buffer_counts[r])
+// (offset = running sum of the counts) with threads_x[r] threads; Metal
+// executes the sections of a single command buffer in encode order, so
+// record i observes record i-1's writes exactly like the per-dispatch path.
+// Record sizes and threadgroup limits are pre-flighted before the first
+// encode, so those failures still name their record index. Once committed,
+// per-kernel attribution inside one command buffer is impossible — failures
+// report the batch size and record range and point at record-by-record
+// replay (WARP_METAL_BATCH=0 on the Python side) for isolation. One watchdog
+// wait bounds the whole batch; after it returns, shared-storage host reads
+// are exact.
+int wmm_dispatch_batch(void **pso_handles, void **buffer_handles,
+                       uint32_t *record_buffer_counts, uint32_t *threads_x,
+                       uint32_t *tg_x, uint8_t *require_tg, uint32_t n_records) {
+    if (n_records == 0) return 0;
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    if (!dev) {
+        _set_error(@"dispatch_batch: no Metal device");
+        return -1;
+    }
+
+    // pre-flight every record: a bad record fails here, attributed to its
+    // index, before anything encodes or executes
+    for (uint32_t r = 0; r < n_records; r++) {
+        id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pso_handles[r];
+        if (!pso) {
+            _set_error([NSString stringWithFormat:
+                        @"dispatch_batch: record %u/%u: missing pso", r, n_records]);
+            return -1;
+        }
+        if (tg_x[r] > pso.maxTotalThreadsPerThreadgroup || (require_tg[r] && tg_x[r] == 0)) {
+            _set_error([NSString stringWithFormat:
+                        @"dispatch_batch: record %u/%u: block_dim %u exceeds the PSO "
+                        @"threadgroup limit %lu%s",
+                        r, n_records, tg_x[r],
+                        (unsigned long)pso.maxTotalThreadsPerThreadgroup,
+                        require_tg[r] ? "" : " (threadgroup sizes above the limit are invalid)"]);
+            return -3;
+        }
+    }
+
+    id<MTLCommandQueue> queue = [dev newCommandQueue];
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+
+    // Completion handler must be attached BEFORE commit; one completion
+    // handler + watchdog for the whole batch (the default window scales with
+    // the record count — see _dispatch_timeout_seconds).
+    double timeout = _dispatch_timeout_seconds(n_records);
+    dispatch_semaphore_t done = nil;
+    if (timeout > 0.0) {
+        done = dispatch_semaphore_create(0);
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> _completed) {
+            dispatch_semaphore_signal(done);
+        }];
+    }
+
+    _residency_use(cb);
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    uint64_t offset = 0;
+    for (uint32_t r = 0; r < n_records; r++) {
+        id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pso_handles[r];
+        _encode_section(enc, pso, buffer_handles + offset, record_buffer_counts[r],
+                        threads_x[r], tg_x[r]);
+        offset += record_buffer_counts[r];
+    }
+    [enc endEncoding];
+
+    [cb commit];
+    if (done != nil) {
+        long waited = dispatch_semaphore_wait(
+            done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
+        if (waited != 0) {
+            // Deadline hit while the batch is still in flight — it keeps
+            // running in the background (later dispatches use a fresh
+            // command queue), but the host fails loud instead of hanging.
+            _set_error([NSString stringWithFormat:
+                        @"dispatch_batch: %u record(s) (indices 0..%u) did not complete "
+                        "within %.1f s (watchdog scales with the batch; set "
+                        "WARP_METAL_DISPATCH_TIMEOUT_S to pin it, 0 disables). Command-buffer "
+                        "status %ld, no error reported yet — the GPU likely faulted "
+                        "(out-of-bounds device access) or a kernel never terminates. "
+                        "Per-record attribution inside one command buffer is impossible; "
+                        "replay with WARP_METAL_BATCH=0 to isolate the faulting record.",
+                        n_records, n_records - 1, timeout, (long)cb.status]);
+            return -4;
+        }
+    } else {
+        // watchdog disabled: the documented unbounded waitUntilCompleted
+        // (without a wait, the status check below would race the in-flight
+        // command buffer and report "command buffer failed" for healthy work)
+        [cb waitUntilCompleted];
+    }
+    if (cb.status != MTLCommandBufferStatusCompleted || cb.error) {
+        _set_error([NSString stringWithFormat:
+                    @"dispatch_batch: batch of %u record(s) (indices 0..%u) failed: %@ "
+                    "(command-buffer status %ld; per-record attribution inside one command "
+                    "buffer is impossible — replay with WARP_METAL_BATCH=0 to isolate the "
+                    "faulting record)",
+                    n_records, n_records - 1,
+                    cb.error.localizedDescription ?: @"no error reported", (long)cb.status]);
+        return -2;
+    }
+    return 0;
+}
+
 void wmm_synchronize(void) {
-    // every dispatch above already waits; kept as the future batch-commit sync
-    // point (M2.5)
+    // every dispatch path above already commits and waits; batched capture
+    // replay syncs through the same per-batch wait (wmm_dispatch_batch)
 }
 
 #ifdef __cplusplus

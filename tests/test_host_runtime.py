@@ -11,6 +11,7 @@ so the vendored Adjoint can extract source.
 """
 
 import ctypes
+import os
 import unittest
 
 import numpy as np
@@ -27,6 +28,36 @@ def _twice(x: wp.float32) -> wp.float32:
 def _scale_kernel(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
     i = wp.tid()
     out[i] = _twice(a[i]) * 2.0
+
+
+@wp.kernel
+def _chain_add1(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    i = wp.tid()
+    out[i] = a[i] + 1.0
+
+
+@wp.kernel
+def _chain_mul2(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    i = wp.tid()
+    out[i] = a[i] * 2.0
+
+
+@wp.kernel
+def _chain_add2(
+    a: wp.array(dtype=wp.float32),
+    b: wp.array(dtype=wp.float32),
+    out: wp.array(dtype=wp.float32),
+):
+    i = wp.tid()
+    out[i] = a[i] + b[i]
+
+
+@wp.kernel
+def _tiled_fill(out: wp.array(dtype=wp.float32)):
+    # launch_tiled: scalar tid is the block index; every lane of block i
+    # writes the same value to cell i (unique-cell, race-free by value)
+    i = wp.tid()
+    out[i] = wp.float(i) + 1.0
 
 
 @wp.struct
@@ -288,6 +319,128 @@ class TestCapturePassthrough(unittest.TestCase):
     def test_capture_launch_rejects_foreign(self):
         with self.assertRaises(RuntimeError):
             wp.capture_launch(object())
+
+
+class TestCaptureReplay(unittest.TestCase):
+    """M2.5 batched replay: a recorded graph replays equivalent to eager
+    execution, ordering preserved across mixed kernel/fill/copy records, and
+    WARP_METAL_BATCH=0 (record-by-record) agrees with the batched path."""
+
+    N = 6
+
+    def test_dependency_chain_replay_matches_eager(self):
+        # k1 -> k2 -> k3 (k3 consumes both intermediates): the replay must
+        # produce the same buffers an eager execution of the same kernels does
+        x_np = np.arange(1, self.N + 1, dtype=np.float32)
+
+        # eager reference on separate buffers
+        ex = wp.from_numpy(x_np.copy(), device="metal")
+        et1 = wp.zeros(self.N, dtype=wp.float32, device="metal")
+        et2 = wp.zeros(self.N, dtype=wp.float32, device="metal")
+        eout = wp.zeros(self.N, dtype=wp.float32, device="metal")
+        wp.launch(_chain_add1, self.N, inputs=[ex, et1], device="metal")
+        wp.launch(_chain_mul2, self.N, inputs=[et1, et2], device="metal")
+        wp.launch(_chain_add2, self.N, inputs=[et1, et2, eout], device="metal")
+
+        # captured: same kernels, fresh buffers, deferred execution
+        cx = wp.from_numpy(x_np.copy(), device="metal")
+        ct1 = wp.zeros(self.N, dtype=wp.float32, device="metal")
+        ct2 = wp.zeros(self.N, dtype=wp.float32, device="metal")
+        cout = wp.zeros(self.N, dtype=wp.float32, device="metal")
+        with wp.ScopedCapture() as c:
+            wp.launch(_chain_add1, self.N, inputs=[cx, ct1], device="metal")
+            wp.launch(_chain_mul2, self.N, inputs=[ct1, ct2], device="metal")
+            wp.launch(_chain_add2, self.N, inputs=[ct1, ct2, cout], device="metal")
+        self.assertIsInstance(c.graph, wp.Graph)
+        self.assertEqual(c.graph.n_ops, 3)
+        # deferred: nothing executed at record time
+        np.testing.assert_array_equal(ct1.numpy_view(), np.zeros(self.N, dtype=np.float32))
+        wp.capture_launch(c.graph)
+        np.testing.assert_allclose(ct1.numpy_view(), x_np + 1.0, rtol=0, atol=1e-6)
+        np.testing.assert_allclose(ct2.numpy_view(), 2.0 * (x_np + 1.0), rtol=0, atol=1e-6)
+        np.testing.assert_allclose(cout.numpy_view(), 3.0 * x_np + 3.0, rtol=0, atol=1e-6)
+        # replay equals eager, buffer for buffer
+        np.testing.assert_allclose(ct1.numpy_view(), et1.numpy_view(), rtol=0, atol=0)
+        np.testing.assert_allclose(ct2.numpy_view(), et2.numpy_view(), rtol=0, atol=0)
+        np.testing.assert_allclose(cout.numpy_view(), eout.numpy_view(), rtol=0, atol=0)
+
+    def test_mixed_graph_replay_order(self):
+        # launch + copy + fill interleaved: replay order is discriminating —
+        # dst reads mid BEFORE the fill (else dst would be 0) and out is
+        # launched AFTER the fill (else out would be 2r+1)
+        r_np = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)
+        r = wp.from_numpy(r_np.copy(), device="metal")
+        mid = wp.zeros(5, dtype=wp.float32, device="metal")
+        dst = wp.zeros(5, dtype=wp.float32, device="metal")
+        out = wp.zeros(5, dtype=wp.float32, device="metal")
+        with wp.ScopedCapture() as c:
+            wp.launch(_chain_mul2, 5, inputs=[r, mid], device="metal")  # mid = 2r
+            wp.copy(dst, mid)  # dst = 2r (recorded, runs at replay)
+            mid.zero_()  # mid = 0 (record-time host write + replayed)
+            wp.launch(_chain_add1, 5, inputs=[mid, out], device="metal")  # out = 1s
+        self.assertEqual(c.graph.n_ops, 4)
+        # record-time semantics: fills write immediately, copies do not
+        np.testing.assert_array_equal(mid.numpy_view(), np.zeros(5, dtype=np.float32))
+        np.testing.assert_array_equal(dst.numpy_view(), np.zeros(5, dtype=np.float32))
+        np.testing.assert_array_equal(out.numpy_view(), np.zeros(5, dtype=np.float32))
+        wp.capture_launch(c.graph)
+        np.testing.assert_allclose(dst.numpy_view(), 2.0 * r_np, rtol=0, atol=1e-6)
+        np.testing.assert_allclose(mid.numpy_view(), np.zeros(5, dtype=np.float32), rtol=0, atol=0)
+        np.testing.assert_allclose(out.numpy_view(), np.ones(5, dtype=np.float32), rtol=0, atol=1e-6)
+
+    def test_batched_vs_unbatched_identical(self):
+        # one graph mixing plain kernel records, a tiled record (exact
+        # threadgroup size) and nothing else; replayed once batched (default)
+        # and once with WARP_METAL_BATCH=0 — results must be identical
+        def run(env_value):
+            old = os.environ.get("WARP_METAL_BATCH")
+            os.environ["WARP_METAL_BATCH"] = env_value
+            try:
+                x = wp.from_numpy(np.arange(1, self.N + 1, dtype=np.float32), device="metal")
+                t1 = wp.zeros(self.N, dtype=wp.float32, device="metal")
+                t2 = wp.zeros(self.N, dtype=wp.float32, device="metal")
+                t3 = wp.zeros(2, dtype=wp.float32, device="metal")
+                out = wp.zeros(self.N, dtype=wp.float32, device="metal")
+                with wp.ScopedCapture() as c:
+                    wp.launch(_chain_add1, self.N, inputs=[x, t1], device="metal")
+                    wp.launch(_chain_mul2, self.N, inputs=[t1, t2], device="metal")
+                    wp.launch_tiled(_tiled_fill, dim=2, inputs=[t3], block_dim=32, device="metal")
+                    wp.launch(_chain_add2, self.N, inputs=[t1, t2, out], device="metal")
+                self.assertEqual(c.graph.n_ops, 4)
+                wp.capture_launch(c.graph)
+                return (
+                    t1.numpy.copy(),
+                    t2.numpy.copy(),
+                    t3.numpy.copy(),
+                    out.numpy.copy(),
+                )
+            finally:
+                if old is None:
+                    os.environ.pop("WARP_METAL_BATCH", None)
+                else:
+                    os.environ["WARP_METAL_BATCH"] = old
+
+        batched = run("1")
+        unbatched = run("0")
+        x_np = np.arange(1, self.N + 1, dtype=np.float32)
+        expected = (
+            x_np + 1.0,
+            2.0 * (x_np + 1.0),
+            np.array([1.0, 2.0], dtype=np.float32),
+            3.0 * x_np + 3.0,
+        )
+        for got, want in zip(batched, expected):
+            np.testing.assert_allclose(got, want, rtol=0, atol=1e-6)
+        for b, u in zip(batched, unbatched):
+            np.testing.assert_array_equal(b, u)
+
+    def test_zero_record_capture_replays_as_noop(self):
+        # ScopedCapture form of the empty-graph contract (the raw
+        # begin/end/no-op variant lives in TestCapturePassthrough)
+        with wp.ScopedCapture() as c:
+            pass
+        self.assertEqual(c.graph.n_ops, 0)
+        wp.capture_launch(c.graph)  # honest no-op
 
 
 class TestModuleHub(unittest.TestCase):

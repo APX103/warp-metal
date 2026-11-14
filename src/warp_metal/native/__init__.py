@@ -75,6 +75,16 @@ def _load() -> ctypes.CDLL:
                     ctypes.c_uint32,
                     ctypes.c_uint32,
                 ]
+                lib.wmm_dispatch_batch.restype = ctypes.c_int
+                lib.wmm_dispatch_batch.argtypes = [
+                    ctypes.POINTER(ctypes.c_void_p),  # per-record PSO handles
+                    ctypes.POINTER(ctypes.c_void_p),  # flattened buffer handles
+                    ctypes.POINTER(ctypes.c_uint32),  # per-record buffer counts
+                    ctypes.POINTER(ctypes.c_uint32),  # per-record thread counts
+                    ctypes.POINTER(ctypes.c_uint32),  # per-record threadgroup sizes (0 = auto)
+                    ctypes.POINTER(ctypes.c_uint8),   # per-record exact-tg-required flags (tiled)
+                    ctypes.c_uint32,                  # record count
+                ]
                 lib.wmm_synchronize.restype = None
                 lib.wmm_synchronize.argtypes = []
                 _LIB = lib
@@ -168,6 +178,35 @@ def dispatch_tiled(pso_handle, buffer_handles, threads_x: int, tg_x: int) -> Non
     Same watchdog-bounded completion wait as :func:`dispatch`."""
     arr = (ctypes.c_void_p * len(buffer_handles))(*buffer_handles)
     rc = _load().wmm_dispatch_tiled(pso_handle, arr, len(buffer_handles), threads_x, tg_x)
+    if rc != 0:
+        raise MetalError(_load().wmm_last_error().decode())
+
+
+def dispatch_batch(records) -> None:
+    """Batched dispatch: one command queue + one command buffer for a whole
+    run of ``(pso_handle, buffer_handles, threads_x, tg_x, require_tg)``
+    records (capture replay).
+
+    Records encode as consecutive compute sections and complete under a
+    single commit + watchdog wait (WARP_METAL_DISPATCH_TIMEOUT_S, default
+    scaled by the record count; 0 disables). Sections execute in list order,
+    so record i observes record i-1's writes exactly like per-record
+    dispatch. Per-record attribution inside one command buffer is impossible
+    — a failure names the batch; replay with ``WARP_METAL_BATCH=0``
+    (host-runtime escape hatch) to isolate the faulting record.
+    """
+    if not records:
+        return
+    n = len(records)
+    pso_arr = (ctypes.c_void_p * n)(*(r[0] for r in records))
+    flat = (ctypes.c_void_p * sum(len(r[1]) for r in records))(
+        *(h for r in records for h in r[1])
+    )
+    counts = (ctypes.c_uint32 * n)(*(len(r[1]) for r in records))
+    threads = (ctypes.c_uint32 * n)(*(r[2] for r in records))
+    tgs = (ctypes.c_uint32 * n)(*(r[3] for r in records))
+    reqs = (ctypes.c_uint8 * n)(*(r[4] for r in records))
+    rc = _load().wmm_dispatch_batch(pso_arr, flat, counts, threads, tgs, reqs, n)
     if rc != 0:
         raise MetalError(_load().wmm_last_error().decode())
 
