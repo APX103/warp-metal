@@ -223,7 +223,9 @@ def run_metal_compare(inp):
     phase = arr_f32(inp["phase"])
     clip_in = arr_f32(inp["clip_in"])
     mat = wp.zeros(n, dtype=wp.mat33f)
-    mat.numpy_view()[:] = inp["mat33"]
+    # warp-metal numpy_view() now matches upstream .numpy() shapes (n,3,3);
+    # golden npz stores mat33 flat (n,9) — reshape on the way in.
+    mat.numpy_view()[:] = inp["mat33"].reshape(mat.numpy_view().shape)
     va = arr_vec3(inp["vec3_a"])
     vb = arr_vec3(inp["vec3_b"])
     idx = wp.zeros(n, dtype=wp.int32)
