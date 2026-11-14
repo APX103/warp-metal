@@ -322,6 +322,67 @@ class TestCapturePassthrough(unittest.TestCase):
             wp.capture_launch(object())
 
 
+class TestCaptureParityAttrs(unittest.TestCase):
+    """M2.5 commit 3: Device/Stream capture-parity attributes. Newton's
+    capture guards read ``device.is_capturing``, ``device.captures.get(
+    device.stream) is not None`` and ``wp.get_stream(d).is_capturing``;
+    under warp-metal these must observe the real capture state (or be a
+    documented False), not AttributeError."""
+
+    def test_outside_capture(self):
+        dev = wp.get_device("metal")
+        self.assertFalse(dev.is_capturing)
+        self.assertEqual(dev.captures, {})
+        self.assertIsNone(dev.captures.get(dev.stream))
+        self.assertFalse(dev.stream.is_capturing)
+        self.assertFalse(wp.get_stream(dev).is_capturing)
+        self.assertFalse(dev.is_mempool_enabled)
+
+    def test_stream_token_is_stable_and_shared(self):
+        dev = wp.get_device("metal")
+        self.assertIs(dev.stream, wp.get_device("metal").stream)
+        self.assertIs(dev.stream, wp.get_stream(dev))
+        self.assertIs(wp.get_stream("metal").device, dev)
+        self.assertIsNot(wp.get_device("cpu").stream, dev.stream)
+        # hashable dict key, like a cudaStream handle upstream
+        self.assertIn(dev.stream, {dev.stream: None})
+
+    def test_inside_capture(self):
+        dev = wp.get_device("metal")
+        cpu = wp.get_device("cpu")
+        with wp.ScopedCapture(device="metal") as c:
+            self.assertTrue(dev.is_capturing)
+            self.assertFalse(cpu.is_capturing)  # reports only on the target device
+            capture = dev.captures.get(dev.stream)
+            self.assertIsNotNone(capture)
+            self.assertIsInstance(capture, wp.Graph)
+            self.assertIsNone(cpu.captures.get(cpu.stream))
+            self.assertEqual(list(dev.captures.keys()), [dev.stream])
+        self.assertFalse(dev.is_capturing)
+        self.assertEqual(dev.captures, {})
+        self.assertIsNone(dev.captures.get(dev.stream))
+        # the object observed during recording is the one capture_end returned
+        self.assertIs(capture, c.graph)
+        self.assertEqual(c.graph.n_ops, 0)  # nothing launched inside this block
+
+    def test_capture_if_inside_capture_raises_named(self):
+        cond = wp.zeros(1, dtype=wp.int32, device="metal")
+        called = []
+        with wp.ScopedCapture(device="metal") as c:
+            with self.assertRaises(wp.CaptureStateError) as ctx:
+                wp.capture_if(cond, on_true=lambda: called.append(1))
+            message = str(ctx.exception)
+            self.assertIn("capture_if", message)
+            self.assertIn("conditional graph node", message)
+            self.assertIn("outside", message)
+            self.assertEqual(called, [])  # no eager execution either
+        # outside capture: upstream's own eager non-CUDA semantics stay
+        cond.numpy[0] = 1
+        wp.capture_if(cond, on_true=lambda: called.append(2))
+        self.assertEqual(called, [2])
+        self.assertEqual(c.graph.n_ops, 0)  # nothing silently recorded
+
+
 class TestCaptureReplay(unittest.TestCase):
     """M2.5 batched replay: a recorded graph replays equivalent to eager
     execution, ordering preserved across mixed kernel/copy/fill records

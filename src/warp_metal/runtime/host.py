@@ -1643,11 +1643,22 @@ def launch(
 # ---------------------------------------------------------------------------
 
 
+class CaptureStateError(RuntimeError):
+    """A graph construct needs CUDA-conditional-node machinery that the
+    active warp-metal record/replay capture cannot express (KEP-0001 M2.5:
+    raised by ``capture_if`` inside an active capture; ``capture_while``
+    keeps the blanket fail-loud everywhere)."""
+
+
 class Graph:
     """Replayable capture record.
 
     Capture records each launch (Metal dispatch or CPU-fallback port) in
-    order; ``capture_launch`` re-dispatches every record synchronously.
+    order; ``capture_launch`` replays them, batching consecutive eligible
+    records into one Metal command buffer (kernels as compute sections,
+    eligible copies / zero fills as blit sections — one commit + watchdog
+    wait per batch) and applying host records between batches in record
+    order.
     Recorded param/arg-buffer temporaries are owned (and released) by the
     graph, and each record holds strong references to the arrays it binds —
     their buffers stay alive for the graph's lifetime even if the launching
@@ -1771,8 +1782,38 @@ class ScopedCapture:
 
 _CAPTURE_LOCK = threading.Lock()
 _CAPTURE_DEPTH = 0
-# active record list while capturing; None outside capture
+# active record list while capturing; None outside capture (aliases the
+# in-progress Graph's record list)
 _CAPTURE_RECORDS: list | None = None
+# the Graph being recorded (created at capture_begin so the device
+# capture-parity attributes can expose it, upstream
+# ``device.captures[stream]``-style) and the device the capture was begun on
+_CAPTURE_GRAPH: Graph | None = None
+_CAPTURE_DEVICE = None
+
+
+def active_capture(device=None) -> Graph | None:
+    """The Graph currently being recorded for ``device``'s implicit stream,
+    else ``None``.
+
+    Runtime-internal accessor and single source of truth behind
+    ``Device.is_capturing``/``Device.captures``/``Stream.is_capturing``
+    (KEP-0001 M2.5 commit 3). Warp-metal allows one non-nested capture,
+    begun on the device passed to (or current at) ``capture_begin``; like
+    upstream's per-device ``captures`` registration, it reports only on that
+    device. With ``device=None`` the active capture is reported regardless
+    of the device it was begun on.
+    """
+    with _CAPTURE_LOCK:
+        if _CAPTURE_DEPTH == 0 or _CAPTURE_GRAPH is None:
+            return None
+        if (
+            device is not None
+            and _CAPTURE_DEVICE is not None
+            and get_device(device).name != _CAPTURE_DEVICE.name
+        ):
+            return None
+        return _CAPTURE_GRAPH
 
 
 def _record_fill(arr, value) -> None:
@@ -1787,27 +1828,41 @@ def _record_fill(arr, value) -> None:
 
 def capture_begin(device=None, stream=None, force_module_load=False, external=None, apic=None, capture_mode=None):
     """Begin capture: launches are RECORDED, not executed (upstream graph
-    semantics). Replay re-dispatches each recorded op synchronously."""
-    global _CAPTURE_DEPTH, _CAPTURE_RECORDS
+    semantics). The in-progress Graph is registered for the target device's
+    implicit stream (observable through ``Device.captures``/``Device.is_capturing``);
+    replay batches consecutive eligible records into one command buffer."""
+    global _CAPTURE_DEPTH, _CAPTURE_RECORDS, _CAPTURE_GRAPH, _CAPTURE_DEVICE
     if external is not None or apic:
         raise RuntimeError("warp-metal does not support external/apic capture (CUDA-graph machinery)")
     with _CAPTURE_LOCK:
         if _CAPTURE_DEPTH == 0:
-            _CAPTURE_RECORDS = []
+            dev = get_device(device)
+            graph = Graph(dev.name)
+            graph._records = []
+            _CAPTURE_GRAPH = graph
+            _CAPTURE_RECORDS = graph._records
+            _CAPTURE_DEVICE = dev
         else:
             raise RuntimeError("nested capture is not supported by warp-metal")
         _CAPTURE_DEPTH += 1
 
 
 def capture_end(device=None, stream=None) -> Graph:
-    """End capture; returns the recorded graph."""
-    global _CAPTURE_DEPTH, _CAPTURE_RECORDS
+    """End capture; returns the recorded graph — the same Graph object the
+    device's ``captures`` view exposed while recording."""
+    global _CAPTURE_DEPTH, _CAPTURE_RECORDS, _CAPTURE_GRAPH, _CAPTURE_DEVICE
     with _CAPTURE_LOCK:
         _CAPTURE_DEPTH = max(0, _CAPTURE_DEPTH - 1)
+        graph = _CAPTURE_GRAPH
         records = _CAPTURE_RECORDS
         _CAPTURE_RECORDS = None
-    graph = Graph(get_device(device).name if device is not None else None, n_ops=len(records) if records else 0)
-    graph._records = records or []
+        _CAPTURE_GRAPH = None
+        _CAPTURE_DEVICE = None
+    if graph is None:
+        # capture_end without capture_begin: keep the historical lenient
+        # empty-graph return (upstream raises here)
+        return Graph(get_device(device).name if device is not None else None)
+    graph.n_ops = len(records) if records else 0
     return graph
 
 
@@ -1954,14 +2009,28 @@ def capture_launch(graph, stream=None):
 
 
 def capture_if(condition, on_true=None, on_false=None, stream=None, **kwargs):
-    """Upstream-faithful eager branch outside graph capture.
+    """Upstream-faithful eager branch outside graph capture; fail-loud inside.
 
-    Upstream semantics: outside a CUDA/APIC capture (the only mode this
-    backend has), ``capture_if`` reads the condition element and invokes the
-    chosen callback eagerly with ``**kwargs``. Graph objects as callbacks
-    (replay inside a recorded conditional) remain the M2.5 boundary and fail
-    loud.
+    Outside capture (upstream's own defined non-CUDA behavior): read the
+    condition element and invoke the chosen callback eagerly with
+    ``**kwargs``. Inside an active capture, upstream CUDA builds a
+    conditional graph node, but warp-metal's record/replay capture cannot
+    express one — recording the eager read would silently pin the branch to
+    its record-time value for every replay — so this raises
+    :class:`CaptureStateError`: capture the branch outside the graph (eager
+    semantics) or restructure so the condition is read on the host between
+    replays. Graph objects as callbacks (replay inside a recorded
+    conditional) remain the M2.5 boundary and fail loud.
     """
+    if _CAPTURE_RECORDS is not None:
+        raise CaptureStateError(
+            "wp.capture_if inside an active capture: upstream CUDA builds a "
+            "conditional graph node here, but warp-metal's record/replay "
+            "capture would have to eager-read the condition once and replay "
+            "that fixed branch on every launch. Capture the branch outside "
+            "the graph (eager semantics), or restructure so the condition is "
+            "evaluated on the host between replays."
+        )
     if on_true is None and on_false is None:
         return
     if not isinstance(condition, WarpArray) or condition.numpy.dtype != np.int32:

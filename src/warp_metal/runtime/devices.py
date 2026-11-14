@@ -9,7 +9,8 @@ Two devices: ``"cpu"`` (host fallback; arrays share unified memory) and
 ``"metal"`` (Apple Silicon GPU via MTLBuffer). Mirrors the observable
 surface of upstream warp's device objects that Newton relies on:
 ``name``, ``ordinal``, ``is_cpu``, ``is_cuda``, ``is_metal``, ``arch``,
-``context``.
+``context``, plus the capture-parity attributes (``stream``,
+``is_capturing``, ``captures``, ``is_mempool_enabled``; KEP-0001 M2.5).
 """
 
 from __future__ import annotations
@@ -18,10 +19,13 @@ from __future__ import annotations
 class Stream:
     """Minimal stream token.
 
-    warp-metal dispatches kernels synchronously per launch (command-buffer
-    batching lands in Phase 2), so a Stream is an ordering handle only: it
-    records its device and name and is accepted wherever upstream would take
-    one.
+    warp-metal dispatches kernels synchronously per launch (graph replay
+    batches records into one command buffer, but each call still waits), so
+    a Stream is an ordering handle only: it records its device and name,
+    carries the device's capture state for parity (:attr:`is_capturing`),
+    and is accepted wherever upstream would take one. Each device owns one
+    stable implicit stream — ``Device.stream`` and :func:`get_stream` return
+    the same object.
     """
 
     def __init__(self, device=None, name=None):
@@ -33,6 +37,14 @@ class Stream:
             device = get_device(device)
         self.device = device
         self.name = name or "metal_stream"
+
+    @property
+    def is_capturing(self) -> bool:
+        """A boolean indicating whether a graph capture is currently ongoing
+        on this stream (the device's active capture; one implicit stream)."""
+        from . import host as _host
+
+        return _host.active_capture(self.device) is not None
 
     def __repr__(self):
         return f"Stream(name={self.name!r}, device={self.device.name!r})"
@@ -71,7 +83,10 @@ class Device:
 
     Mirrors the upstream ``warp.Device`` attributes Newton's device-string
     threading reads: ``name``, ``alias``, ``ordinal``, ``is_cpu``,
-    ``is_cuda``, ``is_metal``, ``arch``, ``context``.
+    ``is_cuda``, ``is_metal``, ``arch``, ``context``, plus the capture-parity
+    surface (``stream``, ``is_capturing``, ``captures``, ``is_mempool_enabled``)
+    so Newton's capture-aware guards observe real state instead of relying
+    on ``is_cuda`` short-circuits by accident (KEP-0001 M2.5).
     """
 
     def __init__(self, name: str, ordinal: int = 0, arch: int = 0):
@@ -83,6 +98,61 @@ class Device:
         self.is_metal = name == "metal"
         self.arch = arch
         self.context = None
+        # One stable implicit stream per device. Upstream ``Device.stream``
+        # is a cudaStream handle; warp-metal dispatches synchronously, so the
+        # token is a Stream object whose role is the stable hashable key
+        # Newton's ``captures.get(device.stream)`` guards read (documented
+        # divergence).
+        self._stream = Stream(self, name=f"{name}_default")
+        # Upstream Device.is_mempool_enabled is a plain bool Newton reads
+        # directly (kamino device info). Mempool allocation is a KEP-0001
+        # Non-Goal (MTLBuffer allocations are direct), so it is always False
+        # — parity attribute only, so capture/mem guards don't AttributeError.
+        self.is_mempool_enabled = False
+
+    @property
+    def stream(self) -> Stream:
+        """The device's stable implicit stream token.
+
+        Upstream ``Device.stream`` is a cudaStream handle; warp-metal has one
+        implicit stream per device, so this is a stable ``Stream`` object —
+        the key :attr:`captures` is keyed by and the object
+        :func:`get_stream` returns.
+        """
+        return self._stream
+
+    @property
+    def is_capturing(self) -> bool:
+        """A boolean indicating whether this device is currently capturing a
+        graph.
+
+        Wired to the host runtime's capture state (single source of truth):
+        True only while the capture begun on this device is active, like
+        upstream's per-device ``captures`` registration.
+        """
+        from . import host as _host
+
+        return _host.active_capture(self) is not None
+
+    @property
+    def captures(self) -> dict:
+        """View of the active captures keyed by stream (upstream
+        ``Device.captures``).
+
+        ``{self.stream: in-progress Graph}`` while the capture begun on this
+        device is recording — the same Graph ``capture_end`` returns — and
+        ``{}`` outside capture, so Newton guards observe
+        ``captures.get(device.stream) is not None`` exactly as on CUDA.
+        Read-only per call (upstream mutates the dict inside warp's own
+        capture_begin/capture_end); warp-metal has a single implicit stream,
+        so the view never holds more than one entry.
+        """
+        from . import host as _host
+
+        graph = _host.active_capture(self)
+        if graph is None:
+            return {}
+        return {self._stream: graph}
 
     def __eq__(self, other):
         if isinstance(other, str):
@@ -220,11 +290,12 @@ def get_devices() -> list[Device]:
 def get_stream(device=None) -> Stream:
     """Return the (single, implicit) stream for a device.
 
-    warp-metal dispatches synchronously; each device has one implicit stream
-    handle. Creating per-call streams would change nothing observable.
+    warp-metal dispatches synchronously; each device owns one stable
+    implicit stream token, and this is the same object as ``Device.stream``
+    (upstream likewise returns the device's current stream), so the
+    ``captures`` key and ``wp.get_stream`` handles stay identical.
     """
-    dev = get_device(device)
-    return Stream(dev, name=f"{dev.name}_default")
+    return get_device(device).stream
 
 
 def set_stream(stream) -> Stream:

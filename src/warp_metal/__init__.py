@@ -135,6 +135,7 @@ from .runtime.host import (  # noqa: F401
     capture_launch,
     capture_if,
     capture_while,
+    CaptureStateError,
     Graph,
     init,
     device_name,
