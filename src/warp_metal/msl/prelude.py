@@ -1455,6 +1455,245 @@ static inline int wp_bvh_get_group_root(uint64_t id, int group_id) {
 }
 """
 
+# KEP-0001 M2.1: device query family, ported semantically verbatim from
+# upstream warp/native/bvh.h (bvh_query_t + the bvh_query_next_impl
+# traversal skeleton with the runtime-kind dispatch of bvh_query_next_dynamic —
+# Newton only ever calls the kind-erased bvh_query_next) and warp/native/
+# intersect.h (the four overlap tests). The tree itself is built host-side
+# into the same layout (runtime/bvh.py), so query kernels dereference ids
+# through wp_bvh_get. MSL has no <cfloat>: FLT_MAX as an exact literal.
+_BVH_QUERY_OPS = """
+constant float WP_FLT_MAX = 3.402823466e+38;
+
+// ---- intersect.h (verbatim; vec3f struct → explicit components) ----------
+
+static inline bool wp_intersect_ray_aabb(vec3f pos, vec3f rcp_dir, vec3f lower, vec3f upper, thread float& t) {
+    float l1, l2, lmin, lmax;
+    l1 = (lower.x - pos.x) * rcp_dir.x;
+    l2 = (upper.x - pos.x) * rcp_dir.x;
+    lmin = fmin(l1, l2);
+    lmax = fmax(l1, l2);
+    l1 = (lower.y - pos.y) * rcp_dir.y;
+    l2 = (upper.y - pos.y) * rcp_dir.y;
+    lmin = fmax(fmin(l1, l2), lmin);
+    lmax = fmin(fmax(l1, l2), lmax);
+    l1 = (lower.z - pos.z) * rcp_dir.z;
+    l2 = (upper.z - pos.z) * rcp_dir.z;
+    lmin = fmax(fmin(l1, l2), lmin);
+    lmax = fmin(fmax(l1, l2), lmax);
+    bool hit = (lmax >= 0.0f) && (lmax >= lmin);
+    if (hit)
+        t = lmin;
+    return hit;
+}
+
+// robust variant: dir[i]==0 is a parallel slab (reject outside the slab,
+// otherwise leave the interval unconstrained) so axis-aligned rays behave
+static inline bool wp_intersect_ray_aabb_robust(
+    vec3f pos, vec3f dir, vec3f rcp_dir, vec3f lower, vec3f upper, thread float& t
+) {
+    float lmin = -WP_FLT_MAX;
+    float lmax = WP_FLT_MAX;
+    if (dir.x == 0.0f) {
+        if (pos.x < lower.x || pos.x > upper.x) return false;
+    } else {
+        float l1 = (lower.x - pos.x) * rcp_dir.x;
+        float l2 = (upper.x - pos.x) * rcp_dir.x;
+        lmin = fmax(fmin(l1, l2), lmin);
+        lmax = fmin(fmax(l1, l2), lmax);
+    }
+    if (dir.y == 0.0f) {
+        if (pos.y < lower.y || pos.y > upper.y) return false;
+    } else {
+        float l1 = (lower.y - pos.y) * rcp_dir.y;
+        float l2 = (upper.y - pos.y) * rcp_dir.y;
+        lmin = fmax(fmin(l1, l2), lmin);
+        lmax = fmin(fmax(l1, l2), lmax);
+    }
+    if (dir.z == 0.0f) {
+        if (pos.z < lower.z || pos.z > upper.z) return false;
+    } else {
+        float l1 = (lower.z - pos.z) * rcp_dir.z;
+        float l2 = (upper.z - pos.z) * rcp_dir.z;
+        lmin = fmax(fmin(l1, l2), lmin);
+        lmax = fmin(fmax(l1, l2), lmax);
+    }
+    bool hit = (lmax >= 0.0f) && (lmax >= lmin);
+    if (hit)
+        t = lmin;
+    return hit;
+}
+
+static inline bool wp_intersect_aabb_aabb(vec3f a_lower, vec3f a_upper, vec3f b_lower, vec3f b_upper) {
+    if (a_lower.x > b_upper.x || a_lower.y > b_upper.y || a_lower.z > b_upper.z || a_upper.x < b_lower.x
+        || a_upper.y < b_lower.y || a_upper.z < b_lower.z) {
+        return false;
+    }
+    return true;
+}
+
+// squared distance from center to the AABB, per axis (Ericson, RTCD)
+static inline bool wp_intersect_sphere_aabb(vec3f center, float radius_sq, vec3f lower, vec3f upper) {
+    float dx = fmax(fmax(lower.x - center.x, center.x - upper.x), 0.0f);
+    float dy = fmax(fmax(lower.y - center.y, center.y - upper.y), 0.0f);
+    float dz = fmax(fmax(lower.z - center.z, center.z - upper.z), 0.0f);
+    return dx * dx + dy * dy + dz * dz <= radius_sq;
+}
+
+// ---- bvh_query_t + traversal (bvh.h) -------------------------------------
+
+// BvhQueryKind: AABB=0, RAY=1, CAPSULE=2, SPHERE=3 (upstream enum class)
+struct wp_bvh_query_t {
+    wp_bvh_t bvh;
+    int stack[64];  // BVH_QUERY_STACK_SIZE
+    int count;
+    int prim_cur;
+    int prim_end;
+    vec3f input_lower;  // start for ray/capsule, center for sphere
+    vec3f input_upper;  // rcp_dir for ray/capsule
+    int bounds_nr;
+    bool last_query_valid;
+    int kind;
+    float radius;
+    float radius_sq;
+};
+
+static inline wp_bvh_query_t wp_bvh_query_init(uint64_t id, vec3f lower, vec3f upper, int root) {
+    wp_bvh_query_t query;
+    query.bvh = wp_bvh_get(id);
+    query.bounds_nr = -1;
+    query.count = 1;
+    query.prim_cur = 0;
+    query.prim_end = 0;
+    query.stack[0] = root == -1 ? *(query.bvh.root) : root;
+    query.input_lower = lower;
+    query.input_upper = upper;
+    query.last_query_valid = true;
+    query.radius = 0.0f;
+    query.radius_sq = 0.0f;
+    return query;
+}
+
+static inline wp_bvh_query_t wp_bvh_query_aabb(uint64_t id, vec3f lower, vec3f upper, int root) {
+    wp_bvh_query_t query = wp_bvh_query_init(id, lower, upper, root);
+    query.kind = 0;
+    return query;
+}
+
+static inline vec3f wp_rcp_vec3(vec3f v) {
+    vec3f r;
+    r.x = 1.0f / v.x;
+    r.y = 1.0f / v.y;
+    r.z = 1.0f / v.z;
+    return r;
+}
+
+static inline wp_bvh_query_t wp_bvh_query_ray(uint64_t id, vec3f start, vec3f dir, int root) {
+    wp_bvh_query_t query = wp_bvh_query_init(id, start, wp_rcp_vec3(dir), root);
+    query.kind = 1;
+    return query;
+}
+
+static inline wp_bvh_query_t wp_bvh_query_capsule(uint64_t id, vec3f start, vec3f dir, float radius, int root) {
+    wp_bvh_query_t query = wp_bvh_query_init(id, start, wp_rcp_vec3(dir), root);
+    query.kind = 2;
+    query.radius = fmax(radius, 0.0f);
+    query.radius_sq = query.radius * query.radius;
+    return query;
+}
+
+static inline wp_bvh_query_t wp_bvh_query_sphere(uint64_t id, vec3f center, float radius, int root) {
+    wp_bvh_query_t query = wp_bvh_query_init(id, center, center, root);
+    query.kind = 3;
+    query.radius = fmax(radius, 0.0f);
+    query.radius_sq = query.radius * query.radius;
+    return query;
+}
+
+// node/primitive overlap test — the runtime-kind switch of upstream's
+// bvh_query_test<QUERY_KIND> (kind folded per instantiation there, dynamic here)
+static inline bool wp_bvh_query_test(thread wp_bvh_query_t& query, vec3f node_lower, vec3f node_upper, float max_dist) {
+    switch (query.kind) {
+    case 3:  // sphere: exact sphere-AABB with pre-computed radius_sq
+        return wp_intersect_sphere_aabb(query.input_lower, query.radius_sq, node_lower, node_upper);
+    case 2:  // capsule: inflate by radius, robust slab test, closed endpoint
+    {
+        float t = WP_FLT_MAX;
+        vec3f infl_l = node_lower;
+        infl_l.x -= query.radius;
+        infl_l.y -= query.radius;
+        infl_l.z -= query.radius;
+        vec3f infl_u = node_upper;
+        infl_u.x += query.radius;
+        infl_u.y += query.radius;
+        infl_u.z += query.radius;
+        bool hit = wp_intersect_ray_aabb_robust(query.input_lower, query.input_upper, query.input_upper, infl_l, infl_u, t);
+        return hit && !(t > max_dist);
+    }
+    case 1:  // ray: plain slab test, half-open max_dist bound
+    {
+        float t = WP_FLT_MAX;
+        bool hit = wp_intersect_ray_aabb(query.input_lower, query.input_upper, node_lower, node_upper, t);
+        return hit && !(t >= max_dist);
+    }
+    default:  // aabb
+        return wp_intersect_aabb_aabb(query.input_lower, query.input_upper, node_lower, node_upper);
+    }
+}
+
+// bvh_query_next_impl traversal skeleton (shared across kinds upstream;
+// the per-kind tests route through wp_bvh_query_test). Every iteration
+// emits one primitive from the leaf being enumerated, or pops one node.
+static inline bool wp_bvh_query_next(thread wp_bvh_query_t& query, thread int& index, float max_dist) {
+    for (;;) {
+        if (query.prim_cur < query.prim_end) {
+            const int primitive_index = query.bvh.primitive_indices[query.prim_cur++];
+            if (!wp_bvh_query_test(
+                    query, query.bvh.item_lowers[primitive_index], query.bvh.item_uppers[primitive_index], max_dist
+                )) {
+                continue;
+            }
+            index = primitive_index;
+            query.bounds_nr = primitive_index;
+            return true;
+        }
+        if (!query.count)
+            return false;
+        const int node_index = query.stack[--query.count];
+        wp_node_half_t node_lower = query.bvh.node_lowers[node_index];
+        wp_node_half_t node_upper = query.bvh.node_uppers[node_index];
+        vec3f nl, nu;
+        nl.x = node_lower.x;
+        nl.y = node_lower.y;
+        nl.z = node_lower.z;
+        nu.x = node_upper.x;
+        nu.y = node_upper.y;
+        nu.z = node_upper.z;
+        if (!wp_bvh_query_test(query, nl, nu, max_dist)) {
+            continue;
+        }
+        const int left_index = (int)(node_lower.u & 0x7fffffffu);
+        const int right_index = (int)(node_upper.u & 0x7fffffffu);
+        if ((node_lower.u >> 31u) & 1u) {
+            // packed leaf: [start, end) primitive range
+            const int start = left_index;
+            const int end = right_index;
+            if (end - start == 1) {
+                int primitive_index = query.bvh.primitive_indices[start];
+                index = primitive_index;
+                query.bounds_nr = primitive_index;
+                return true;
+            }
+            query.prim_cur = start;
+            query.prim_end = end;
+        } else {
+            query.stack[query.count++] = left_index;
+            query.stack[query.count++] = right_index;
+        }
+    }
+}
+"""
+
 _PRELUDE = (
     "#include <metal_stdlib>\n"
     "#include <metal_atomic>\n"
@@ -1473,7 +1712,10 @@ _PRELUDE = (
     + _SCALAR_OPS
     + "\n"
     + _BVH_OPS
+    + "\n"
+    + _BVH_QUERY_OPS
 )
+
 
 PRELUDE = _PRELUDE
 

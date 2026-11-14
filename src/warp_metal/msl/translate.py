@@ -210,6 +210,8 @@ def msl_type(ctype: str) -> str:
         return "int4"  # loaded shape vectors index via wp_extract(int4, i)
     if ctype == "wp::Mesh":
         return "wp_mesh"  # Phase-1 stub (see prelude) — never executed
+    if ctype == "wp::bvh_query_t":
+        return "wp_bvh_query_t"  # M2.1 query family (prelude _BVH_QUERY_OPS)
     if ctype.startswith("wp::mesh_query"):
         return "wp_mesh_query_stub"  # tiled AABB query handle stub (prelude)
     if ctype == "wp::spatial_vector_t<wp::float32>":
@@ -342,6 +344,19 @@ _CALL_TABLE = {
     "tile_query_valid": "wp_tile_query_valid",
     "tile_mesh_query_aabb_next": "wp_tile_mesh_query_aabb_next",
     "untile": "wp_untile",
+    # BVH device query family (KEP-0001 M2.1; prelude _BVH_QUERY_OPS —
+    # upstream bvh.h port). The SSA resolves wp.bvh_query_next to the
+    # per-kind *_next builtin by the query's static type; all of them map
+    # to the one runtime-kind-dispatch MSL function.
+    "bvh_query_aabb": "wp_bvh_query_aabb",
+    "bvh_query_ray": "wp_bvh_query_ray",
+    "bvh_query_capsule": "wp_bvh_query_capsule",
+    "bvh_query_sphere": "wp_bvh_query_sphere",
+    "bvh_query_next": "wp_bvh_query_next",
+    "bvh_query_ray_next": "wp_bvh_query_next",
+    "bvh_query_capsule_next": "wp_bvh_query_next",
+    "bvh_query_sphere_next": "wp_bvh_query_next",
+    "bvh_query_next_dynamic": "wp_bvh_query_next",
 }
 
 # scalar casts: wp::<scalar>(x) → ((T)(x))

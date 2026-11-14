@@ -161,7 +161,86 @@ def b_compute_shape_world_transforms(rng):
 
 
 def b_compute_bvh_group_roots(rng):
-    return ([], ["bvh_get_group_root requires a built BVH context (Phase 2, M2.1)"])
+    """compute_bvh_group_roots over a grouped BVH (KEP-0001 M2.1: device
+    query family; the "bvh" key builds wp.Bvh per conformance phase)."""
+    # two spatially separated groups of two boxes each: dense group ids
+    # 0..1 (the kernel indexes the output by group id)
+    lowers = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [10.0, 0.0, 0.0], [11.0, 0.0, 0.0]], dtype=np.float32
+    )
+    uppers = lowers + 0.5
+    groups = np.array([0, 0, 1, 1], dtype=np.int32)
+    return (
+        [
+            ("bvh", "bvh", {"lowers": lowers, "uppers": uppers, "groups": groups}),
+            ("out_bvh_group_roots", "out:i32", 2),
+            ("__dim__", "", 2),
+        ],
+        [],
+    )
+
+
+def b_vertex_triangle_collision_detection_kernel(rng):
+    """geometry/kernels.vertex_triangle_collision_detection_kernel (style3d
+    cloth collision path) — real Newton closure kernel exercising the BVH
+    whole-tree AABB query (all-particle world -1 → query_all branch).
+
+    Scene: three well-separated triangles; T0/T2 sit 0.3 apart in z so
+    their vertices collide within max_query_radius=2.0, T1 is isolated.
+    Per-vertex and per-triangle CSR buffers are sized so no resize flag
+    fires; per-triangle collision buffers are in-place inputs (their slot
+    ORDER is atomic-schedule dependent) while the compared outputs are the
+    order-independent counts / min distances / resize flags.
+    """
+    tris = np.array(
+        [
+            [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            [(10.0, 0.0, 0.0), (11.0, 0.0, 0.0), (10.0, 1.0, 0.0)],
+            [(0.3, 0.3, 0.3), (1.3, 0.3, 0.3), (0.3, 1.3, 0.3)],
+        ],
+        dtype=np.float32,
+    )
+    n_tri = 3
+    n_vert = 3 * n_tri
+    pos = tris.reshape(n_vert, 3)
+    tri_indices = np.array([[t * 3, t * 3 + 1, t * 3 + 2] for t in range(n_tri)], dtype=np.int32)
+    # triangle AABBs for the query BVH (single-group tree: all particles are
+    # in the global world -1, so the kernel takes the query_all branch and
+    # bvh_group_roots stays unread)
+    lowers = tris.min(axis=1)
+    uppers = tris.max(axis=1)
+
+    k = 8  # per-vertex / per-triangle collision buffer capacity
+    v_offsets = (np.arange(n_vert + 1, dtype=np.int32) * k).astype(np.int32)
+    t_offsets = (np.arange(n_tri + 1, dtype=np.int32) * k).astype(np.int32)
+    return (
+        [
+            ("max_query_radius", "scalar:f32", 2.0),
+            ("min_query_radius", "scalar:f32", 0.0),
+            ("bvh", "bvh", {"lowers": lowers, "uppers": uppers, "groups": None}),
+            ("bvh_group_roots", "arr:i32", np.zeros(2, dtype=np.int32)),
+            ("pos", "arr:vec3", pos),
+            ("tri_indices", "arr2:i32", tri_indices),
+            ("particle_world", "arr:i32", np.full(n_vert, -1, dtype=np.int32)),
+            ("world_count", "scalar:i32", 1),
+            ("vertex_colliding_triangles_offsets", "arr:i32", v_offsets),
+            ("vertex_colliding_triangles_buffer_sizes", "arr:i32", np.full(n_vert, k, dtype=np.int32)),
+            ("triangle_colliding_vertices_offsets", "arr:i32", t_offsets),
+            ("triangle_colliding_vertices_buffer_sizes", "arr:i32", np.full(n_tri, k, dtype=np.int32)),
+            ("vertex_triangle_filtering_list", "arr:i32", np.zeros(1, dtype=np.int32)),
+            ("vertex_triangle_filtering_list_offsets", "arr:i32", np.zeros(n_vert + 1, dtype=np.int32)),
+            ("min_distance_filtering_ref_pos", "arr:vec3", pos.copy()),
+            ("vertex_colliding_triangles", "arr:i32", np.zeros(2 * k * n_vert, dtype=np.int32)),
+            ("vertex_colliding_triangles_count", "out:i32", n_vert),
+            ("vertex_colliding_triangles_min_dist", "out:f32", n_vert),
+            ("triangle_colliding_vertices", "arr:i32", np.zeros(k * n_tri, dtype=np.int32)),
+            ("triangle_colliding_vertices_count", "out:i32", n_tri),
+            ("triangle_colliding_vertices_min_dist", "out:f32", n_tri),
+            ("resize_flags", "out:i32", 3),
+            ("__dim__", "", n_vert),
+        ],
+        [],
+    )
 
 
 def b_update_shape_xforms(rng):

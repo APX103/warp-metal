@@ -349,6 +349,11 @@ CORPUS_TABLE = [
     ("newton._src.geometry.bvh", "compute_enabled_shapes", "compute_enabled_shapes"),
     ("newton._src.geometry.bvh", "compute_shape_world_transforms", "compute_shape_world_transforms"),
     ("newton._src.geometry.bvh", "compute_bvh_group_roots", "compute_bvh_group_roots"),
+    (
+        "newton._src.geometry.kernels",
+        "vertex_triangle_collision_detection_kernel",
+        "vertex_triangle_collision_detection_kernel",
+    ),
     ("newton._src.viewer.kernels", "update_shape_xforms", "update_shape_xforms"),
     ("newton._src.viewer.kernels", "repack_shape_colors", "repack_shape_colors"),
     ("newton._src.viewer.kernels", "repack_shape_opacities", "repack_shape_opacities"),
@@ -465,6 +470,9 @@ def _alloc_array(pkg, key, val, device="cpu"):
     raise ValueError(f"bad array dtype key {key!r}")
 
 
+_PACKED_CONTEXTS: list = []
+
+
 def _pack_args(pkg, args, device="cpu", mod=None):
     """(launch_args, dim, out_arrays, out_names) from builder triples.
 
@@ -517,6 +525,27 @@ def _pack_args(pkg, args, device="cpu", mod=None):
             for i, v in enumerate(np.asarray(val, dtype=np.float32).ravel()):
                 t[i] = v
             launch_args.append(t)
+        elif key == "bvh":
+            # KEP-0001 M2.1: build the BVH per conformance phase (golden:
+            # real warp CPU tree; compare: warp-metal host tree) over the
+            # same deterministic bounds; the kernel arg is the uint64 id
+            lowers = np.asarray(val["lowers"], dtype=np.float32)
+            uppers = np.asarray(val["uppers"], dtype=np.float32)
+            groups = val.get("groups")
+            la = pkg.zeros(len(lowers), dtype=pkg.vec3, device=device)
+            _arr_view(la)[:] = lowers
+            ua = pkg.zeros(len(uppers), dtype=pkg.vec3, device=device)
+            _arr_view(ua)[:] = uppers
+            ga = None
+            if groups is not None:
+                ga = pkg.zeros(len(groups), dtype=pkg.int32, device=device)
+                _arr_view(ga)[:] = np.asarray(groups, dtype=np.int32)
+            bvh = pkg.Bvh(la, ua, constructor="sah", groups=ga, leaf_size=2)
+            # keepalive: only the uint64 id escapes this scope; releasing the
+            # Bvh destroys the tree context and the launch would dereference
+            # a freed handle (bus error on the golden side)
+            _PACKED_CONTEXTS.append(bvh)
+            launch_args.append(int(bvh.id))
         else:
             raise ValueError(f"bad corpus dtype key {key!r}")
     return launch_args, dim, out_arrays, out_names
@@ -869,10 +898,19 @@ def main() -> None:
         results["surface"] = format_surface_section(res)
         print(f"surface: {res['n_ok']} ok / {res['n_mismatch']} mismatch / {res['n_missing']} missing")
     if args.layer in ("corpus", "all"):
-        try:
-            import warp_metal  # noqa: F401 — compare side
-        except ImportError:
-            # Newton venv (no warp_metal): this process IS the golden phase
+        # KEP-0001 M1.5 note: since the shim, the Newton venv also has
+        # warp_metal installed; CORPUS_FORCE_GOLDEN pins this process as the
+        # golden phase (warp_metal is never imported, so `import warp`
+        # resolves to the real warp-lang below)
+        force_golden = bool(os.environ.get("CORPUS_FORCE_GOLDEN"))
+        is_golden = force_golden
+        if not force_golden:
+            try:
+                import warp_metal  # noqa: F401 — compare side
+            except ImportError:
+                is_golden = True
+        if is_golden:
+            # Newton venv (no warp_metal import): this process IS the golden phase
             run_corpus_golden(args.corpus_golden)
             print(f"corpus golden -> {args.corpus_golden}")
             return
