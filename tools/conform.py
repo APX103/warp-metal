@@ -387,6 +387,46 @@ CORPUS_TABLE = [
     ("newton._src.geometry.narrow_phase", "narrow_phase_find_mesh_triangle_overlaps_kernel", None),
     ("newton._src.geometry.narrow_phase", "mesh_triangle_contacts_to_reducer_kernel", None),
     ("newton._src.sim.articulation", "eval_articulation_fk", None),
+    # KEP-0001 M2.4 P3+P4: steel tile factories (n_dofs=12, 3 articulations;
+    # launch_tiled bd=1 via the builders' __block_dim__ pin — the upstream
+    # CPU bd=1 serial scalar-fallback discipline vs the matching Metal
+    # threadgroup lowering)
+    (
+        "newton._src.solvers.steel.solver_steel",
+        "_get_cholesky_kernel",
+        "steel_cholesky_kernel",
+        ("_get_cholesky_kernel", [12, "sm_90", 1]),
+    ),
+    (
+        "newton._src.solvers.steel.solver_steel",
+        "_get_triangular_solve_kernel",
+        "steel_triangular_solve_kernel",
+        ("_get_triangular_solve_kernel", [12, "sm_90", 1]),
+    ),
+    (
+        "newton._src.solvers.steel.solver_steel",
+        "_get_hinv_jt_plain_kernel",
+        "steel_hinv_jt_plain_kernel",
+        ("_get_hinv_jt_plain_kernel", [12, 8, "sm_90", 1, 3, False, True]),
+    ),
+    (
+        "newton._src.solvers.steel.solver_steel",
+        "_get_hinv_jt_kernel",
+        "steel_hinv_jt_kernel",
+        ("_get_hinv_jt_kernel", [12, 8, "sm_90", 1, 3, False, True, False]),
+    ),
+    (
+        "newton._src.solvers.steel.solver_steel",
+        "_get_crba_cholesky_kernel",
+        "steel_crba_cholesky_kernel",
+        ("_get_crba_cholesky_kernel", [12, "sm_90", 1]),
+    ),
+    (
+        "newton._src.solvers.steel.solver_steel",
+        "_get_cholesky_inverse_tiled_kernel",
+        "steel_cholesky_inverse_tiled_kernel",
+        ("_get_cholesky_inverse_tiled_kernel", [12, "sm_90", 1]),
+    ),
 ]
 
 _GJK_SKIP = "GJK/MPR factory kernel calls @wp.func_native support functions (Metal translation: Phase 2)"
@@ -406,15 +446,18 @@ def _resolve_kernel(mod, qualname, factory):
     """Module-level kernel by qualname, or a factory-built kernel.
 
     Factory rows carry ``(factory_name, [args])``; string args resolve as
-    module attributes (e.g. the writer @wp.func), everything else passes
-    verbatim. The factory is called under each side's own warp package so
-    both sides build the identical kernel object.
+    module attributes when one exists (e.g. the writer @wp.func) and pass
+    verbatim otherwise (literal strings such as device_arch tags), so both
+    sides build the identical kernel object.
     """
     if factory is None:
         return getattr(mod, qualname)
     fname, fargs = factory
     fn = getattr(mod, fname)
-    args = [getattr(mod, a) if isinstance(a, str) else a for a in fargs]
+    args = [
+        getattr(mod, a) if isinstance(a, str) and hasattr(mod, a) else a
+        for a in fargs
+    ]
     return fn(*args)
 
 
@@ -425,6 +468,7 @@ def _corpus_dtype(pkg, key: str):
         "bool": pkg.bool, "vec2": pkg.vec2, "vec3": pkg.vec3, "vec4": pkg.vec4, "vec2i": pkg.vec2i,
         "vec3i": pkg.vec3i, "vec4i": pkg.vec4i, "mat33": pkg.mat33,
         "transform": pkg.transform, "spatial_vector": pkg.spatial_vector,
+        "spatial_matrix": pkg.spatial_matrix,
     }[key]
 
 
@@ -463,6 +507,16 @@ def _alloc_array(pkg, key, val, device="cpu"):
         view = _arr_view(arr)
         view[:] = val.reshape(view.shape)
         return arr
+    if key.startswith("arr3:"):
+        elem = _corpus_dtype(pkg, key[5:])
+        arr = pkg.zeros(val.shape, dtype=elem, device=device)
+        view = _arr_view(arr)
+        view[:] = val.reshape(view.shape)
+        return arr
+    if key.startswith("out3:"):
+        elem = _corpus_dtype(pkg, key[5:])
+        out_arr = pkg.zeros(val, dtype=elem, device=device)
+        return out_arr
     if key.startswith("out2:"):
         elem = _corpus_dtype(pkg, key[5:])
         out_arr = pkg.zeros(val, dtype=elem, device=device)
@@ -543,7 +597,9 @@ def _pack_args(pkg, args, device="cpu", mod=None):
             for i, ref in enumerate(ids):
                 view[i] = 0 if ref is None else _PACKED_MESHES[ref]
             launch_args.append(arr)
-        elif key.startswith("arr:") or key.startswith("io:") or key.startswith(("arr2:", "out2:", "out:", "outinit:")):
+        elif key.startswith("arr:") or key.startswith("io:") or key.startswith(
+            ("arr2:", "arr3:", "out2:", "out3:", "out:", "outinit:")
+        ):
             arr = _alloc_array(pkg, key, val, device)
             launch_args.append(arr)
             if key.startswith("out"):
@@ -606,6 +662,26 @@ def _corpus_block_dim(args):
     return None
 
 
+def _corpus_launch(wp, kern, args, launch_args, device):
+    """Launch a corpus kernel the way its builder pinned it.
+
+    Rows with a ``__block_dim__`` pin are tile kernels: both sides go through
+    ``wp.launch_tiled`` exactly like Newton's own call sites. Upstream CPU
+    resolves block_dim to 1 (``enable_cpu_blocks`` off — the serial bd=1
+    scalar-fallback discipline every golden is generated with); warp-metal
+    compiles the matching threadgroup-backed lowering under the same block
+    size. Unpinned rows keep the plain ``wp.launch`` (per-thread scalar tier).
+    """
+    dim = _corpus_launch_dim(args)
+    bd = _corpus_block_dim(args)
+    if bd is None:
+        wp.launch(kern, dim, inputs=launch_args, outputs=[], device=device)
+    else:
+        # upstream launch_tiled requires keyword dim (RuntimeError otherwise)
+        wp.launch_tiled(kern, dim=dim if isinstance(dim, (tuple, list)) else [dim],
+                        inputs=launch_args, outputs=[], device=device, block_dim=bd)
+
+
 def run_corpus_golden(out_npz: Path) -> dict:
     """Golden phase (Newton venv, real warp): CPU reference for every entry."""
     import numpy as np
@@ -641,8 +717,7 @@ def run_corpus_golden(out_npz: Path) -> dict:
         mod = importlib.import_module(module)
         kern = _resolve_kernel(mod, qualname, factory)
         launch_args, dim, out_arrays, out_names = _pack_args(wp, args, device="cpu", mod=mod)
-        wp.launch(kern, dim, inputs=launch_args, outputs=[], device="cpu",
-                  block_dim=_corpus_block_dim(args))
+        _corpus_launch(wp, kern, args, launch_args, "cpu")
         wp.synchronize()
         for i, name in enumerate(out_names):
             payload[f"{qualname}::{name}"] = _arr_view(out_arrays[i]).copy()
@@ -705,8 +780,7 @@ def run_corpus(golden_npz: Path) -> str:
             mod = importlib.import_module(module)
             kern = _resolve_kernel(mod, qualname, factory)
             launch_args, dim, out_arrays, out_names = _pack_args(wp, args, device="metal", mod=mod)
-            wp.launch(kern, dim, inputs=launch_args, outputs=[], device="metal",
-                      block_dim=_corpus_block_dim(args))
+            _corpus_launch(wp, kern, args, launch_args, "metal")
             wp.synchronize()
             ok, detail = True, []
             for i, name in enumerate(out_names):

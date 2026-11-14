@@ -21,6 +21,7 @@ budget, barrier-uniformity checkpoint, plain-launch scalar routing) run
 everywhere. Skips cleanly when no Metal device is present.
 """
 
+import re
 import unittest
 
 import numpy as np
@@ -639,6 +640,698 @@ class TestTileModelPins(unittest.TestCase):
         self.assertEqual(u.shr_arrays, [("float", BD)])
         self.assertIn(f"threadgroup float _wp_tile_shr_0[{BD}];", src)
         self.assertIn("threadgroup_barrier(mem_flags::mem_threadgroup);", src)
+
+    def test_row_view_advances_by_row_stride(self):
+        # ``arr2d[i]`` row slices (the steel armature / Newton corpus pattern)
+        # must advance the view's data pointer by i * strides[0] BYTES with a
+        # Python-style negative wrap, mirroring upstream array.h view(). A
+        # shape-product advance (idx * shape[1] * shape[2]) collapses to 0 on
+        # 2-D parents (shape[2] == 0) and pins every slice to row 0 — the
+        # corpus cholesky divergence. Pinned at the source level: both the
+        # load view and the store view must carry the stride advance.
+        @wp.kernel
+        def k_row_view(x: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+            i = wp.tid()
+            row = x[i]
+            t = wp.tile_load(row, shape=(BD,), bounds_check=False)
+            wp.tile_store(out[i], t)
+
+        u = self._translate(k_row_view, BD)
+        src = u.source()
+        advances = re.findall(
+            r"(\w+)_data = \(device \w+\*\)\(\(device char\*\)\(\w+_data\) \+ \(size_t\)\((.*?)\)\);", src
+        )
+        self.assertEqual(len(advances), 2)  # x view + out view
+        for _var, expr in advances:
+            # byte advance i * strides[0] (never a shape product, which folds
+            # to zero on 2-D parents), negative indices wrapped
+            self.assertIn(".strides[0]", expr)
+            self.assertIn("< 0 ?", expr)
+            self.assertNotIn(".shape[1]", expr)
+        # the meta shift: view strides copy the parent's trailing strides
+        self.assertIn(".strides[1]", src)
+        self.assertIn(".ndim - 1", src)
+
+
+# ---- KEP-0001 M2.4 P3+P4 kernels: matmul, alias views, diag_add, assign,
+# axis reductions, scan, and the cholesky/solve family -----------------------
+
+
+@wp.kernel
+def k_mm(a: wp.array2d(dtype=wp.float32), b: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    blk = wp.tid()
+    ta = wp.tile_load(a, shape=(4, 6), offset=(blk * 4, 0), storage="shared")
+    tb = wp.tile_load(b, shape=(6, 4), offset=(0, blk * 4), storage="shared")
+    c = wp.tile_zeros((4, 4), dtype=wp.float32, storage="shared")
+    wp.tile_matmul(ta, tb, c)
+    wp.tile_store(out, c, offset=(blk * 4, blk * 4))
+
+
+@wp.kernel
+def k_mm_acc(a: wp.array2d(dtype=wp.float32), b: wp.array2d(dtype=wp.float32), io: wp.array2d(dtype=wp.float32)):
+    blk = wp.tid()
+    ta = wp.tile_load(a, shape=(4, 6), offset=(blk * 4, 0), storage="shared")
+    tb = wp.tile_load(b, shape=(6, 4), offset=(0, blk * 4), storage="shared")
+    tc = wp.tile_load(io, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    wp.tile_matmul(ta, tb, tc, alpha=2.0, beta=3.0)
+    wp.tile_store(io, tc, offset=(blk * 4, 0))
+
+
+@wp.kernel
+def k_transpose(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(4, 6), offset=(blk * 4, 0), storage="shared")
+    tt = wp.tile_transpose(t)
+    wp.tile_store(out, tt, offset=(0, blk * 4))
+
+
+@wp.kernel
+def k_reshape(a: wp.array2d(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(4, 6), offset=(blk * 4, 0), storage="shared")
+    r = wp.tile_reshape(t, shape=(24,))
+    wp.tile_store(out, r, offset=(blk * 24,))
+
+
+@wp.kernel
+def k_reshape_write_through(a: wp.array2d(dtype=wp.float32), s: wp.array(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    # the reshape alias owns no storage: assigning through it writes the
+    # source tile's array (flat offset 7..10 -> t[1, 1..4]), visible in t
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(4, 6), offset=(blk * 4, 0), storage="shared")
+    sv = wp.tile_load(s, shape=(4,), offset=(blk * 4,), storage="shared")
+    r = wp.tile_reshape(t, shape=(24,))
+    wp.tile_assign(r, sv, offset=(7,))
+    wp.tile_store(out, t, offset=(blk * 4, 0))
+
+
+@wp.kernel
+def k_view_write_through(a: wp.array2d(dtype=wp.float32), s: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    # a (2,2) view at offset (1,1) aliases the source tile: the assign must
+    # land in the SOURCE tile's storage at (1,1)..(2,2) through the view's
+    # base+strides mapping
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(4, 6), offset=(blk * 4, 0), storage="shared")
+    sv = wp.tile_load(s, shape=(2, 2), offset=(blk * 2, 0), storage="shared")
+    v = wp.tile_view(t, offset=(1, 1), shape=(2, 2))
+    wp.tile_assign(v, sv, offset=(0, 0))
+    wp.tile_store(out, t, offset=(blk * 4, 0))
+
+
+@wp.kernel
+def k_assign_overlap(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    # src view aliases the dst columns the write shifts ONTO (read cols 0..3,
+    # write cols 2..5): the snapshot staging makes the shift copy ORIGINAL
+    # data (numpy assignment semantics), not half-updated columns
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(8, 8), offset=(blk * 8, 0), storage="shared")
+    s = wp.tile_view(t, offset=(0, 0), shape=(8, 4))
+    wp.tile_assign(t, s, offset=(0, 2))
+    wp.tile_store(out, t, offset=(blk * 8, 0))
+
+
+@wp.kernel
+def k_diag_add(a: wp.array2d(dtype=wp.float32), d: wp.array(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    dv = wp.tile_load(d, shape=(4,), offset=(blk * 4,), storage="shared")
+    c = wp.tile_diag_add(t, dv)
+    wp.tile_store(out, c, offset=(blk * 4, 0))
+
+
+@wp.kernel
+def k_axis_sum(a: wp.array2d(dtype=wp.float32), out0: wp.array(dtype=wp.float32), out1: wp.array(dtype=wp.float32)):
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(4, 6), offset=(blk * 4, 0), storage="shared")
+    s0 = wp.tile_sum(t, axis=0)
+    s1 = wp.tile_sum(t, axis=1)
+    wp.tile_store(out0, s0, offset=(blk * 6,))
+    wp.tile_store(out1, s1, offset=(blk * 4,))
+
+
+@wp.kernel
+def k_scan(a: wp.array(dtype=wp.float32), outi: wp.array(dtype=wp.float32), oute: wp.array(dtype=wp.float32)):
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(8,), offset=(blk * 8,), storage="shared")
+    ri = wp.tile_scan_inclusive(t)
+    re = wp.tile_scan_exclusive(t)
+    wp.tile_store(outi, ri, offset=(blk * 8,))
+    wp.tile_store(oute, re, offset=(blk * 8,))
+
+
+@wp.kernel
+def k_plain_scan(a: wp.array(dtype=wp.float32), outi: wp.array(dtype=wp.float32), oute: wp.array(dtype=wp.float32)):
+    # plain launch: the per-thread degenerate tile is the one loaded element,
+    # so the inclusive prefix IS the element and the exclusive prefix is the
+    # empty sum
+    i = wp.tid()
+    t = wp.tile_load(a, shape=(1,), offset=(i,))
+    ri = wp.tile_scan_inclusive(t)
+    re = wp.tile_scan_exclusive(t)
+    wp.tile_store(outi, ri, offset=(i,))
+    wp.tile_store(oute, re, offset=(i,))
+
+
+@wp.kernel
+def k_chol(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    l = wp.tile_cholesky(t)
+    wp.tile_store(out, l, offset=(blk * 4, 0))
+
+
+@wp.kernel
+def k_chol_inplace(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    wp.tile_cholesky_inplace(t)
+    wp.tile_store(out, t, offset=(blk * 4, 0))
+
+
+@wp.kernel
+def k_lower_solve(a: wp.array2d(dtype=wp.float32), y: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    blk = wp.tid()
+    l = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    v = wp.tile_load(y, shape=(4,), offset=(blk * 4,), storage="shared")
+    z = wp.tile_lower_solve(l, v)
+    wp.tile_store(out, z, offset=(blk * 4,))
+
+
+@wp.kernel
+def k_lower_solve_m(a: wp.array2d(dtype=wp.float32), y: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    blk = wp.tid()
+    l = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    v = wp.tile_load(y, shape=(4, 2), offset=(blk * 4, 0), storage="shared")
+    z = wp.tile_lower_solve(l, v)
+    wp.tile_store(out, z, offset=(blk * 4, 0))
+
+
+@wp.kernel
+def k_upper_solve(a: wp.array2d(dtype=wp.float32), y: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    # upstream idiom: U = transpose(L); upper_solve reads the transposed
+    # triangle through the alias's strided mapping
+    blk = wp.tid()
+    l = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    lt = wp.tile_transpose(l)
+    v = wp.tile_load(y, shape=(4, 2), offset=(blk * 4, 0), storage="shared")
+    x = wp.tile_upper_solve(lt, v)
+    wp.tile_store(out, x, offset=(blk * 4, 0))
+
+
+@wp.kernel
+def k_chol_solve(a: wp.array2d(dtype=wp.float32), y: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    blk = wp.tid()
+    l = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    v = wp.tile_load(y, shape=(4,), offset=(blk * 4,), storage="shared")
+    x = wp.tile_cholesky_solve(l, v, fill_mode="lower")
+    wp.tile_store(out, x, offset=(blk * 4,))
+
+
+@wp.kernel
+def k_chol_solve_upper(a: wp.array2d(dtype=wp.float32), y: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    # upper fill reads the factor from the input's upper triangle — the
+    # caller passes chol(H, "upper") (= chol(H, "lower") transposed)
+    blk = wp.tid()
+    h = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    v = wp.tile_load(y, shape=(4,), offset=(blk * 4,), storage="shared")
+    x = wp.tile_cholesky_solve(h, v, fill_mode="upper")
+    wp.tile_store(out, x, offset=(blk * 4,))
+
+
+@wp.kernel
+def k_chol_solve_inplace(a: wp.array2d(dtype=wp.float32), y: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    blk = wp.tid()
+    l = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    v = wp.tile_load(y, shape=(4,), offset=(blk * 4,), storage="shared")
+    wp.tile_cholesky_solve_inplace(l, v, fill_mode="lower")
+    wp.tile_store(out, v, offset=(blk * 4,))
+
+
+@wp.kernel
+def k_lower_solve_inplace(a: wp.array2d(dtype=wp.float32), y: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    blk = wp.tid()
+    l = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    v = wp.tile_load(y, shape=(4,), offset=(blk * 4,), storage="shared")
+    wp.tile_lower_solve_inplace(l, v)
+    wp.tile_store(out, v, offset=(blk * 4,))
+
+
+@wp.kernel
+def k_upper_solve_inplace(a: wp.array2d(dtype=wp.float32), y: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    blk = wp.tid()
+    l = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    lt = wp.tile_transpose(l)
+    v = wp.tile_load(y, shape=(4,), offset=(blk * 4,), storage="shared")
+    wp.tile_upper_solve_inplace(lt, v)
+    wp.tile_store(out, v, offset=(blk * 4,))
+
+
+# ---- P3+P4 numpy references -----------------------------------------------
+
+
+def _spd(rng, n, scale=3.0):
+    a = rng.standard_normal((n, n)).astype(np.float32)
+    return (a @ a.T + np.eye(n, dtype=np.float32) * scale).astype(np.float32)
+
+
+def _fwd_sub(L, y):
+    """forward substitution, float64 reference (vector or matrix rhs)"""
+    L = L.astype(np.float64)
+    y = np.atleast_2d(y.T).T.astype(np.float64) if y.ndim == 2 else y.astype(np.float64)
+    x = np.zeros_like(y)
+    for i in range(L.shape[0]):
+        s = y[i] - L[i, :i] @ x[:i]
+        x[i] = s / L[i, i]
+    return x
+
+
+def _bwd_sub(U, y):
+    """back substitution, float64 reference (vector or matrix rhs)"""
+    U = U.astype(np.float64)
+    y = y.astype(np.float64)
+    x = np.zeros_like(y)
+    for i in range(U.shape[0] - 1, -1, -1):
+        s = y[i] - U[i, i + 1 :] @ x[i + 1 :]
+        x[i] = s / U[i, i]
+    return x
+
+
+class TestTileMatmul(unittest.TestCase):
+    def setUp(self):
+        if _SKIP:
+            raise unittest.SkipTest(_SKIP_MSG)
+
+    def test_matmul_4x6_6x4(self):
+        rng = np.random.default_rng(21)
+        n_blocks = 2
+        a = rng.uniform(-2, 2, (n_blocks * 4, 6)).astype(np.float32)
+        b = rng.uniform(-2, 2, (6, n_blocks * 4)).astype(np.float32)
+        aa = wp.zeros((n_blocks * 4, 6), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        bb = wp.zeros((6, n_blocks * 4), dtype=wp.float32, device="metal")
+        bb.numpy_view()[:] = b
+        out = wp.full((n_blocks * 4, n_blocks * 4), -7.0, dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_mm, dim=n_blocks, inputs=[aa, bb, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = np.full((n_blocks * 4, n_blocks * 4), -7.0, dtype=np.float32)
+        for blk in range(n_blocks):
+            want[blk * 4 : (blk + 1) * 4, blk * 4 : (blk + 1) * 4] = (
+                a[blk * 4 : (blk + 1) * 4, :].astype(np.float64) @ b[:, blk * 4 : (blk + 1) * 4].astype(np.float64)
+            )
+        np.testing.assert_allclose(out.numpy_view(), want, rtol=1e-4, atol=1e-4)
+
+    def test_matmul_accumulate_alpha_beta(self):
+        # io = alpha * A @ B + beta * io, in place through the loaded tile
+        rng = np.random.default_rng(22)
+        n_blocks = 1
+        a = rng.uniform(-2, 2, (4, 6)).astype(np.float32)
+        b = rng.uniform(-2, 2, (6, 4)).astype(np.float32)
+        c0 = rng.uniform(-2, 2, (4, 4)).astype(np.float32)
+        aa = wp.zeros((4, 6), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        bb = wp.zeros((6, 4), dtype=wp.float32, device="metal")
+        bb.numpy_view()[:] = b
+        io = wp.zeros((4, 4), dtype=wp.float32, device="metal")
+        io.numpy_view()[:] = c0
+        wp.launch_tiled(k_mm_acc, dim=n_blocks, inputs=[aa, bb, io], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = 2.0 * (a.astype(np.float64) @ b.astype(np.float64)) + 3.0 * c0.astype(np.float64)
+        np.testing.assert_allclose(io.numpy_view(), want, rtol=1e-4, atol=1e-4)
+
+
+class TestTileViewAliases(unittest.TestCase):
+    def setUp(self):
+        if _SKIP:
+            raise unittest.SkipTest(_SKIP_MSG)
+
+    def test_transpose_store_reordered(self):
+        rng = np.random.default_rng(23)
+        n_blocks = 2
+        a = rng.uniform(-5, 5, (n_blocks * 4, 6)).astype(np.float32)
+        aa = wp.zeros((n_blocks * 4, 6), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        out = wp.full((6, n_blocks * 4), -7.0, dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_transpose, dim=n_blocks, inputs=[aa, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = np.full((6, n_blocks * 4), -7.0, dtype=np.float32)
+        for blk in range(n_blocks):
+            want[:, blk * 4 : (blk + 1) * 4] = a[blk * 4 : (blk + 1) * 4, :].T
+        np.testing.assert_allclose(out.numpy_view(), want, rtol=TOL, atol=1e-6)
+
+    def test_reshape_flatten_row_major(self):
+        rng = np.random.default_rng(24)
+        n_blocks = 2
+        a = rng.uniform(-5, 5, (n_blocks * 4, 6)).astype(np.float32)
+        aa = wp.zeros((n_blocks * 4, 6), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        out = wp.full(n_blocks * 24, -7.0, dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_reshape, dim=n_blocks, inputs=[aa, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = np.full(n_blocks * 24, -7.0, dtype=np.float32)
+        for blk in range(n_blocks):
+            want[blk * 24 : (blk + 1) * 24] = a[blk * 4 : (blk + 1) * 4, :].reshape(24)
+        np.testing.assert_allclose(out.numpy_view(), want, rtol=TOL, atol=1e-6)
+
+    def test_reshape_write_through_visible_in_source(self):
+        rng = np.random.default_rng(25)
+        n_blocks = 1
+        a = rng.uniform(-5, 5, (4, 6)).astype(np.float32)
+        s = rng.uniform(10, 20, 4).astype(np.float32)
+        aa = wp.zeros((4, 6), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        ss = wp.zeros(4, dtype=wp.float32, device="metal")
+        ss.numpy_view()[:] = s
+        out = wp.zeros((4, 6), dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_reshape_write_through, dim=n_blocks, inputs=[aa, ss, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = a.copy()
+        want[1, 1:5] = s  # flat offset 7..10 of the (4,6) reshape
+        np.testing.assert_allclose(out.numpy_view(), want, rtol=TOL, atol=1e-6)
+
+    def test_view_write_through_visible_in_source(self):
+        rng = np.random.default_rng(26)
+        n_blocks = 2
+        a = rng.uniform(-5, 5, (n_blocks * 4, 6)).astype(np.float32)
+        s = rng.uniform(10, 20, (n_blocks * 2, 2)).astype(np.float32)
+        aa = wp.zeros((n_blocks * 4, 6), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        ss = wp.zeros((n_blocks * 2, 2), dtype=wp.float32, device="metal")
+        ss.numpy_view()[:] = s
+        out = wp.zeros((n_blocks * 4, 6), dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_view_write_through, dim=n_blocks, inputs=[aa, ss, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = a.copy()
+        for blk in range(n_blocks):
+            want[blk * 4 + 1 : blk * 4 + 3, 1:3] = s[blk * 2 : (blk + 1) * 2, :]
+        np.testing.assert_allclose(out.numpy_view(), want, rtol=TOL, atol=1e-6)
+
+    def test_assign_overlap_snapshot_semantics(self):
+        # numpy assignment semantics: the aliased source is snapshotted before
+        # the shifted write, so cols 2..3 of the ORIGINAL survive in cols 4..5
+        rng = np.random.default_rng(27)
+        n_blocks = 2
+        a = rng.uniform(-5, 5, (n_blocks * 8, 8)).astype(np.float32)
+        aa = wp.zeros((n_blocks * 8, 8), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        out = wp.zeros((n_blocks * 8, 8), dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_assign_overlap, dim=n_blocks, inputs=[aa, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = a.copy()
+        for blk in range(n_blocks):
+            t = a[blk * 8 : (blk + 1) * 8, :]
+            want[blk * 8 : (blk + 1) * 8, 2:6] = t[:, 0:4]
+        np.testing.assert_allclose(out.numpy_view(), want, rtol=TOL, atol=1e-6)
+
+
+class TestTileDiagAddAxisReduce(unittest.TestCase):
+    def setUp(self):
+        if _SKIP:
+            raise unittest.SkipTest(_SKIP_MSG)
+
+    def test_diag_add(self):
+        rng = np.random.default_rng(28)
+        n_blocks = 2
+        a = rng.uniform(-5, 5, (n_blocks * 4, 4)).astype(np.float32)
+        d = rng.uniform(0.5, 2.0, n_blocks * 4).astype(np.float32)
+        aa = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        dd = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        dd.numpy_view()[:] = d
+        out = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_diag_add, dim=n_blocks, inputs=[aa, dd, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = a.copy()
+        for blk in range(n_blocks):
+            want[blk * 4 : (blk + 1) * 4] += np.eye(4, dtype=np.float32) * d[blk * 4 : (blk + 1) * 4, None]
+        np.testing.assert_allclose(out.numpy_view(), want, rtol=TOL, atol=1e-6)
+
+    def test_axis_sum_both_axes(self):
+        rng = np.random.default_rng(29)
+        n_blocks = 2
+        a = rng.uniform(-5, 5, (n_blocks * 4, 6)).astype(np.float32)
+        aa = wp.zeros((n_blocks * 4, 6), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        out0 = wp.zeros(n_blocks * 6, dtype=wp.float32, device="metal")
+        out1 = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_axis_sum, dim=n_blocks, inputs=[aa, out0, out1], block_dim=BD, device="metal")
+        wp.synchronize()
+        for blk in range(n_blocks):
+            t = a[blk * 4 : (blk + 1) * 4, :]
+            np.testing.assert_allclose(
+                out0.numpy_view()[blk * 6 : (blk + 1) * 6], t.sum(axis=0, dtype=np.float64), rtol=1e-4, atol=1e-4
+            )
+            np.testing.assert_allclose(
+                out1.numpy_view()[blk * 4 : (blk + 1) * 4], t.sum(axis=1, dtype=np.float64), rtol=1e-4, atol=1e-4
+            )
+
+
+class TestTileScan(unittest.TestCase):
+    def setUp(self):
+        if _SKIP:
+            raise unittest.SkipTest(_SKIP_MSG)
+
+    def test_inclusive_exclusive(self):
+        # Hillis-Steele deviates from upstream's sequential float order, so
+        # the comparison carries a 1e-4 relative tolerance
+        rng = np.random.default_rng(30)
+        n_blocks = 3
+        a = rng.uniform(-5, 5, n_blocks * 8).astype(np.float32)
+        aa = wp.zeros(n_blocks * 8, dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        outi = wp.zeros(n_blocks * 8, dtype=wp.float32, device="metal")
+        oute = wp.zeros(n_blocks * 8, dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_scan, dim=n_blocks, inputs=[aa, outi, oute], block_dim=BD, device="metal")
+        wp.synchronize()
+        for blk in range(n_blocks):
+            chunk = a[blk * 8 : (blk + 1) * 8].astype(np.float64)
+            np.testing.assert_allclose(outi.numpy_view()[blk * 8 : (blk + 1) * 8], np.cumsum(chunk), rtol=1e-4, atol=1e-4)
+            np.testing.assert_allclose(
+                oute.numpy_view()[blk * 8 : (blk + 1) * 8], np.concatenate([[0.0], np.cumsum(chunk)[:-1]]),
+                rtol=1e-4, atol=1e-4,
+            )
+
+    def test_plain_launch_degenerate(self):
+        # plain launch scalar tier: inclusive prefix = the element itself,
+        # exclusive prefix = the empty sum
+        rng = np.random.default_rng(31)
+        a = rng.uniform(-5, 5, 16).astype(np.float32)
+        aa = wp.zeros(16, dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = a
+        outi = wp.full(16, -1.0, dtype=wp.float32, device="metal")
+        oute = wp.full(16, -1.0, dtype=wp.float32, device="metal")
+        wp.launch(k_plain_scan, dim=16, inputs=[aa, outi, oute], device="metal")
+        wp.synchronize()
+        np.testing.assert_allclose(outi.numpy_view(), a, rtol=TOL)
+        np.testing.assert_allclose(oute.numpy_view(), np.zeros(16, dtype=np.float32), rtol=TOL)
+
+
+class TestTileCholeskySolve(unittest.TestCase):
+    def setUp(self):
+        if _SKIP:
+            raise unittest.SkipTest(_SKIP_MSG)
+
+    def _spd_blocks(self, seed, n_blocks, n=4):
+        rng = np.random.default_rng(seed)
+        return np.concatenate([_spd(rng, n)[None] for _ in range(n_blocks)], axis=0)
+
+    def test_cholesky_lower(self):
+        n_blocks = 3
+        h = self._spd_blocks(32, n_blocks)
+        aa = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = h.reshape(n_blocks * 4, 4)
+        out = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_chol, dim=n_blocks, inputs=[aa, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = np.concatenate([np.linalg.cholesky(h[b].astype(np.float64))[None] for b in range(n_blocks)])
+        np.testing.assert_allclose(out.numpy_view().reshape(n_blocks, 4, 4), want, rtol=1e-4, atol=1e-5)
+
+    def test_cholesky_inplace(self):
+        n_blocks = 2
+        h = self._spd_blocks(33, n_blocks)
+        aa = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = h.reshape(n_blocks * 4, 4)
+        out = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_chol_inplace, dim=n_blocks, inputs=[aa, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = np.concatenate([np.linalg.cholesky(h[b].astype(np.float64))[None] for b in range(n_blocks)])
+        np.testing.assert_allclose(out.numpy_view().reshape(n_blocks, 4, 4), want, rtol=1e-4, atol=1e-5)
+
+    def test_lower_solve_vector_and_matrix(self):
+        rng = np.random.default_rng(34)
+        n_blocks = 2
+        ls = np.concatenate([np.linalg.cholesky(_spd(rng, 4)).astype(np.float32)[None] for _ in range(n_blocks)])
+        yv = rng.uniform(-5, 5, n_blocks * 4).astype(np.float32)
+        ym = rng.uniform(-5, 5, (n_blocks * 4, 2)).astype(np.float32)
+        ll = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        ll.numpy_view()[:] = ls.reshape(n_blocks * 4, 4)
+        yy = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        yy.numpy_view()[:] = yv
+        ymm = wp.zeros((n_blocks * 4, 2), dtype=wp.float32, device="metal")
+        ymm.numpy_view()[:] = ym
+        outv = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        outm = wp.zeros((n_blocks * 4, 2), dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_lower_solve, dim=n_blocks, inputs=[ll, yy, outv], block_dim=BD, device="metal")
+        wp.launch_tiled(k_lower_solve_m, dim=n_blocks, inputs=[ll, ymm, outm], block_dim=BD, device="metal")
+        wp.synchronize()
+        for b in range(n_blocks):
+            np.testing.assert_allclose(
+                outv.numpy_view()[b * 4 : (b + 1) * 4], _fwd_sub(ls[b], yv[b * 4 : (b + 1) * 4]), rtol=1e-4, atol=1e-5
+            )
+            np.testing.assert_allclose(
+                outm.numpy_view()[b * 4 : (b + 1) * 4, :], _fwd_sub(ls[b], ym[b * 4 : (b + 1) * 4, :]), rtol=1e-4, atol=1e-5
+            )
+
+    def test_upper_solve_via_transpose(self):
+        rng = np.random.default_rng(35)
+        n_blocks = 2
+        ls = np.concatenate([np.linalg.cholesky(_spd(rng, 4)).astype(np.float32)[None] for _ in range(n_blocks)])
+        ym = rng.uniform(-5, 5, (n_blocks * 4, 2)).astype(np.float32)
+        ll = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        ll.numpy_view()[:] = ls.reshape(n_blocks * 4, 4)
+        ymm = wp.zeros((n_blocks * 4, 2), dtype=wp.float32, device="metal")
+        ymm.numpy_view()[:] = ym
+        outm = wp.zeros((n_blocks * 4, 2), dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_upper_solve, dim=n_blocks, inputs=[ll, ymm, outm], block_dim=BD, device="metal")
+        wp.synchronize()
+        for b in range(n_blocks):
+            np.testing.assert_allclose(
+                outm.numpy_view()[b * 4 : (b + 1) * 4, :], _bwd_sub(ls[b].T, ym[b * 4 : (b + 1) * 4, :]), rtol=1e-4, atol=1e-5
+            )
+
+    def test_cholesky_solve_lower_upper(self):
+        rng = np.random.default_rng(36)
+        n_blocks = 2
+        h = self._spd_blocks(37, n_blocks)
+        yv = rng.uniform(-5, 5, n_blocks * 4).astype(np.float32)
+        # the solve family takes the FACTOR in the fill_mode triangle
+        # (upstream names the argument L): lower fill reads the lower
+        # triangle of the input, upper fill reads its upper triangle —
+        # feed chol(h, "lower") for the lower-fill kernel and its transpose
+        # (= chol(h, "upper")) for the upper-fill kernel
+        ls = np.linalg.cholesky(h).astype(np.float32)
+        hh = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        hh.numpy_view()[:] = ls.reshape(n_blocks * 4, 4)
+        hu = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        hu.numpy_view()[:] = ls.transpose(0, 2, 1).reshape(n_blocks * 4, 4)
+        yy = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        yy.numpy_view()[:] = yv
+        outl = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        outu = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_chol_solve, dim=n_blocks, inputs=[hh, yy, outl], block_dim=BD, device="metal")
+        wp.launch_tiled(k_chol_solve_upper, dim=n_blocks, inputs=[hu, yy, outu], block_dim=BD, device="metal")
+        wp.synchronize()
+        for b in range(n_blocks):
+            want = np.linalg.solve(h[b].astype(np.float64), yv[b * 4 : (b + 1) * 4].astype(np.float64))
+            np.testing.assert_allclose(outl.numpy_view()[b * 4 : (b + 1) * 4], want, rtol=1e-4, atol=1e-5)
+            np.testing.assert_allclose(outu.numpy_view()[b * 4 : (b + 1) * 4], want, rtol=1e-4, atol=1e-5)
+
+    def test_solve_inplace_variants(self):
+        rng = np.random.default_rng(38)
+        n_blocks = 2
+        ls = np.concatenate([np.linalg.cholesky(_spd(rng, 4)).astype(np.float32)[None] for _ in range(n_blocks)])
+        yv = rng.uniform(-5, 5, n_blocks * 4).astype(np.float32)
+        ll = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        ll.numpy_view()[:] = ls.reshape(n_blocks * 4, 4)
+        yy = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        yy.numpy_view()[:] = yv
+        yl = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        yl.numpy_view()[:] = yv
+        yu = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        yu.numpy_view()[:] = yv
+        yc = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        yc.numpy_view()[:] = yv
+        outl = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        outu = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        outc = wp.zeros(n_blocks * 4, dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_lower_solve_inplace, dim=n_blocks, inputs=[ll, yl, outl], block_dim=BD, device="metal")
+        wp.launch_tiled(k_upper_solve_inplace, dim=n_blocks, inputs=[ll, yu, outu], block_dim=BD, device="metal")
+        wp.launch_tiled(k_chol_solve_inplace, dim=n_blocks, inputs=[ll, yc, outc], block_dim=BD, device="metal")
+        wp.synchronize()
+        for b in range(n_blocks):
+            y = yv[b * 4 : (b + 1) * 4].astype(np.float64)
+            np.testing.assert_allclose(outl.numpy_view()[b * 4 : (b + 1) * 4], _fwd_sub(ls[b], yv[b * 4 : (b + 1) * 4]), rtol=1e-4, atol=1e-5)
+            np.testing.assert_allclose(outu.numpy_view()[b * 4 : (b + 1) * 4], _bwd_sub(ls[b].T, yv[b * 4 : (b + 1) * 4]), rtol=1e-4, atol=1e-5)
+            want = np.linalg.solve(ls[b].astype(np.float64) @ ls[b].astype(np.float64).T, y)
+            np.testing.assert_allclose(outc.numpy_view()[b * 4 : (b + 1) * 4], want, rtol=1e-4, atol=1e-5)
+
+
+class TestTileP34Pins(unittest.TestCase):
+    """Translate-only pins for the P3+P4 closure (CPU-safe)."""
+
+    def _translate(self, kern, block_dim=None):
+        from warp_metal.msl.translate import translate_kernel
+
+        opts = {"block_dim": block_dim} if block_dim else {}
+        return translate_kernel(kern, opts)
+
+    def test_alias_decl_claims_no_slot(self):
+        # a tile_transpose result is a metadata alias: the only threadgroup
+        # array is the source tile's — the alias borrows its slot
+        @wp.kernel
+        def k_alias(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+            t = wp.tile_load(a, shape=(4, 6), storage="shared")
+            tt = wp.tile_transpose(t)
+            wp.tile_store(out, tt, offset=(0, 0))
+
+        u = self._translate(k_alias, BD)
+        self.assertEqual(u.shr_arrays, [("float", 24)])
+        src = u.source()
+        self.assertIn("_wp_tile_shr_0[24]", src)
+        self.assertNotIn("_wp_tile_shr_1[", src)
+
+    def test_plain_cholesky_identity(self):
+        # plain scalar tier: the (1,1) factor is sqrt(a) — the n=1 serial
+        # case upstream runs at WP_TILE_BLOCK_DIM == 1; no barriers, no
+        # shared arrays
+        @wp.kernel
+        def k_plain_chol(out: wp.array(dtype=wp.float32)):
+            i = wp.tid()
+            t = wp.tile_zeros((1, 1), dtype=wp.float32, storage="shared")
+            wp.tile_cholesky_inplace(t)
+            wp.tile_store(out, wp.tile_reshape(t, shape=(1,)), offset=(i,))
+
+        u = self._translate(k_plain_chol)
+        src = u.source()
+        self.assertIn("= sqrt(", src)
+        self.assertNotIn("threadgroup_barrier", src)
+        self.assertEqual(u.shr_arrays, [])
+
+    def test_plain_solve_guarded_division(self):
+        # plain scalar tier: each solve phase is one diag-guarded division
+        # (upstream's `(diag != 0.0f) ? s/diag : s`)
+        @wp.kernel
+        def k_plain_solve(a: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            i = wp.tid()
+            l = wp.tile_zeros((1, 1), dtype=wp.float32, storage="shared")
+            v = wp.tile_load(y, shape=(1,), offset=(i,))
+            z = wp.tile_lower_solve(l, v)
+            wp.tile_store(out, z, offset=(i,))
+
+        u = self._translate(k_plain_solve)
+        src = u.source()
+        self.assertIn("!= 0.0f", src)
+        self.assertNotIn("threadgroup_barrier", src)
+        self.assertEqual(u.shr_arrays, [])
+
+    def test_matmul_strided_gemm_loop(self):
+        # the launch_tiled GEMM: per-thread strided output elements, k
+        # ascending (upstream's accumulation order), one end barrier
+        u = self._translate(k_mm, BD)
+        src = u.source()
+        self.assertIn("for (int _wp_g = _wp_lane;", src)
+        self.assertIn("for (int _wp_k = 0; _wp_k < 6; ++_wp_k)", src)
+        self.assertIn("* _wp_acc + ", src)
+        self.assertIn("threadgroup_barrier(mem_flags::mem_threadgroup);", src)
+
+    def test_cholesky_statement_inplace_form(self):
+        # wp.tile_cholesky_inplace lowers as a statement: thread-0 diagonal
+        # write, strided row updates, one barrier per column — upstream's
+        # scalar_cholesky_impl verbatim
+        u = self._translate(k_chol_inplace, BD)
+        src = u.source()
+        self.assertIn("if (_wp_lane == 0)", src)
+        self.assertIn("= sqrt(_wp_s);", src)
+        self.assertIn("float _wp_inv_s = 1.0f / _wp_s;", src)
 
 
 if __name__ == "__main__":

@@ -916,6 +916,195 @@ def b_narrow_phase_primitive_kernel(rng):
     )
 
 
+# ---------------------------------------------------------------------------
+# KEP-0001 M2.4 P3+P4: steel solver tile factories (solver_steel.py). Each
+# factory bakes one articulation per launch block over fixed-dof tile shapes,
+# so the fixtures pin n_dofs=12 (3 articulations x 4 dofs) and route through
+# ``__block_dim__`` (conform.py launches both sides with wp.launch_tiled:
+# upstream CPU resolves bd=1 — the serial scalar-fallback discipline every
+# golden is generated with; warp-metal compiles the matching threadgroup
+# lowering). SPD inputs come from seeded numpy so cholesky's sqrt chain never
+# touches a negative; masked articulations exercise the early return with the
+# untouched outputs pre-zeroed identically on both sides.
+# ---------------------------------------------------------------------------
+
+_STEEL_ARTS = 3
+_STEEL_DOFS = 12
+_STEEL_JOINTS = 12  # 1-dof joints: joint j belongs to dof j within its art
+
+
+def _spd_group(rng, arts, n):
+    """(arts, n, n) SPD float32: A@A.T + 3I per articulation."""
+    out = np.empty((arts, n, n), dtype=np.float32)
+    for g in range(arts):
+        a = rng.standard_normal((n, n)).astype(np.float32)
+        out[g] = a @ a.T + np.eye(n, dtype=np.float32) * 3.0
+    return out.astype(np.float32)
+
+
+def _lower_group(rng, arts, n):
+    """(arts, n, n) lower-triangular Cholesky factors of _spd_group."""
+    return np.linalg.cholesky(_spd_group(rng, arts, n)).astype(np.float32)
+
+
+def _steel_layout(rng):
+    """(group_to_art, mass_update_mask) for the 3-articulation fixtures:
+    identity art map, articulation 1 masked out (early-return branch)."""
+    return (
+        np.arange(_STEEL_ARTS, dtype=np.int32),
+        np.array([1, 0, 1], dtype=np.int32),
+    )
+
+
+def b_steel_cholesky_kernel(rng):
+    """steel solver_steel._get_cholesky_kernel(12, arch, 1): tile Cholesky of
+    H + diag(armature) per articulation (M2.4 P4)."""
+    g2a, mask = _steel_layout(rng)
+    return (
+        [
+            ("H_group", "arr3:f32", _spd_group(rng, _STEEL_ARTS, _STEEL_DOFS)),
+            ("R_group", "arr2:f32", rng.uniform(0.1, 1.0, (_STEEL_ARTS, _STEEL_DOFS)).astype(np.float32)),
+            ("group_to_art", "arr:i32", g2a),
+            ("mass_update_mask", "arr:i32", mask),
+            ("L_group", "out3:f32", (_STEEL_ARTS, _STEEL_DOFS, _STEEL_DOFS)),
+            ("__dim__", "", _STEEL_ARTS),
+            ("__block_dim__", "", 1),
+        ],
+        [],
+    )
+
+
+def b_steel_triangular_solve_kernel(rng):
+    """steel solver_steel._get_triangular_solve_kernel(12, arch, 1): tiled
+    forward/backward substitution L L^T x = tau (M2.4 P4)."""
+    g2a, _mask = _steel_layout(rng)
+    return (
+        [
+            ("L_group", "arr3:f32", _lower_group(rng, _STEEL_ARTS, _STEEL_DOFS)),
+            ("tau_group", "arr3:f32", rng.standard_normal((_STEEL_ARTS, _STEEL_DOFS, 1)).astype(np.float32)),
+            ("group_to_art", "arr:i32", g2a),
+            ("articulation_active", "arr:i32", np.array([1, 1, 1], dtype=np.int32)),
+            ("qdd_group", "out3:f32", (_STEEL_ARTS, _STEEL_DOFS, 1)),
+            ("__dim__", "", _STEEL_ARTS),
+            ("__block_dim__", "", 1),
+        ],
+        [],
+    )
+
+
+def _steel_hinv_args(rng, diag_group):
+    """Shared fixture for the two H^-1 J^T factories: lower factors, a fully
+    initialized Jacobian (3 constraint chunks x 12 dofs, 5 active rows), and
+    the world bookkeeping the kernel reads. max_constraints=8 with
+    constraint_chunk_size=3 pins BOUNDS_CHECK=True (8 % 3 != 0); launch dim
+    (arts, 2 chunks) drives ``idx, chunk = wp.tid()``; rows >= 5 stay at the
+    pre-zeroed initial value on both sides."""
+    g2a, _mask = _steel_layout(rng)
+    args = [
+        ("L_group", "arr3:f32", _lower_group(rng, _STEEL_ARTS, _STEEL_DOFS)),
+        ("J_group", "arr3:f32", rng.standard_normal((_STEEL_ARTS, 8, _STEEL_DOFS)).astype(np.float32)),
+        ("group_to_art", "arr:i32", g2a),
+        ("art_to_world", "arr:i32", np.arange(_STEEL_ARTS, dtype=np.int32)),
+        ("articulation_world_dof_offset", "arr:i32", np.array([0, 12, 24], dtype=np.int32)),
+        ("world_constraint_count", "arr:i32", np.full(_STEEL_ARTS, 5, dtype=np.int32)),
+        ("Y_group", "out3:f32", (_STEEL_ARTS, 8, _STEEL_DOFS)),
+        # WRITE_WORLD=0 folds the world stores out; binding real outputs
+        # verifies no stray writes land
+        ("J_world", "out3:f32", (_STEEL_ARTS, 8, 36)),
+        ("Y_world", "out3:f32", (_STEEL_ARTS, 8, 36)),
+    ]
+    if diag_group is not None:
+        args.append(("diag_group", "out2:f32", (_STEEL_ARTS, 8)))
+    args += [("__dim__", "", (_STEEL_ARTS, 2)), ("__block_dim__", "", 1)]
+    return args
+
+
+def b_steel_hinv_jt_plain_kernel(rng):
+    """steel solver_steel._get_hinv_jt_plain_kernel(12, 8, arch, 1, 3):
+    tile_transpose aliases + tile_lower_solve/tile_upper_solve over a (3,12)
+    constraint chunk (M2.4 P3+P4)."""
+    return (_steel_hinv_args(rng, None), [])
+
+
+def b_steel_hinv_jt_kernel(rng):
+    """steel solver_steel._get_hinv_jt_kernel(12, 8, arch, 1, 3,
+    compute_diag=False): the full variant — same solve chain plus the
+    (compiled-out at this fill_mode) diag output binding (M2.4 P3+P4)."""
+    return (_steel_hinv_args(rng, "diag"), [])
+
+
+def b_steel_crba_cholesky_kernel(rng):
+    """steel solver_steel._get_crba_cholesky_kernel(12, arch, tile_threads=1):
+    composite-RBA mass matrix staged via tile_scatter_masked (scalar +
+    spatial_vector forms) + tile_extract + tile_diag_add + tile_cholesky
+    (M2.4 P3+P4).
+
+    The fixed source map keeps H strictly diagonally dominant so the factor
+    never sqrt's a negative: S[d] = amp_d (e_{d%6} + 0.05 e_{(d+1)%6}) with
+    amp_d = 0.8**d, body inertias c_j I6, source_dof diagonal = self and
+    subdiagonal = the dof two steps back (a weak cross term); the augmented
+    drive adds positive K on the odd dofs only."""
+    arts, dofs, joints = _STEEL_ARTS, _STEEL_DOFS, _STEEL_JOINTS
+    amp = 0.8 ** np.arange(dofs, dtype=np.float32)
+    s_vec = np.zeros((dofs, 6), dtype=np.float32)
+    for d in range(dofs):
+        s_vec[d, d % 6] = amp[d]
+        s_vec[d, (d + 1) % 6] = 0.05 * amp[d]
+    body_i = np.zeros((joints + 4, 36), dtype=np.float32)
+    for j in range(joints + 4):
+        body_i[j] = (np.eye(6, dtype=np.float32) * (1.0 + 0.05 * j)).reshape(36)
+    source_dof = np.full((dofs, dofs), -1, dtype=np.int32)
+    for r in range(dofs):
+        source_dof[r, r] = r
+        if r >= 2:
+            source_dof[r, r - 1] = r - 2
+        if r + 1 < dofs:
+            source_dof[r, r + 1] = r
+    drive_k = np.array([0.3 if d % 2 == 0 else 0.0 for d in range(dofs)], dtype=np.float32)
+    g2a, mask = _steel_layout(rng)
+    return (
+        [
+            ("articulation_start", "arr:i32", np.arange(arts, dtype=np.int32) * 4),
+            ("articulation_dof_start", "arr:i32", np.arange(arts, dtype=np.int32) * 4),
+            ("mass_update_mask", "arr:i32", mask),
+            ("joint_child", "arr:i32", np.arange(1, joints + 1, dtype=np.int32)),
+            ("joint_S_s", "arr:spatial_vector", s_vec),
+            ("body_I_c", "arr:spatial_matrix", body_i),
+            ("group_to_art", "arr:i32", g2a),
+            ("R_group", "arr2:f32", np.full((arts, dofs), 0.5, dtype=np.float32)),
+            ("dof_joint_offset", "arr:i32", np.tile(np.arange(4, dtype=np.int32), arts)),
+            ("source_dof", "arr2:i32", source_dof),
+            ("fused_augmented_drive", "scalar:i32", 1),
+            ("drive_dof_K", "arr:f32", drive_k),
+            ("L_group", "out3:f32", (arts, dofs, dofs)),
+            ("__dim__", "", arts),
+            ("__block_dim__", "", 1),
+        ],
+        [],
+    )
+
+
+def b_steel_cholesky_inverse_tiled_kernel(rng):
+    """steel solver_steel._get_cholesky_inverse_tiled_kernel(12, arch, 1):
+    factor + tile_cholesky_solve against a shared identity tile — the
+    materialized inverse (M2.4 P4)."""
+    g2a, mask = _steel_layout(rng)
+    return (
+        [
+            ("H_group", "arr3:f32", _spd_group(rng, _STEEL_ARTS, _STEEL_DOFS)),
+            ("R_group", "arr2:f32", rng.uniform(0.1, 1.0, (_STEEL_ARTS, _STEEL_DOFS)).astype(np.float32)),
+            ("identity", "arr2:f32", np.eye(_STEEL_DOFS, dtype=np.float32)),
+            ("group_to_art", "arr:i32", g2a),
+            ("mass_update_mask", "arr:i32", mask),
+            ("L_group", "out3:f32", (_STEEL_ARTS, _STEEL_DOFS, _STEEL_DOFS)),
+            ("Hinv_group", "out3:f32", (_STEEL_ARTS, _STEEL_DOFS, _STEEL_DOFS)),
+            ("__dim__", "", _STEEL_ARTS),
+            ("__block_dim__", "", 1),
+        ],
+        [],
+    )
+
+
 BUILDERS = {
     name[2:]: fn  # strip leading "b_"
     for name, fn in list(globals().items())

@@ -502,7 +502,7 @@ _RE_RETURN = re.compile(r"^\s*return\s*(.*?);\s*$")
 # wp::tile_layout_strided_t<wp::tile_shape_t<D0,...>, wp::tile_stride_t<...>>,
 # ALIGN> var = ...`).
 _RE_TILE_DECL = re.compile(
-    r"^\s*(?:const\s+)?wp::tile_(register|shared)_t<([A-Za-z0-9_:<>,\s]+)>\s+(\w+)\s*=\s*.*?;\s*$"
+    r"^\s*(?:const\s+)?wp::tile_(register|shared)_t<([A-Za-z0-9_:<>,\s]+)>\s+(\w+)\s*=\s*([^;]*);\s*$"
 )
 _RE_TILE_SHAPE = re.compile(r"wp::tile_shape_t<([\d,\s]+)>")
 
@@ -522,19 +522,95 @@ class TileVar:
                       ``tile_shared_t`` decl, every register decl whose shape
                       is not the per-thread one-element form, and every
                       reduction result (a shape-(1,) shared tile).
+                      ``slot == -1`` marks a non-owning ALIAS decl (the
+                      ``= nullptr`` form a ``wp::tile_transpose/reshape/view``
+                      result is declared with): no storage of its own — the
+                      producing assignment binds ``slot``/``base`` to the
+                      source tile's array (upstream Owner=false shared view).
     kind == "scalar": the tile is the thread's own element value — the
                       ``wp.tile(v)`` broadcast / per-thread 1-element register
                       form, kept on the M1 per-thread-scalar lowering.
+
+    ``strides`` are the per-dimension element strides into the backing array
+    (row-major of ``dims`` for owner tiles; the swapped template strides for
+    transpose aliases) and ``base`` the MSL element-offset expression of the
+    view origin (``"0"`` for owners and transpose/reshape aliases, the
+    offset-coordinate dot product for ``tile_view``). Storage address of an
+    element is ``base + sum(coord_i * strides_i)``; a contiguous tile
+    (base "0", row-major strides) keeps the identity linear mapping.
     """
 
-    __slots__ = ("kind", "elem", "slot", "size", "dims")
+    __slots__ = ("kind", "elem", "slot", "size", "dims", "strides", "base")
 
-    def __init__(self, kind: str, elem: str, slot: int = -1, size: int = 0, dims: list[int] | None = None):
+    def __init__(
+        self,
+        kind: str,
+        elem: str,
+        slot: int = -1,
+        size: int = 0,
+        dims: list[int] | None = None,
+        strides: list[int] | None = None,
+        base: str = "0",
+    ):
         self.kind = kind
         self.elem = elem
         self.slot = slot
         self.size = size
         self.dims = dims or []
+        self.strides = strides if strides is not None else _rowmajor_strides(self.dims)
+        self.base = base
+
+    def is_contig(self) -> bool:
+        return self.base == "0" and self.strides == _rowmajor_strides(self.dims)
+
+    def coord_addr(self, coords: list[str]) -> str:
+        """Storage address expression for one element given per-dim coordinate
+        MSL expressions (len == len(dims))."""
+        parts = []
+        if self.base != "0":
+            parts.append(f"({self.base})")
+        for c, s in zip(coords, self.strides):
+            if s == 1:
+                parts.append(f"({c})")
+            elif s != 0:
+                parts.append(f"({c}) * {s}")
+        if not parts:
+            return "0"
+        return parts[0] if len(parts) == 1 else " + ".join(parts)
+
+    def lin_addr(self, lin: str, prefix: str = "_wp_v") -> tuple[list[str], str]:
+        """(coordinate-decl lines, storage address) for one element given its
+        tile-linear index expression. Contiguous tiles map the linear index
+        straight through; strided views unravel coordinates first."""
+        if self.is_contig():
+            return [], lin
+        lines: list[str] = []
+        coords: list[str] = []
+        div = 1
+        for d in self.dims[1:]:
+            div *= d
+        rem = lin
+        for i, d in enumerate(self.dims):
+            if i == len(self.dims) - 1:
+                coords.append(rem)
+            else:
+                name = f"{prefix}{i}"
+                # no trailing semicolon: every caller wraps the decl itself
+                lines.append(f"int {name} = ({rem}) / {div}")
+                coords.append(name)
+                rem = f"({rem}) - {name} * {div}"
+                div //= d if d else 1
+        return lines, self.coord_addr(coords)
+
+
+def _rowmajor_strides(dims: list[int]) -> list[int]:
+    """Row-major element strides of ``dims`` (last dim contiguous)."""
+    strides: list[int] = []
+    acc = 1
+    for d in reversed(dims):
+        strides.append(acc)
+        acc *= d
+    return strides[::-1]
 
 
 def _tile_shape_dims(layout_src: str) -> list[int]:
@@ -1020,6 +1096,10 @@ class _BodyTranslator:
         # compile-time SSA constants (const var = literal) for tile_extract
         self.tile_vars: dict[str, TileVar] = {}
         self.const_vars: dict[str, str] = {}
+        # unique suffix for bare kernel-scope index decls (register-tile
+        # stores emit `int _wp_s{N}` OUTSIDE any loop scope — two stores in
+        # one kernel must not redeclare the same name)
+        self._store_uid = 0
         # lexically open braces, ["if" | "loop", ...]: cooperative tile ops
         # (barrier emitters) must sit in uniform control flow — a reduce /
         # scatter / shared-fill site lexically inside an `if` fails loud
@@ -1117,6 +1197,11 @@ class _BodyTranslator:
         tvar = self.tile_vars.get(name)
         if tvar is None:
             raise TranslationError(f"{what}: source {name!r} is not a tile variable")
+        if tvar.kind == "shr" and tvar.slot < 0:
+            raise TranslationError(
+                f"{what}: source {name!r} is an unbound tile alias (no producing "
+                "tile_transpose/reshape/view assignment reached it)"
+            )
         return tvar
 
     # -- expressions ---------------------------------------------------------
@@ -1302,16 +1387,20 @@ class _BodyTranslator:
         if tvar.kind == "shr":
             # strided per-thread accumulate over the shared array,
             # first-element seeded; threads that own no element stage the
-            # neutral identity so the tree stays exact for every combine
+            # neutral identity so the tree stays exact for every combine.
+            # Reads go through the tile's linear->storage mapping (a
+            # transpose/view source reorders coordinates).
             arr = f"_wp_tile_shr_{tvar.slot}"
+            r_lines, r_addr = tvar.lin_addr("_wp_t", prefix="_wp_r")
             lines += [
                 f"{elem} _wp_ident_{j} = {_reduce_identity_init(elem, combine)};",
                 f"{elem} _wp_acc_{j} = _wp_ident_{j};",
                 f"bool _wp_has_{j} = false;",
                 f"int _wp_first_{j} = 0;",
                 f"for (int _wp_t = _wp_lane; _wp_t < {tvar.size}; _wp_t += {bd}) {{",
+                *(f"    {ln};" for ln in r_lines),
             ]
-            stage = f"    if (!_wp_has_{j}) {{ _wp_acc_{j} = {arr}[_wp_t]; _wp_has_{j} = true; _wp_first_{j} = _wp_t; }}"
+            stage = f"    if (!_wp_has_{j}) {{ _wp_acc_{j} = {arr}[{r_addr}]; _wp_has_{j} = true; _wp_first_{j} = _wp_t; }}"
             if arg_op:
                 # argmin/argmax: the staged index must track the improving
                 # extreme (not just the lane's first element), or a lane whose
@@ -1320,17 +1409,17 @@ class _BodyTranslator:
                 cmp = "<" if arg_op == "argmin" else ">"
                 lines.append(stage)
                 lines.append(
-                    f"    else {{ if ({arr}[_wp_t] {cmp} _wp_acc_{j}) {{ _wp_acc_{j} = {arr}[_wp_t]; _wp_first_{j} = _wp_t; }} }}"
+                    f"    else {{ if ({arr}[{r_addr}] {cmp} _wp_acc_{j}) {{ _wp_acc_{j} = {arr}[{r_addr}]; _wp_first_{j} = _wp_t; }} }}"
                 )
             elif combine == "+":
                 lines.append(stage)
-                lines.append(f"    else {{ _wp_acc_{j} = _wp_acc_{j} + {arr}[_wp_t]; }}")
+                lines.append(f"    else {{ _wp_acc_{j} = _wp_acc_{j} + {arr}[{r_addr}]; }}")
             elif combine == "|":
                 lines.append(stage)
-                lines.append(f"    else {{ _wp_acc_{j} = _wp_acc_{j} | {arr}[_wp_t]; }}")
+                lines.append(f"    else {{ _wp_acc_{j} = _wp_acc_{j} | {arr}[{r_addr}]; }}")
             else:
                 lines.append(stage)
-                lines.append(f"    else {{ _wp_acc_{j} = {combine}(_wp_acc_{j}, {arr}[_wp_t]); }}")
+                lines.append(f"    else {{ _wp_acc_{j} = {combine}(_wp_acc_{j}, {arr}[{r_addr}]); }}")
             lines += [
                 "}",
                 f"_wp_tile_shr_{j}[_wp_lane] = _wp_has_{j} ? _wp_acc_{j} : _wp_ident_{j};",
@@ -1536,14 +1625,24 @@ class _BodyTranslator:
         # no barrier: every thread writes only global-memory coordinates
         # derived from its own strided slots (no cross-lane visibility need)
         if tvar.kind == "shr":
+            if tvar.slot < 0:
+                raise TranslationError(
+                    f"tile_store source {src_name!r} is an unbound tile alias (no producing "
+                    "tile_transpose/reshape/view assignment reached it)"
+                )
             bd = self._require_block_dim("wp::tile_store")
             arr = f"_wp_tile_shr_{tvar.slot}"
             n = tvar.size
             if nd == 1:
+                s_lines, s_addr = tvar.lin_addr("_wp_t", prefix="_wp_st")
                 return [
                     f"for (int _wp_t = _wp_lane; _wp_t < {n}; _wp_t += {bd}) {{",
+                    *(f"    {ln};" for ln in s_lines),
                     f"    int _wp_s0 = ({offs[0]}) + _wp_t;",
-                    f"    if (_wp_s0 < {meta}.shape[0] || !{bc_msl}) {{ *{self._tile_addr(spec, ['_wp_s0'])} = {arr}[_wp_t]; }}",
+                    (
+                        f"    if (_wp_s0 < {meta}.shape[0] || !{bc_msl}) "
+                        f"{{ *{self._tile_addr(spec, ['_wp_s0'])} = {arr}[{s_addr}]; }}"
+                    ),
                     "}",
                 ]
             cols = tvar.dims[1] if len(tvar.dims) == 2 else 0
@@ -1551,21 +1650,25 @@ class _BodyTranslator:
                 raise TranslationError(
                     f"tile_store source tile {src_name!r} has no 2-D shape to unravel against"
                 )
+            s_lines, s_addr = tvar.lin_addr("_wp_t", prefix="_wp_st")
             return [
                 f"for (int _wp_t = _wp_lane; _wp_t < {n}; _wp_t += {bd}) {{",
-                f"    int _wp_i0 = _wp_t / {cols};",
-                f"    int _wp_i1 = _wp_t - _wp_i0 * {cols};",
-                f"    int _wp_s0 = ({offs[0]}) + _wp_i0;",
-                f"    int _wp_s1 = ({offs[1]}) + _wp_i1;",
-                f"    if ((_wp_s0 < {meta}.shape[0] && _wp_s1 < {meta}.shape[1]) || !{bc_msl}) "
-                f"{{ *{self._tile_addr(spec, ['_wp_s0', '_wp_s1'])} = {arr}[_wp_t]; }}",
+                *(f"    {ln};" for ln in s_lines),
+                f"    int _wp_s0 = ({offs[0]}) + _wp_t / {cols};",
+                f"    int _wp_s1 = ({offs[1]}) + _wp_t - _wp_t / {cols} * {cols};",
+                (
+                    f"    if ((_wp_s0 < {meta}.shape[0] && _wp_s1 < {meta}.shape[1]) || !{bc_msl}) "
+                    f"{{ *{self._tile_addr(spec, ['_wp_s0', '_wp_s1'])} = {arr}[{s_addr}]; }}"
+                ),
                 "}",
             ]
         if nd != 1:
             raise TranslationError("tile_store from a per-thread tile is 1-D only in the closure")
+        s = f"_wp_s{self._store_uid}"
+        self._store_uid += 1
         return [
-            f"int _wp_s0 = ({offs[0]}) + _wp_lane;",
-            f"if (_wp_s0 < {meta}.shape[0] || !{bc_msl}) {{ *{self._tile_addr(spec, ['_wp_s0'])} = {src_name}; }}",
+            f"int {s} = ({offs[0]}) + _wp_lane;",
+            f"if ({s} < {meta}.shape[0] || !{bc_msl}) {{ *{self._tile_addr(spec, [s])} = {src_name}; }}",
         ]
 
     def _tile_map(self, target: str, rhs: str) -> list[str]:
@@ -1599,14 +1702,27 @@ class _BodyTranslator:
                 )
             bd = self._require_block_dim("wp::tile_map")
             self._check_uniform("wp::tile_map over a shared tile")
-            reads = [
-                f"(_wp_tile_shr_{o.slot}[_wp_t])" if o.kind == "shr" else self._tile_scalar_read(a, o)
-                for a, o in zip([a.strip() for a in args[1:]], ops)
-            ]
             arr = f"_wp_tile_shr_{tvar.slot}"
+            # operand reads and the target write go through each tile's own
+            # linear->storage mapping (a transposed/view operand reorders
+            # coordinates); the strided pass iterates the tile's row-major
+            # linear index. Coordinate temps get per-tile names so nested
+            # views never collide.
+            unravel: list[str] = []
+            t_lines, t_addr = tvar.lin_addr("_wp_t", prefix="_wp_mt")
+            unravel += t_lines
+            reads = []
+            for oi, (a, o) in enumerate(zip([a.strip() for a in args[1:]], ops)):
+                if o.kind == "shr":
+                    o_lines, o_addr = o.lin_addr("_wp_t", prefix=f"_wp_m{oi}")
+                    unravel += o_lines
+                    reads.append(f"_wp_tile_shr_{o.slot}[{o_addr}]")
+                else:
+                    reads.append(self._tile_scalar_read(a, o))
             return [
                 f"for (int _wp_t = _wp_lane; _wp_t < {tvar.size}; _wp_t += {bd}) {{",
-                f"    {arr}[_wp_t] = {op_msl}({', '.join(reads)});",
+                *(f"    {ln};" for ln in unravel),
+                f"    {arr}[{t_addr}] = {op_msl}({', '.join(reads)});",
                 "}",
                 "threadgroup_barrier(mem_flags::mem_threadgroup);",
             ]
@@ -1674,27 +1790,32 @@ class _BodyTranslator:
         return [f"{target} = {val_src};"]
 
     def _tile_scatter(self, stripped: str) -> list[str]:
-        """``wp::tile_scatter_masked(tile, idx, v, mask);`` — each masked
-        thread writes its slot of the SHARED tile, then a barrier orders the
-        write before any cross-lane read (single-lane writes are visible to
-        the whole block — the M1 per-thread-copy defect is gone)."""
+        """``wp::tile_scatter_masked(tile, idx[, idx1], v, mask);`` — each
+        masked thread writes its slot of the SHARED tile (1-D linear index or
+        2-D coordinate pair), then a barrier orders the write before any
+        cross-lane read (single-lane writes are visible to the whole block —
+        the M1 per-thread-copy defect is gone)."""
         self.unit.uses_tile_ops = True
         open_p = len("wp::tile_scatter_masked(") - 1
         close = _find_balanced(stripped, open_p)
         sargs = split_args(stripped[open_p + 1 : close])
-        if len(sargs) != 4:
+        if len(sargs) not in (4, 5):
             raise TranslationError(f"tile_scatter_masked with {len(sargs)} args")
+        nd = len(sargs) - 3  # 1-D (idx) or 2-D (idx0, idx1)
         tvar = self._tvar(sargs[0].strip(), "tile_scatter_masked")
         if tvar.kind != "shr":
             if self.unit.block_dim is None:
                 # plain launch without block_dim: per-thread degenerate
                 # lowering — the tile is the thread's own single element,
-                # written only when the index selects it (element 0) and the
+                # written only when the index selects element (0[,0]) and the
                 # mask is set. No barrier: nothing is cross-lane visible.
                 tgt = sargs[0].strip()
+                guards = [f"({self.expr(s)}) == 0" for s in sargs[1 : 1 + nd]]
                 return [
-                    f"if ({self.expr(sargs[3])} && ({self.expr(sargs[1])}) == 0) "
-                    f"{{ {tgt} = {self.expr(sargs[2])}; }}",
+                    (
+                        f"if ({self.expr(sargs[2 + nd])} && {' && '.join(guards)}) "
+                        f"{{ {tgt} = {self.expr(sargs[1 + nd])}; }}"
+                    )
                 ]
             raise TranslationError(
                 f"tile_scatter_masked target {sargs[0].strip()!r} is not a shared-storage tile: "
@@ -1703,8 +1824,14 @@ class _BodyTranslator:
             )
         self._check_uniform("wp::tile_scatter_masked")
         arr = f"_wp_tile_shr_{tvar.slot}"
+        if nd == 1:
+            addr = tvar.coord_addr([self.expr(sargs[1])])
+        else:
+            addr = tvar.coord_addr([self.expr(sargs[1]), self.expr(sargs[2])])
+        value = self.expr(sargs[1 + nd])
+        mask = self.expr(sargs[2 + nd])
         return [
-            f"if ({self.expr(sargs[3])}) {{ {arr}[{self.expr(sargs[1])}] = {self.expr(sargs[2])}; }}",
+            f"if ({mask}) {{ {arr}[{addr}] = {value}; }}",
             "threadgroup_barrier(mem_flags::mem_threadgroup);",
         ]
 
@@ -1734,11 +1861,17 @@ class _BodyTranslator:
                     raise TranslationError(
                         f"wp::tile_extract index {k} out of bounds for tile of {tvar.size} element(s)"
                     )
-                return [f"{target} = {arr}[{k}];"]
+                _lines, addr = tvar.lin_addr(str(k))
+                return [f"{target} = {arr}[{addr}];"]
             # dynamic index: every element lives in the shared array, so the
-            # read is direct (upstream's negative-index normalization is
-            # already in the SSA index expression)
-            return [f"{target} = {arr}[{self.expr(idx_var)}];"]
+            # read is direct through the tile's linear->storage mapping
+            # (upstream's negative-index normalization is already in the SSA
+            # index expression)
+            d_lines, d_addr = tvar.lin_addr(self.expr(idx_var), prefix="_wp_x")
+            return [
+                *(f"{ln};" for ln in d_lines),
+                f"{target} = {arr}[{d_addr}];",
+            ]
         if idx_const == "0":
             return [f"{target} = {src};"]  # per-thread form: identity (M1)
         if idx_const is None:
@@ -1757,6 +1890,744 @@ class _BodyTranslator:
             f"if (_wp_lane == {int(idx_const)}) {{ _wp_tile_shr_{k}[0] = {src}; }}",
             "threadgroup_barrier(mem_flags::mem_threadgroup);",
             f"{target} = _wp_tile_shr_{k}[0];",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    # -- tile algebra (KEP-0001 M2.4 P3+P4) -----------------------------------
+    #
+    # Dual-mode like every tile op: launch_tiled lowers the shared-storage
+    # (threadgroup) forms below; any plain launch lowers every op to the
+    # per-thread scalar degenerate (one-element tile — the CPU-golden
+    # convention; serial-by-construction, so cholesky/solve degrade to the
+    # same serial algorithm upstream runs at WP_TILE_BLOCK_DIM == 1).
+    #
+    # Float-order discipline: every loop order below matches the upstream
+    # scalar fallback exactly (tile_cholesky.h / tile_solve.h / tile_matmul.h
+    # partitioned_gemm scalar paths, tile_reduce.h axis fold, tile_scan.h
+    # sequential CPU pass) so warp CPU goldens and Metal agree bit-for-bit up
+    # to sqrt/FMA rounding — well inside the 1e-5 corpus tolerance.
+
+    def _shrub(self, tvar: TileVar) -> str:
+        if tvar.kind != "shr" or tvar.slot < 0:
+            raise TranslationError(
+                f"tile op requires a shared-storage tile (got "
+                f"{'an unbound alias' if tvar.slot < 0 else 'a per-thread scalar tile'}); "
+                "upstream forces operands to shared storage at parse time, which a "
+                "plain launch (per-thread scalar tier) cannot retrofit"
+            )
+        return f"_wp_tile_shr_{tvar.slot}"
+
+    def _float_tile(self, tvar: TileVar, what: str) -> None:
+        if tvar.elem not in ("float", "half"):
+            raise TranslationError(f"{what} over tile element {tvar.elem!r}: float/half tiles only")
+        if tvar.elem == "half":
+            raise TranslationError(f"{what}: half-precision tiles are outside the closure")
+
+    def _parse_tile_call(self, rhs: str, name: str, with_template: bool) -> tuple[list[str], str]:
+        """(args, template text) behind ``[wp::]name<...>(...)``."""
+        open_p = rhs.index("(")
+        head = rhs[:open_p].strip()
+        m = re.match(r"^(?:wp::)?([A-Za-z_]\w*)(?:<(.*)>)?$", head, re.DOTALL)
+        if m is None or m.group(1) != name:
+            raise TranslationError(f"cannot parse {name} call {rhs!r}")
+        close = _find_balanced(rhs, open_p)
+        if rhs[close + 1 :].strip():
+            raise TranslationError(f"trailing text after {name} call {rhs!r}")
+        args = split_args(rhs[open_p + 1 : close])
+        tmpl = (m.group(2) or "").strip()
+        if with_template and not tmpl:
+            raise TranslationError(f"{name} call {rhs!r} carries no template (outside the closure)")
+        return args, tmpl
+
+    def _tile_alias_bind(self, target: str, rhs: str, op: str) -> list[str]:
+        """``var = wp::tile_transpose(src)`` / ``tile_reshape<T>(src)`` /
+        ``tile_view<T>(src, offs...)`` — pure metadata alias (upstream
+        tile.h:5462-5628 Owner=false shared views, zero movement, zero
+        barrier). The target's pending alias decl binds to the source tile's
+        threadgroup array with the view's shape/strides/base; physical
+        reordering happens in the consuming ops' linear->storage mapping.
+        Plain launches bind the per-thread scalar value (identity alias; a
+        non-zero view offset cannot address the thread's one element and
+        fails loud)."""
+        self.unit.uses_tile_ops = True
+        with_template = op in ("tile_reshape", "tile_view")
+        args, tmpl = self._parse_tile_call(rhs, op, with_template)
+        src_name = args[0].strip()
+        tgt = self.tile_vars.get(target)
+        src = self.tile_vars.get(src_name)
+        if tgt is None or src is None:
+            raise TranslationError(f"wp::{op} operand is not a tile variable in {rhs!r}")
+        if src.kind == "scalar" or self.unit.block_dim is None:
+            if op == "tile_view":
+                offs = [self.const_vars.get(a.strip(), a.strip()) for a in args[1:]]
+                if any(o not in ("0", None) and o != 0 for o in offs):
+                    raise TranslationError(
+                        "wp::tile_view with a non-zero offset on a plain launch: the per-thread "
+                        "scalar tier holds one element per tile — identity aliases only"
+                    )
+            tgt.kind = "scalar"
+            return [f"{target} = {src_name};"]
+        if tgt.slot >= 0:
+            raise TranslationError(
+                f"wp::{op} target {target!r} owns storage (its decl was not the alias '= nullptr' form)"
+            )
+        if op == "tile_transpose":
+            if len(tgt.dims) != 2 or len(src.dims) != 2:
+                raise TranslationError("wp::tile_transpose is 2-D only in the closure")
+            tgt.dims = list(reversed(src.dims))
+            tgt.strides = list(reversed(src.strides))
+            tgt.base = src.base
+        else:
+            dims = _tile_shape_dims(tmpl)
+            stride_m = re.search(r"wp::tile_stride_t<([\d,\s]+)>", tmpl)
+            if stride_m is None:
+                raise TranslationError(f"wp::{op} template carries no tile_stride_t: {rhs!r}")
+            strides = [int(s) for s in stride_m.group(1).replace(" ", "").split(",") if s]
+            tgt.dims = dims
+            tgt.strides = strides
+            if op == "tile_reshape":
+                tgt.base = src.base
+            else:  # tile_view: base = source base + offset·source strides
+                terms = [] if src.base == "0" else [f"({src.base})"]
+                offs = args[1:]
+                for i, stride in enumerate(src.strides):
+                    off = self.expr(offs[i]) if i < len(offs) else "0"
+                    if stride == 1:
+                        terms.append(f"({off})")
+                    elif stride != 0:
+                        terms.append(f"({off}) * {stride}")
+                tgt.base = " + ".join(terms) if terms else "0"
+        size = 1
+        for d in tgt.dims:
+            size *= d
+        tgt.size = size
+        tgt.slot = src.slot  # the alias borrows the source's threadgroup array
+        return []
+
+    def _tile_matmul(self, target: str | None, rhs: str, acc_name: bool) -> list[str]:
+        """``c = wp::tile_matmul(a, b)`` (alpha=1, beta=0) /
+        ``wp::tile_matmul_acc(a, b, c)`` (alpha=1, beta=1) — the SSA carries
+        all eight args ``(fwd, bkA, bkB, A, B, C, alpha, beta)`` either way
+        (the mathdx function pointers lower to 0; dormant). Simplified GEMM:
+        per-thread strided output elements, k ascending (upstream's k order),
+        one end barrier."""
+        args, _tmpl = self._parse_tile_call(rhs, "tile_matmul_acc" if acc_name else "tile_matmul", False)
+        if len(args) != 8:
+            raise TranslationError(f"tile_matmul with {len(args)} args (needs fwd, bkA, bkB, A, B, C, alpha, beta)")
+        a_t = self._tvar(args[3].strip(), "tile_matmul")
+        b_t = self._tvar(args[4].strip(), "tile_matmul")
+        if target is None:
+            target = args[5].strip()
+        c_t = self._tvar(target, "tile_matmul")
+        alpha = self.expr(args[6])
+        beta = self.expr(args[7])
+        if len(a_t.dims) != 2 or len(b_t.dims) != 2 or len(c_t.dims) != 2:
+            raise TranslationError("tile_matmul operands must be 2-D tiles")
+        m, k = a_t.dims
+        if b_t.dims[0] != k:
+            raise TranslationError(f"tile_matmul shape mismatch A {a_t.dims} B {b_t.dims}")
+        if c_t.dims[0] != m or c_t.dims[1] != b_t.dims[1]:
+            raise TranslationError(f"tile_matmul shape mismatch A {a_t.dims} B {b_t.dims} C {c_t.dims}")
+        self._float_tile(c_t, "tile_matmul")
+        self.unit.uses_tile_ops = True
+        if self.unit.block_dim is None:
+            # plain scalar tier: one-element tiles — (1,1)@(1,1) accumulate
+            if a_t.kind != "shr" and b_t.kind != "shr" and c_t.kind != "shr":
+                return [
+                    (
+                        f"{target} = ({alpha}) * ({args[3].strip()} * {args[4].strip()}) "
+                        f"+ ({beta}) * {target};"
+                    )
+                ]
+            raise TranslationError("tile_matmul on a plain launch lowers per-thread scalar tiles only")
+        bd = self._require_block_dim("wp::tile_matmul")
+        self._check_uniform("wp::tile_matmul")
+        aarr, barr, carr = self._shrub(a_t), self._shrub(b_t), self._shrub(c_t)
+        n = b_t.dims[1]
+        a_un, _a_addr = a_t.lin_addr("_wp_g", prefix="_wp_ga")
+        b_un, _b_addr = b_t.lin_addr("_wp_g", prefix="_wp_gb")
+        c_un, c_addr = c_t.lin_addr("_wp_g", prefix="_wp_gc")
+        # k ascending — upstream's partitioned_gemm scalar accumulation order
+        return [
+            f"for (int _wp_g = _wp_lane; _wp_g < {m * n}; _wp_g += {bd}) {{",
+            *(f"    {ln};" for ln in a_un + b_un + c_un),
+            f"    int _wp_i = _wp_g / {n};",
+            f"    int _wp_j = _wp_g - _wp_i * {n};",
+            "    float _wp_acc = {};",
+            f"    for (int _wp_k = 0; _wp_k < {k}; ++_wp_k) {{",
+            f"        int _wp_ai = _wp_i * {k} + _wp_k;",
+            f"        int _wp_bi = _wp_k * {n} + _wp_j;",
+            *(f"        {ln};" for ln in a_t.lin_addr("_wp_ai", prefix="_wp_ka")[0]),
+            *(f"        {ln};" for ln in b_t.lin_addr("_wp_bi", prefix="_wp_kb")[0]),
+            (
+                f"        _wp_acc = _wp_acc + {aarr}[{a_t.lin_addr('_wp_ai', prefix='_wp_ka')[1]}] "
+                f"* {barr}[{b_t.lin_addr('_wp_bi', prefix='_wp_kb')[1]}];"
+            ),
+            "    }",
+            f"    {carr}[{c_addr}] = ({alpha}) * _wp_acc + ({beta}) * {carr}[{c_addr}];",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _tile_diag_add(self, target: str, rhs: str) -> list[str]:
+        """``c = wp::tile_diag_add(a, b)`` — c = a with c[t,t] += b[t]
+        (upstream tile.h:6131; the target is a fresh tile, the source stays
+        intact)."""
+        args, _tmpl = self._parse_tile_call(rhs, "tile_diag_add", False)
+        if len(args) != 3:
+            raise TranslationError(f"tile_diag_add with {len(args)} args (needs a, b, c)")
+        a_t = self._tvar(args[0].strip(), "tile_diag_add")
+        b_t = self._tvar(args[1].strip(), "tile_diag_add")
+        if args[2].strip() != target:
+            raise TranslationError(f"tile_diag_add target {target!r} does not match its SSA out arg")
+        c_t = self._tvar(target, "tile_diag_add")
+        if len(a_t.dims) != 2 or a_t.dims[0] != a_t.dims[1]:
+            raise TranslationError(f"tile_diag_add source {a_t.dims} is not square")
+        if len(c_t.dims) != 2 or c_t.dims != a_t.dims:
+            raise TranslationError(f"tile_diag_add target {c_t.dims} does not match source {a_t.dims}")
+        if len(b_t.dims) != 1 or b_t.dims[0] != a_t.dims[0]:
+            raise TranslationError(f"tile_diag_add diagonal {b_t.dims} does not match {a_t.dims}")
+        self._float_tile(c_t, "tile_diag_add")
+        self.unit.uses_tile_ops = True
+        if self.unit.block_dim is None:
+            if a_t.kind != "shr" and b_t.kind != "shr" and c_t.kind != "shr":
+                # plain scalar tier: the one-element tile IS the diagonal
+                return [f"{target} = {args[0].strip()} + {args[1].strip()};"]
+            raise TranslationError("tile_diag_add on a plain launch lowers per-thread scalar tiles only")
+        bd = self._require_block_dim("wp::tile_diag_add")
+        self._check_uniform("wp::tile_diag_add")
+        n = a_t.dims[0]
+        aarr, barr, carr = self._shrub(a_t), self._shrub(b_t), self._shrub(c_t)
+        c_un, c_addr = c_t.lin_addr("_wp_t", prefix="_wp_ct")
+        b_addr = b_t.coord_addr(["_wp_i"])
+        a_un2, a_addr2 = a_t.lin_addr("_wp_q", prefix="_wp_ca")
+        return [
+            "{ float _wp_z = {};",
+            f"for (int _wp_t = _wp_lane; _wp_t < {n * n}; _wp_t += {bd}) {{",
+            *(f"    {ln};" for ln in c_un),
+            f"    int _wp_i = _wp_t / {n};",
+            f"    int _wp_j = _wp_t - _wp_i * {n};",
+            f"    int _wp_q = _wp_i * {n} + _wp_j;",
+            *(f"    {ln};" for ln in a_un2),
+            f"    {carr}[{c_addr}] = {aarr}[{a_addr2}]",
+            f"        + ((_wp_i == _wp_j) ? {barr}[{b_addr}] : _wp_z);",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "}",
+        ]
+
+    def _tile_scan(self, target: str, rhs: str, inclusive: bool) -> list[str]:
+        """``r = wp::tile_scan_inclusive/exclusive(t)`` — prefix sum over the
+        tile's linear elements (upstream tile_scan.h: shared copy-in, block
+        scan, register copy-out). Simplified block scan: Hillis-Steele over
+        the scratch copy (double barrier per log2 step, read-before-write
+        captured per lane); float order is NOT upstream's sequential one, so
+        conformance comparisons allow 1e-4 relative."""
+        args, _tmpl = self._parse_tile_call(rhs, "tile_scan_inclusive" if inclusive else "tile_scan_exclusive", False)
+        if len(args) != 1:
+            raise TranslationError(f"tile_scan with {len(args)} args")
+        src = self._tvar(args[0].strip(), "tile_scan")
+        tgt = self._tvar(target, "tile_scan")
+        self._float_tile(tgt, "tile_scan")
+        self.unit.uses_tile_ops = True
+        if self.unit.block_dim is None:
+            # plain scalar tier: the one-element prefix is the element itself;
+            # the exclusive prefix is the empty-sum identity
+            if src.kind != "shr" and tgt.kind != "shr":
+                if inclusive:
+                    return [f"{target} = {args[0].strip()};"]
+                return ["{ float _wp_z = {};", f"    {target} = _wp_z;", "}"]
+            raise TranslationError("tile_scan on a plain launch lowers per-thread scalar tiles only")
+        bd = self._require_block_dim("wp::tile_scan")
+        self._check_uniform("wp::tile_scan")
+        n = src.size
+        sarr = self._shrub(src)
+        if tgt.kind == "shr":
+            out_arr = self._shrub(tgt)
+            n_scan = n
+            scratch = self._claim_shr("float", n)
+        else:
+            out_arr = None
+            n_scan = bd if src.kind != "shr" else src.size
+            scratch = self._claim_shr("float", n_scan)
+        # ping-pong scratch: the add step reads A[t - d] while peers write
+        # A[t'], so each Hillis-Steele step computes into a second scratch,
+        # then copies back — every read sees the previous step's state
+        scratch_b = self._claim_shr("float", n_scan)
+        if src.kind == "shr":
+            s_lines, s_addr = src.lin_addr("_wp_t", prefix="_wp_ss")
+            fill = [
+                f"for (int _wp_t = _wp_lane; _wp_t < {n}; _wp_t += {bd}) {{",
+                *(f"    {ln};" for ln in s_lines),
+                f"    _wp_tile_shr_{scratch}[_wp_t] = {sarr}[{s_addr}];",
+                "}",
+            ]
+        else:
+            # scalar tile source: each lane stages its own element (its
+            # linear index is the lane — the M1 convention)
+            fill = [
+                f"_wp_tile_shr_{scratch}[_wp_lane] = {args[0].strip()};",
+            ]
+        lines = [
+            *fill,
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            # Hillis-Steele inclusive scan: one add pass + copy-back per
+            # log2(n) step (the copy-back pass exists so the ping-pong
+            # scratch never aliases the reads)
+            f"for (int _wp_d = 1; _wp_d < {n_scan}; _wp_d <<= 1) {{",
+            f"    for (int _wp_t = _wp_lane; _wp_t < {n_scan}; _wp_t += {bd}) {{",
+            f"        _wp_tile_shr_{scratch_b}[_wp_t] = _wp_tile_shr_{scratch}[_wp_t]",
+            f"            + ((_wp_t >= _wp_d) ? _wp_tile_shr_{scratch}[_wp_t - _wp_d] : 0.0f);",
+            "    }",
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"    for (int _wp_t = _wp_lane; _wp_t < {n_scan}; _wp_t += {bd}) {{",
+            f"        _wp_tile_shr_{scratch}[_wp_t] = _wp_tile_shr_{scratch_b}[_wp_t];",
+            "    }",
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "}",
+        ]
+        if tgt.kind == "shr":
+            t_lines, t_addr = tgt.lin_addr("_wp_t", prefix="_wp_to")
+            if inclusive:
+                copy_out = [
+                    f"for (int _wp_t = _wp_lane; _wp_t < {tgt.size}; _wp_t += {bd}) {{",
+                    *(f"    {ln};" for ln in t_lines),
+                    f"    {out_arr}[{t_addr}] = _wp_tile_shr_{scratch}[_wp_t];",
+                    "}",
+                ]
+            else:
+                copy_out = [
+                    "{ float _wp_z = {};",
+                    f"for (int _wp_t = _wp_lane; _wp_t < {tgt.size}; _wp_t += {bd}) {{",
+                    *(f"    {ln};" for ln in t_lines),
+                    f"    {out_arr}[{t_addr}] = (_wp_t > 0) ? _wp_tile_shr_{scratch}[_wp_t - 1] : _wp_z;",
+                    "}",
+                    "}",
+                ]
+            lines += copy_out
+        else:
+            if inclusive:
+                lines.append(f"{target} = _wp_tile_shr_{scratch}[_wp_lane];")
+            else:
+                lines += [
+                    "{ float _wp_z = {};",
+                    f"    {target} = (_wp_lane > 0) ? _wp_tile_shr_{scratch}[_wp_lane - 1] : _wp_z;",
+                    "}",
+                ]
+        lines.append("threadgroup_barrier(mem_flags::mem_threadgroup);")
+        return lines
+
+    def _tile_sum_axis(self, target: str, rhs: str) -> list[str]:
+        """``r = wp::tile_sum_axis<K>(t)`` — reduce along axis K, result tile
+        with that dimension removed (upstream tile_reduce.h axis fold: each
+        output slice accumulates its line in ascending linear order; here the
+        per-output accumulation is one thread's serial k loop — same order as
+        upstream's CPU bd=1 path)."""
+        args, tmpl = self._parse_tile_call(rhs, "tile_sum_axis", True)
+        if len(args) != 1:
+            raise TranslationError(f"tile_sum_axis with {len(args)} args")
+        if tmpl not in ("0", "1"):
+            raise TranslationError(f"tile_sum_axis axis {tmpl!r}: only 0/1 are in the closure")
+        axis = int(tmpl)
+        src = self._tvar(args[0].strip(), "tile_sum_axis")
+        tgt = self._tvar(target, "tile_sum_axis")
+        self._float_tile(tgt, "tile_sum_axis")
+        if len(src.dims) != 2:
+            raise TranslationError(f"tile_sum_axis over {src.dims}: 2-D tiles only in the closure")
+        want = [src.dims[1 - axis]]
+        if len(tgt.dims) != 1 or tgt.dims[0] != want[0]:
+            raise TranslationError(f"tile_sum_axis result {tgt.dims} does not match axis-{axis} shape {want}")
+        self.unit.uses_tile_ops = True
+        if self.unit.block_dim is None:
+            if src.kind != "shr" and tgt.kind != "shr":
+                return [f"{target} = {args[0].strip()};"]
+            raise TranslationError("tile_sum_axis on a plain launch lowers per-thread scalar tiles only")
+        bd = self._require_block_dim("wp::tile_sum_axis")
+        self._check_uniform("wp::tile_sum_axis")
+        sarr = self._shrub(src)
+        out_len = want[0]
+        red_len = src.dims[axis]
+        lines = ["{ float _wp_z = {};"]
+        if tgt.kind == "shr":
+            oarr = self._shrub(tgt)
+            o_un, o_addr = tgt.lin_addr("_wp_o", prefix="_wp_ot")
+            lines += [
+                f"for (int _wp_o = _wp_lane; _wp_o < {out_len}; _wp_o += {bd}) {{",
+                *(f"    {ln};" for ln in o_un),
+                "    float _wp_acc = _wp_z;",
+                f"    for (int _wp_k = 0; _wp_k < {red_len}; ++_wp_k) {{",
+                f"        int _wp_q = {f'_wp_k * {out_len} + _wp_o' if axis == 0 else f'_wp_o * {red_len} + _wp_k'};",
+                *(f"        {ln};" for ln in src.lin_addr("_wp_q", prefix="_wp_qs")[0]),
+                f"        _wp_acc = _wp_acc + {sarr}[{src.lin_addr('_wp_q', prefix='_wp_qs')[1]}];",
+                "    }",
+                f"    {oarr}[{o_addr}] = _wp_acc;",
+                "}",
+            ]
+        else:
+            if out_len != bd:
+                raise TranslationError(
+                    f"tile_sum_axis result tile {tgt.dims} is per-thread scalar but its shape "
+                    "does not match the block_dim lane count"
+                )
+            lines += [
+                f"for (int _wp_o = _wp_lane; _wp_o < {out_len}; _wp_o += {bd}) {{",
+                "    float _wp_acc = _wp_z;",
+                f"    for (int _wp_k = 0; _wp_k < {red_len}; ++_wp_k) {{",
+                f"        int _wp_q = {f'_wp_k * {out_len} + _wp_o' if axis == 0 else f'_wp_o * {red_len} + _wp_k'};",
+                *(f"        {ln};" for ln in src.lin_addr("_wp_q", prefix="_wp_qs")[0]),
+                f"        _wp_acc = _wp_acc + {sarr}[{src.lin_addr('_wp_q', prefix='_wp_qs')[1]}];",
+                "    }",
+                f"    if (_wp_o == _wp_lane) {{ {target} = _wp_acc; }}",
+                "}",
+            ]
+        lines += [
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "}",
+        ]
+        return lines
+
+    def _cholesky_lines(self, a_t: TileVar, o_t: TileVar, upper: bool) -> list[str]:
+        """Cooperative column Cholesky (upstream tile_cholesky.h
+        scalar_cholesky_impl verbatim): redundant diagonal compute, thread-0
+        diagonal write, thread-strided row updates and opposite-triangle
+        zeroing, one barrier per column. ``upper`` selects the stored
+        triangle (fill_mode)."""
+        n = a_t.dims[0]
+        aarr, oarr = self._shrub(a_t), self._shrub(o_t)
+        bd = self.unit.block_dim
+
+        def ai(r: str, c: str) -> str:
+            # A diagonal/reads use tile_coord(j, j); row updates read
+            # A(j, i) when upper else A(i, j) — through A's own mapping
+            return a_t.coord_addr([c, r] if upper else [r, c])
+
+        def oi(r: str, c: str) -> str:
+            return o_t.coord_addr([c, r] if upper else [r, c])
+
+        return [
+            f"{a_t.elem} _wp_z = {{}};",
+            f"for (int _wp_j = 0; _wp_j < {n}; ++_wp_j) {{",
+            f"    float _wp_s = {aarr}[{ai('_wp_j', '_wp_j')}];",
+            # upstream's in-place alias guard: order the diagonal read
+            # before any peer's Out writes of this column
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "    for (int _wp_k = 0; _wp_k < _wp_j; ++_wp_k) {",
+            f"        float _wp_r = {oarr}[{oi('_wp_j', '_wp_k')}];",
+            "        _wp_s = _wp_s - _wp_r * _wp_r;",
+            "    }",
+            "    _wp_s = sqrt(_wp_s);",
+            "    float _wp_inv_s = 1.0f / _wp_s;",
+            f"    if (_wp_lane == 0) {{ {oarr}[{oi('_wp_j', '_wp_j')}] = _wp_s; }}",
+            f"    for (int _wp_i = _wp_j + 1 + _wp_lane; _wp_i < {n}; _wp_i += {bd}) {{",
+            f"        float _wp_si = {aarr}[{ai('_wp_j', '_wp_i') if upper else ai('_wp_i', '_wp_j')}];",
+            "        for (int _wp_k = 0; _wp_k < _wp_j; ++_wp_k) {",
+            f"            _wp_si = _wp_si - {oarr}[{oi('_wp_i', '_wp_k')}] * {oarr}[{oi('_wp_j', '_wp_k')}];",
+            "        }",
+            f"        {oarr}[{oi('_wp_i', '_wp_j')}] = _wp_si * _wp_inv_s;",
+            "    }",
+            f"    for (int _wp_k = _wp_j + 1 + _wp_lane; _wp_k < {n}; _wp_k += {bd}) {{",
+            f"        {oarr}[{oi('_wp_j', '_wp_k')}] = _wp_z;",
+            "    }",
+            "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+            "}",
+        ]
+
+    def _tile_cholesky(self, target: str | None, rhs: str) -> list[str]:
+        """``l = wp::tile_cholesky<Upper>(fwd, bkA, bkB, a, out)`` (mathdx
+        pointers lower to 0; dormant) / statement
+        ``wp::tile_cholesky_inplace<Upper>(fwd, a)``. Out-of-place writes the
+        target tile (fresh); in-place factors the source tile itself."""
+        name = "tile_cholesky_inplace" if rhs.startswith(("wp::tile_cholesky_inplace", "tile_cholesky_inplace")) else "tile_cholesky"
+        args, tmpl = self._parse_tile_call(rhs, name, True)
+        if tmpl not in ("true", "false"):
+            raise TranslationError(f"{name} fill template {tmpl!r}: only true/false are in the closure")
+        upper = tmpl == "true"
+        if name == "tile_cholesky_inplace":
+            if len(args) != 2:
+                raise TranslationError(f"{name} with {len(args)} args (needs fwd, a)")
+            a_name = args[1].strip()
+            a_t = self._tvar(a_name, name)
+            o_t = a_t
+        else:
+            if len(args) != 5:
+                raise TranslationError(f"{name} with {len(args)} args (needs fwd, bkA, bkB, a, out)")
+            a_t = self._tvar(args[3].strip(), name)
+            if target is None:
+                target = args[4].strip()
+            o_t = self._tvar(target, name)
+        self._float_tile(o_t, name)
+        if len(a_t.dims) != 2 or a_t.dims[0] != a_t.dims[1]:
+            raise TranslationError(f"{name} source {a_t.dims} is not square")
+        if o_t.dims != a_t.dims:
+            raise TranslationError(f"{name} target {o_t.dims} does not match source {a_t.dims}")
+        self.unit.uses_tile_ops = True
+        if self.unit.block_dim is None:
+            # plain scalar tier: the one-element factor is sqrt(a) (the n=1
+            # serial case — upper/lower coincide)
+            if a_t.kind != "shr":
+                if name == "tile_cholesky_inplace":
+                    return [f"{a_name} = sqrt({a_name});"]
+                return [f"{target} = sqrt({args[3].strip()});"]
+            raise TranslationError(f"{name} on a plain launch lowers per-thread scalar tiles only")
+        self._require_block_dim(name)
+        self._check_uniform(name)
+        lines = self._cholesky_lines(a_t, o_t, upper)
+        lines.append("threadgroup_barrier(mem_flags::mem_threadgroup);")
+        return lines
+
+    def _solve_phase_lines(
+        self,
+        a_t: TileVar,
+        x_t: TileVar,
+        y_t: TileVar | None,
+        phase: str,
+        a_swap: bool,
+    ) -> list[str]:
+        """One triangular-substitution phase (upstream tile_solve.h
+        scalar_cholesky_forward/back_substitution): vector RHS serial on
+        thread 0, matrix RHS strided over RHS columns, one barrier at the
+        end. ``phase`` "fwd" (i ascending) or "bwd" (i descending);
+        ``a_swap`` reads A at (j, i) instead of (i, j) (the transposed
+        triangle)."""
+        n = a_t.dims[0]
+        aarr = self._shrub(a_t)
+        xarr = self._shrub(x_t)
+        matrix = len(x_t.dims) == 2
+        m = x_t.dims[1] if matrix else 1
+        bd = self.unit.block_dim
+
+        def ai(i: str, j: str) -> str:
+            return a_t.coord_addr([j, i] if a_swap else [i, j])
+
+        def xi(i: str, k: str) -> str:
+            return x_t.coord_addr([i] if not matrix else [i, k])
+
+        yarr = xarr if y_t is None else self._shrub(y_t)
+
+        def yi_expr(i: str, k: str) -> str:
+            if y_t is None:
+                return xi(i, k)
+            return y_t.coord_addr([i] if not matrix else [i, k])
+
+        lines: list[str] = []
+        if phase == "fwd":
+            i_head = f"for (int _wp_i = 0; _wp_i < {n}; ++_wp_i)"
+        else:
+            i_head = f"for (int _wp_i = {n} - 1; _wp_i >= 0; --_wp_i)"
+        if matrix:
+            lines.append(f"for (int _wp_k = _wp_lane; _wp_k < {m}; _wp_k += {bd}) {{")
+            lines.append(f"    {i_head} {{")
+            lines.append(f"        float _wp_s = {yarr}[{yi_expr('_wp_i', '_wp_k')}];")
+        else:
+            lines.append("if (_wp_lane == 0) {")
+            lines.append(f"    {i_head} {{")
+            lines.append(f"        float _wp_s = {yarr}[{yi_expr('_wp_i', '_wp_i')}];")
+        if phase == "fwd":
+            jbounds = ("0", "_wp_i")
+            jcond = "_wp_j < _wp_i"
+        else:
+            jbounds = ("_wp_i + 1", str(n))
+            jcond = "_wp_j < " + str(n)
+        lines.append(f"        for (int _wp_j = {jbounds[0]}; {jcond}; ++_wp_j) {{")
+        lines.append(f"            _wp_s = _wp_s - {aarr}[{ai('_wp_i', '_wp_j')}] * {xarr}[{xi('_wp_j', '_wp_k')}];")
+        lines.append("        }")
+        lines.append(f"        float _wp_d = {aarr}[{ai('_wp_i', '_wp_i')}];")
+        lines.append(f"        {xarr}[{xi('_wp_i', '_wp_k')}] = (_wp_d != 0.0f) ? _wp_s / _wp_d : _wp_s;")
+        lines.append("    }")
+        lines.append("}")
+        lines.append("threadgroup_barrier(mem_flags::mem_threadgroup);")
+        return lines
+
+    def _tile_solve(self, target: str | None, rhs: str) -> list[str]:
+        """The triangular-solve family (upstream tile_solve.h):
+        ``z = [wp::]tile_lower_solve(fwd, bkwd, L, y, z)`` /
+        ``x = [wp::]tile_upper_solve(fwd, U, z, x)`` / statement in-place
+        variants / ``x = wp::tile_cholesky_solve<Upper>(fwd, a, y, x)`` and
+        its in-place form. Out-of-place copies the RHS into the result tile
+        first (alias protection, upstream ``z = y``); the solve phases then
+        run as in upstream (vector RHS serial on thread 0, matrix RHS
+        thread-strided over RHS columns)."""
+        m = re.match(r"^(?:wp::)?(tile_lower_solve|tile_upper_solve|tile_cholesky_solve"
+                     r"|tile_lower_solve_inplace|tile_upper_solve_inplace|tile_cholesky_solve_inplace)"
+                     r"(?:<([^>]*)>)?\(", rhs)
+        if m is None:
+            raise TranslationError(f"cannot parse solve call {rhs!r}")
+        name = m.group(1)
+        tmpl = (m.group(2) or "").strip()
+        open_p = rhs.index("(")
+        close = _find_balanced(rhs, open_p)
+        args = split_args(rhs[open_p + 1 : close])
+        inplace = name.endswith("_inplace")
+        base = name[: -len("_inplace")] if inplace else name
+        if inplace:
+            if len(args) != 3:
+                raise TranslationError(f"{name} with {len(args)} args (needs fwd, a, y)")
+            a_name = args[1].strip()
+            a_t = self._tvar(a_name, name)
+            y_name = args[-1].strip()
+            y_t = self._tvar(y_name, name)
+            x_t, x_name = y_t, y_name
+        else:
+            if base == "tile_cholesky_solve":
+                if len(args) != 4:
+                    raise TranslationError(f"{name} with {len(args)} args (needs fwd, a, y, x)")
+                a_name = args[1].strip()
+                y_name = args[2].strip()
+                a_t = self._tvar(a_name, name)
+                y_t = self._tvar(y_name, name)
+                x_name = args[3].strip() if target is None else target
+            elif base == "tile_lower_solve":
+                if len(args) != 5:
+                    raise TranslationError(f"{name} with {len(args)} args (needs fwd, bkwd, L, y, z)")
+                a_name = args[2].strip()
+                y_name = args[3].strip()
+                a_t = self._tvar(a_name, name)
+                y_t = self._tvar(y_name, name)
+                x_name = args[4].strip() if target is None else target
+            else:  # tile_upper_solve
+                if len(args) != 4:
+                    raise TranslationError(f"{name} with {len(args)} args (needs fwd, U, z, x)")
+                a_name = args[1].strip()
+                y_name = args[2].strip()
+                a_t = self._tvar(a_name, name)
+                y_t = self._tvar(y_name, name)
+                x_name = args[3].strip() if target is None else target
+            x_t = self._tvar(x_name, name)
+        self._float_tile(x_t, name)
+        if len(a_t.dims) != 2 or a_t.dims[0] != a_t.dims[1]:
+            raise TranslationError(f"{name} matrix {a_t.dims} is not square")
+        if len(y_t.dims) > 2 or y_t.dims[0] != a_t.dims[0]:
+            raise TranslationError(f"{name} rhs {y_t.dims} does not match the matrix rows {a_t.dims}")
+        if x_t.dims != y_t.dims:
+            raise TranslationError(f"{name} result {x_t.dims} does not match rhs {y_t.dims}")
+        self.unit.uses_tile_ops = True
+        if self.unit.block_dim is None:
+            # plain scalar tier: the n=1 serial solve — one guarded division
+            # per phase (vector form; matrix rhs with one column is identical)
+            if a_t.kind != "shr" and y_t.kind != "shr" and x_t.kind != "shr":
+                a_src = a_name  # the resolved matrix-tile SSA var for every form
+                if inplace:
+                    y_src = y_name
+                    step = f"({y_src} = ({a_src} != 0.0f) ? {y_src} / {a_src} : {y_src})"
+                    lines = [step]
+                    if base == "tile_cholesky_solve":
+                        lines.append(step)  # second (backward) phase
+                    return lines
+                # out-of-place: the result tile starts at the zeros/broadcast
+                # value — copy the rhs in first (upstream `z = y`), then the
+                # per-phase guarded division(s)
+                phase = f"({x_name} = ({a_src} != 0.0f) ? {x_name} / {a_src} : {x_name})"
+                head = f"{x_name} = {y_name};"
+                if base == "tile_cholesky_solve":
+                    return [head, phase, phase]
+                return [head, phase]
+            raise TranslationError(f"{name} on a plain launch lowers per-thread scalar tiles only")
+        self._require_block_dim(name)
+        self._check_uniform(name)
+        lines: list[str] = []
+        if not inplace and x_t.slot != y_t.slot:
+            # copy y into x first (upstream `z = y`), through each tile's own
+            # linear->storage mapping
+            yarr = self._shrub(y_t)
+            xarr = self._shrub(x_t)
+            y_un, y_addr = y_t.lin_addr("_wp_t", prefix="_wp_cy")
+            x_un, x_addr = x_t.lin_addr("_wp_t", prefix="_wp_cx")
+            lines += [
+                f"for (int _wp_t = _wp_lane; _wp_t < {x_t.size}; _wp_t += {self.unit.block_dim}) {{",
+                *(f"    {ln};" for ln in y_un + x_un),
+                f"    {xarr}[{x_addr}] = {yarr}[{y_addr}];",
+                "}",
+                "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            ]
+        if base == "tile_lower_solve":
+            lines += self._solve_phase_lines(a_t, x_t, None, "fwd", a_swap=False)
+        elif base == "tile_upper_solve":
+            # upstream tile_solve.h: back substitution reads U(i, j) AS GIVEN
+            # — a transposed operand carries the transpose in its own
+            # strides, so no coordinate swap here
+            lines += self._solve_phase_lines(a_t, x_t, None, "bwd", a_swap=False)
+        else:  # tile_cholesky_solve: A = F F^T, F read from the fill_mode
+            # triangle (upstream names the argument L). fwd solves F^T z = y
+            # — reading F^T(i, j) = F(j, i), the transposed coords through
+            # the input's own mapping — so the swap tracks fill_mode; bwd
+            # solves F x = z through the un-transposed coords.
+            upper = tmpl == "true"
+            lines += self._solve_phase_lines(a_t, x_t, None, "fwd", a_swap=upper)
+            lines += self._solve_phase_lines(a_t, x_t, None, "bwd", a_swap=not upper)
+        return lines
+
+    def _tile_assign_stmt(self, rhs: str) -> list[str]:
+        """``wp::tile_assign(dst, src, offs...)`` — copy src into dst at the
+        offset (upstream tile.h:5943). The source is snapshotted into scratch
+        before any write (upstream stages to registers: dest may be a view
+        aliasing src, NumPy assignment semantics), one barrier on each side.
+        Plain launches bind the per-thread value (non-zero offsets cannot
+        address the thread's one element and fail loud)."""
+        args, _tmpl = self._parse_tile_call(rhs, "tile_assign", False)
+        if len(args) < 3:
+            raise TranslationError(f"tile_assign with {len(args)} args (needs dst, src, offsets...)")
+        d_t = self._tvar(args[0].strip(), "tile_assign")
+        s_t = self._tvar(args[1].strip(), "tile_assign")
+        if d_t.dims != s_t.dims:
+            pass  # src must FIT in dst; full-tile assign is the closure form
+        offs = args[2:]
+        if len(offs) != len(d_t.dims):
+            raise TranslationError(f"tile_assign needs one offset per dst dimension, got {len(offs)}")
+        self.unit.uses_tile_ops = True
+        if self.unit.block_dim is None:
+            off_vals = [self.const_vars.get(o.strip(), o.strip()) for o in offs]
+            if any(v != "0" for v in off_vals):
+                raise TranslationError(
+                    "wp::tile_assign with a non-zero offset on a plain launch: the per-thread "
+                    "scalar tier holds one element per tile — identity assigns only"
+                )
+            return [f"{args[0].strip()} = {args[1].strip()};"]
+        bd = self._require_block_dim("wp::tile_assign")
+        self._check_uniform("wp::tile_assign")
+        darr, sarr = self._shrub(d_t), self._shrub(s_t)
+        if s_t.elem != d_t.elem:
+            raise TranslationError(f"tile_assign elem mismatch {s_t.elem} -> {d_t.elem}")
+        scratch = self._claim_shr(d_t.elem, s_t.size)
+        s_un, s_addr = s_t.lin_addr("_wp_t", prefix="_wp_as")
+        # dst coordinates: _wp_t is a SRC-linear index — unravel it through
+        # the src shape, add the offset per axis, then map through the dst
+        # strides (a view/alias dst reorders through its own mapping; the
+        # src linear index must never be reused as a dst index, it lands at
+        # the wrong element whenever the offset wraps a dst row).
+        w_lines: list[str] = []
+        rem = "_wp_t"
+        if len(s_t.dims) > 1:
+            div = 1
+            for d in s_t.dims[1:]:
+                div *= d
+            for i in range(len(s_t.dims) - 1):
+                coord = f"_wp_ad{i}"
+                w_lines.append(f"int {coord} = {rem} / {div}")
+                rem = f"({rem} - {coord} * {div})"
+                div //= s_t.dims[i] if s_t.dims[i] else 1
+        addr_terms = []
+        for i, o in enumerate(offs):
+            coord = rem if i == len(s_t.dims) - 1 else f"_wp_ad{i}"
+            stride = d_t.strides[i]
+            term = f"({self.expr(o)}) + {coord}"
+            addr_terms.append(f"({term})" + (f" * {stride}" if stride != 1 else ""))
+        # a view/alias dst owns no storage: its base selects the region of
+        # the underlying source-tile array
+        if d_t.base != "0":
+            addr_terms.append(f"({d_t.base})")
+        d_addr = " + ".join(addr_terms) if addr_terms else "0"
+        return [
+            # snapshot phase
+            f"for (int _wp_t = _wp_lane; _wp_t < {s_t.size}; _wp_t += {bd}) {{",
+            *(f"    {ln};" for ln in s_un),
+            f"    _wp_tile_shr_{scratch}[_wp_t] = {sarr}[{s_addr}];",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            # write phase at the offset (a view dst reorders through its mapping)
+            f"for (int _wp_t = _wp_lane; _wp_t < {s_t.size}; _wp_t += {bd}) {{",
+            *(f"    {ln};" for ln in w_lines),
+            f"    {darr}[{d_addr}] = _wp_tile_shr_{scratch}[_wp_t];",
+            "}",
             "threadgroup_barrier(mem_flags::mem_threadgroup);",
         ]
 
@@ -1887,8 +2758,15 @@ class _BodyTranslator:
                         raise TranslationError(
                             f"wp::tile_extract index {k} out of bounds for tile of {tvar.size} element(s)"
                         )
-                    return f"{arr}[{k}]"
-                return f"{arr}[{self.expr(idx_var)}]"
+                    _lines, addr = tvar.lin_addr(str(k))
+                    return f"{arr}[{addr}]"
+                d_lines, d_addr = tvar.lin_addr(self.expr(idx_var), prefix="_wp_x")
+                if d_lines:
+                    raise TranslationError(
+                        "wp::tile_extract with a runtime index on a strided view must be assigned "
+                        "to a local first (the coordinate unravel emits statements)"
+                    )
+                return f"{arr}[{d_addr}]"
             if idx_const == "0":
                 return src
             raise TranslationError(
@@ -1998,6 +2876,27 @@ class _BodyTranslator:
             elem = msl_type(split_args(template)[0])
             dims = _tile_shape_dims(split_args(template)[1])
             self.unit.uses_tile_ops = True
+            init = m.group(4)
+            if init is not None and init.strip() == "nullptr":
+                # non-owning alias decl (``= nullptr``): a tile_transpose /
+                # tile_reshape / tile_view result — upstream Owner=false shared
+                # view. No storage is claimed; strides may differ from
+                # row-major (a transposed layout), and the producing
+                # assignment binds the slot/base to the source tile's array.
+                stride_m = re.search(r"wp::tile_stride_t<([\d,\s]+)>", template)
+                strides = (
+                    [int(s) for s in stride_m.group(1).replace(" ", "").split(",") if s]
+                    if stride_m
+                    else None
+                )
+                if self.unit.block_dim is None:
+                    self.tile_vars[name] = TileVar("scalar", elem, dims=dims)
+                else:
+                    size = 1
+                    for d in dims:
+                        size *= d
+                    self.tile_vars[name] = TileVar("shr", elem, slot=-1, size=size, dims=dims, strides=strides)
+                return []
             if kind_word == "register" and (
                 self.unit.block_dim is None or dims == [self.unit.block_dim]
             ):
@@ -2216,6 +3115,84 @@ class _BodyTranslator:
                 return self._tile_reduce(target, rhs)
             if rhs.startswith("wp::tile_zeros<"):
                 return self._tile_zeros(target, rhs)
+            if rhs.startswith(("wp::tile_transpose(", "wp::tile_reshape<", "wp::tile_view<")):
+                op = (
+                    "tile_transpose"
+                    if rhs.startswith("wp::tile_transpose(")
+                    else ("tile_reshape" if rhs.startswith("wp::tile_reshape<") else "tile_view")
+                )
+                return self._tile_alias_bind(target, rhs, op)
+            if rhs.startswith(("wp::tile_matmul_acc(", "wp::tile_matmul(")):
+                # the SSA names every tile_matmul form tile_matmul_acc — the
+                # alpha/beta split travels in the arguments
+                return self._tile_matmul(target, rhs, acc_name=rhs.startswith("wp::tile_matmul_acc("))
+            if rhs.startswith("wp::tile_diag_add("):
+                return self._tile_diag_add(target, rhs)
+            if rhs.startswith(("wp::tile_scan_inclusive(", "wp::tile_scan_exclusive(")):
+                return self._tile_scan(target, rhs, inclusive=rhs.startswith("wp::tile_scan_inclusive("))
+            if rhs.startswith("wp::tile_sum_axis<"):
+                return self._tile_sum_axis(target, rhs)
+            if rhs.startswith("wp::tile_cholesky<"):
+                return self._tile_cholesky(target, rhs)
+            if rhs.startswith(
+                (
+                    "wp::tile_lower_solve(",
+                    "tile_lower_solve(",
+                    "wp::tile_upper_solve(",
+                    "tile_upper_solve(",
+                    "wp::tile_cholesky_solve<",
+                    "tile_cholesky_solve<",
+                )
+            ):
+                # lower/upper_solve reach the SSA without the wp:: namespace;
+                # cholesky_solve keeps it
+                return self._tile_solve(target, rhs)
+            if rhs.startswith("wp::view("):
+                # `v = wp::view(parent, idx);` — an array-prefix slice
+                # (``parent[i]`` on an N-D array yields an (N-1)-D view over
+                # the parent's buffer). A local (data, meta) pair derived
+                # from the parent's runtime meta; the data pointer advances
+                # by one full outer slice of BYTE strides.
+                vargs = split_args(rhs[len("wp::view(") : -1])
+                if len(vargs) != 2:
+                    raise TranslationError(f"wp::view with {len(vargs)} args: single-index slices only")
+                parent = vargs[0].strip()
+                pspec = self.array_args.get(parent)
+                if pspec is None:
+                    raise TranslationError(f"wp::view on non-array {parent!r}")
+                elem = array_elem_msl(pspec.ctype)
+                nspec = ArgSpec(target, "array", f"wp::array_t<{elem}>")
+                nspec.local = True
+                self.array_args[target] = nspec
+                idx = self.expr(vargs[1])
+                pref = self._meta_ref(pspec)
+                self.hoisted.extend([
+                    f"wp_arr_meta {target}_m = {{}};",
+                    f"device {elem}* {target}_data = (device {elem}*)0;",
+                ])
+                # Upstream array.h view(): one full outer slice per index —
+                # an i * strides[0] BYTE advance (meta strides mirror
+                # array_t's byte strides, the same units wp_address uses),
+                # with negative indices wrapped Python-style. A shape-product
+                # advance is wrong for every ndim that lacks trailing dims: on
+                # a 2-D parent it collapses to shape[1] * 0 == 0 and pins
+                # every slice to row 0.
+                wrapped = f"((int)({idx}) < 0 ? (int)({idx}) + {pref}.shape[0] : (int)({idx}))"
+                return [
+                    (
+                        f"{target}_data = (device {elem}*)((device char*)({self._data_expr(pspec)}) "
+                        f"+ (size_t)({wrapped} * ({pref}.strides[0])));"
+                    ),
+                    f"{target}_m.offset = {pref}.offset; {target}_m.ndim = {pref}.ndim - 1;",
+                    (
+                        f"{target}_m.shape[0] = {pref}.shape[1]; {target}_m.shape[1] = {pref}.shape[2]; "
+                        f"{target}_m.shape[2] = 0; {target}_m.shape[3] = 0;"
+                    ),
+                    (
+                        f"{target}_m.strides[0] = {pref}.strides[1]; {target}_m.strides[1] = {pref}.strides[2]; "
+                        f"{target}_m.strides[2] = 0; {target}_m.strides[3] = 0;"
+                    ),
+                ]
             m_cp = re.match(r"^wp::copy\((\w+)\)$", rhs)
             base = m_cp.group(1) if m_cp else (rhs.strip() if re.match(r"^\w+$", rhs.strip()) else None)
             if rhs.startswith("wp::mesh_get(") or (base is not None and base in self.mesh_vars):
@@ -2316,6 +3293,28 @@ class _BodyTranslator:
             return self._tile_scatter(stripped)
         if stripped.startswith("wp::tile_store<"):
             return self._tile_store(stripped)
+        if stripped.startswith(("wp::tile_matmul_acc(", "wp::tile_matmul(")):
+            # in-place GEMM (alpha/beta in the args; the SSA names every form
+            # tile_matmul_acc); strip the statement's trailing semicolon — the
+            # parsers below expect a bare call
+            src = stripped.removesuffix(";")
+            return self._tile_matmul(None, src, acc_name=src.startswith("wp::tile_matmul_acc("))
+        if stripped.startswith("wp::tile_assign("):
+            return self._tile_assign_stmt(stripped.removesuffix(";"))
+        if stripped.startswith("wp::tile_cholesky_inplace<"):
+            return self._tile_cholesky(None, stripped.removesuffix(";"))
+        if stripped.startswith(("wp::tile_cholesky_solve_inplace<", "tile_cholesky_solve_inplace<")):
+            return self._tile_solve(None, stripped.removesuffix(";"))
+        if stripped.startswith(
+            (
+                "tile_lower_solve_inplace(",
+                "wp::tile_lower_solve_inplace(",
+                "tile_upper_solve_inplace(",
+                "wp::tile_upper_solve_inplace(",
+            )
+        ):
+            # lower/upper in-place solves reach the SSA without the wp:: namespace
+            return self._tile_solve(None, stripped.removesuffix(";"))
 
         m_ca = re.match(r"^\s*(\w+(?:\.\w+)*)\s*([+\-*/])=\s*(.+?);\s*$", line)
         if m_ca:
@@ -2616,6 +3615,10 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
 
     opts = dict(options or {})
     opts["enable_backward"] = False
+    # the tile mathdx builders (matmul/cholesky/solve lto dispatch) read
+    # options["output_arch"] unconditionally — a caller that omits it parses
+    # the vendored builtins with a KeyError
+    opts.setdefault("output_arch", None)
     # The deterministic builder branches on `options.get("deterministic")`;
     # a missing key reads as None != NOT_GUARANTEED and turns ON the det
     # codegen path (WP_DET_SCATTER_OR_FALLBACK macros). Force plain mode.
