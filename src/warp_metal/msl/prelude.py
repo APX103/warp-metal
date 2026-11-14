@@ -294,6 +294,37 @@ static inline vec4f wp_extract(mat44f m, int r) { return make_vec4f(m.c[r][0], m
 static inline float wp_extract(mat22f m, int r, int c) { return m.c[r][c]; }
 static inline float wp_extract(mat33f m, int r, int c) { return m.c[r][c]; }
 static inline float wp_extract(mat44f m, int r, int c) { return m.c[r][c]; }
+// trace (mat.h wp::trace: sum of the diagonal; gen-mat sizes get their own
+// overload from ensure_mat_def)
+static inline float wp_trace(mat22f m) { return m.c[0][0] + m.c[1][1]; }
+static inline float wp_trace(mat33f m) { return m.c[0][0] + m.c[1][1] + m.c[2][2]; }
+static inline float wp_trace(mat44f m) { return m.c[0][0] + m.c[1][1] + m.c[2][2] + m.c[3][3]; }
+// neg/add/sub (mat.h operator surface: elementwise, closed over the fixed
+// sizes; gen mats get the same from ensure_mat_def)
+static inline mat22f wp_neg(mat22f m) { return make_mat22f(-m.c[0][0], -m.c[0][1], -m.c[1][0], -m.c[1][1]); }
+static inline mat33f wp_neg(mat33f m) { return make_mat33f(-m.c[0][0], -m.c[0][1], -m.c[0][2], -m.c[1][0], -m.c[1][1], -m.c[1][2], -m.c[2][0], -m.c[2][1], -m.c[2][2]); }
+static inline mat44f wp_neg(mat44f m) {
+    mat44f r; for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) r.c[i][j] = -m.c[i][j]; return r;
+}
+// div (mat.h:3148/3161: elementwise scalar division, both operand orders)
+static inline mat22f wp_div(mat22f m, float s) {
+    mat22f r; for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) r.c[i][j] = m.c[i][j] / s; return r;
+}
+static inline mat22f wp_div(float s, mat22f m) {
+    mat22f r; for (int i = 0; i < 2; ++i) for (int j = 0; j < 2; ++j) r.c[i][j] = s / m.c[i][j]; return r;
+}
+static inline mat33f wp_div(mat33f m, float s) {
+    mat33f r; for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) r.c[i][j] = m.c[i][j] / s; return r;
+}
+static inline mat33f wp_div(float s, mat33f m) {
+    mat33f r; for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) r.c[i][j] = s / m.c[i][j]; return r;
+}
+static inline mat44f wp_div(mat44f m, float s) {
+    mat44f r; for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) r.c[i][j] = m.c[i][j] / s; return r;
+}
+static inline mat44f wp_div(float s, mat44f m) {
+    mat44f r; for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) r.c[i][j] = s / m.c[i][j]; return r;
+}
 // assign_inplace (vec.h / quat.h: component_ref with negative-index wrap)
 static inline void wp_assign_inplace(thread vec2f& v, int i, float x) {
     if (i < 0) i += 2;
@@ -332,6 +363,10 @@ static inline void wp_assign_inplace(thread mat44f& m, int i, vec4f v) {
     if (i < 0) i += 4;
     m.c[i][0] = v.x; m.c[i][1] = v.y; m.c[i][2] = v.z; m.c[i][3] = v.w;
 }
+// element assign (`m[i][j] = x` on fixed mats, matching the generic matNxM form)
+static inline void wp_assign_inplace(thread mat22f& m, int i, int j, float x) { m.c[i][j] = x; }
+static inline void wp_assign_inplace(thread mat33f& m, int i, int j, float x) { m.c[i][j] = x; }
+static inline void wp_assign_inplace(thread mat44f& m, int i, int j, float x) { m.c[i][j] = x; }
 
 // lvalue element access (wp::indexref lowering: `&v[i]` on plain structs,// which carry no operator[]); returns a thread reference so stores/loads
 // through the pointer alias hit the underlying variable
@@ -1165,6 +1200,39 @@ static inline int wp_atomic_min_ret_at(device int* d, wp_arr_meta m, int i, int 
 }
 static inline int wp_atomic_max_ret_at(device int* d, wp_arr_meta m, int i, int j, int v) {
     return wp_atomic_max_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+// 3D variants (array3d atomics, e.g. steel crba_fill_par_dof H_group scatter)
+static inline void wp_atomic_add_at(device float* d, wp_arr_meta m, int i, int j, int k, float v) {
+    wp_atomic_add((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1] + k * m.strides[2])), v);
+}
+static inline void wp_atomic_add_at(device int* d, wp_arr_meta m, int i, int j, int k, int v) {
+    wp_atomic_add((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1] + k * m.strides[2])), v);
+}
+static inline float wp_atomic_add_ret_at(device float* d, wp_arr_meta m, int i, int j, int k, float v) {
+    return wp_atomic_add_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1] + k * m.strides[2])), v);
+}
+static inline float wp_atomic_min_ret_at(device float* d, wp_arr_meta m, int i, int j, int k, float v) {
+    return wp_atomic_min_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1] + k * m.strides[2])), v);
+}
+static inline float wp_atomic_max_ret_at(device float* d, wp_arr_meta m, int i, int j, int k, float v) {
+    return wp_atomic_max_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1] + k * m.strides[2])), v);
+}
+static inline int wp_atomic_add_ret_at(device int* d, wp_arr_meta m, int i, int j, int k, int v) {
+    return wp_atomic_add_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1] + k * m.strides[2])), v);
+}
+static inline int wp_atomic_min_ret_at(device int* d, wp_arr_meta m, int i, int j, int k, int v) {
+    return wp_atomic_min_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1] + k * m.strides[2])), v);
+}
+static inline int wp_atomic_max_ret_at(device int* d, wp_arr_meta m, int i, int j, int k, int v) {
+    return wp_atomic_max_ret((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1] + k * m.strides[2])), v);
+}
+// atomic_exch (warp atomic_exch always returns the old value; int/uint only —
+// e.g. steel _warn_constraint_row_overflow latching warning flags)
+static inline int wp_atomic_exch_ret_at(device int* d, wp_arr_meta m, int i, int v) {
+    return atomic_exchange_explicit((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v, memory_order_relaxed);
+}
+static inline int wp_atomic_exch_ret_at(device int* d, wp_arr_meta m, int i, int j, int v) {
+    return atomic_exchange_explicit((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v, memory_order_relaxed);
 }
 
 // composite (spatial_vectorf) atomics: per-component fetch on the packed

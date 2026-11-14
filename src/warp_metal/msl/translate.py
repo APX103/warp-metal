@@ -110,6 +110,12 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
     lines.append(f"    {msl_t} v = {{}};")
     lines.append("    return v;")
     lines.append("}")
+    # scalar fill (mat.h mat_t(Type s) constructor, e.g. zero-inertia guards)
+    lines.append(f"static inline {msl_t} make_{msl_t}(float s) {{")
+    lines.append(f"    {msl_t} v;")
+    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) v.c[i][j] = s;")
+    lines.append("    return v;")
+    lines.append("}")
     comps = ", ".join(f"m.c[i][{j}]" for j in range(N))
     lines.append(
         f"static inline {vec} wp_extract({msl_t} m, int i) {{ return make_{vec}({comps}); }}"
@@ -132,6 +138,8 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
         f"static inline {msl_t} wp_where(bool c, {msl_t} a, {msl_t} b) {{ return c ? a : b; }}"
     )
     if M == N:
+        diag = " + ".join(f"m.c[{i}][{i}]" for i in range(N))
+        lines.append(f"static inline float wp_trace({msl_t} m) {{ return {diag}; }}")
         # square-mat ops (prelude covers 2x2..4x4; generic sizes like Newton's
         # spatial-inertia mat6x6f get the same warp-mul/transpose semantics:
         # row-major r.c[i][j] = sum_k a.c[i][k]*b.c[k][j])
@@ -181,6 +189,33 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
             )
             lines.append("    return r;")
             lines.append("}")
+    # elementwise div, both operand orders (mat.h:3148/3161)
+    lines.append(f"static inline {msl_t} wp_div({msl_t} m, float s) {{")
+    lines.append(f"    {msl_t} r;")
+    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = m.c[i][j] / s;")
+    lines.append("    return r;")
+    lines.append("}")
+    lines.append(f"static inline {msl_t} wp_div(float s, {msl_t} m) {{")
+    lines.append(f"    {msl_t} r;")
+    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = s / m.c[i][j];")
+    lines.append("    return r;")
+    lines.append("}")
+    # elementwise neg/add/sub (mat.h operator surface)
+    lines.append(f"static inline {msl_t} wp_neg({msl_t} m) {{")
+    lines.append(f"    {msl_t} r;")
+    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = -m.c[i][j];")
+    lines.append("    return r;")
+    lines.append("}")
+    lines.append(f"static inline {msl_t} wp_add({msl_t} a, {msl_t} b) {{")
+    lines.append(f"    {msl_t} r;")
+    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = a.c[i][j] + b.c[i][j];")
+    lines.append("    return r;")
+    lines.append("}")
+    lines.append(f"static inline {msl_t} wp_sub({msl_t} a, {msl_t} b) {{")
+    lines.append(f"    {msl_t} r;")
+    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = a.c[i][j] - b.c[i][j];")
+    lines.append("    return r;")
+    lines.append("}")
     unit.structs[msl_t] = "\n".join(lines)
 
 
@@ -2781,6 +2816,10 @@ class _BodyTranslator:
             return f"make_{msl_t}({', '.join(self.expr(a) for a in args)})"
         if key == "wp::copy":
             return self.expr(args[0])
+        if key == "wp::trace":
+            # matrix trace (sum of diagonal): fixed sizes via the prelude,
+            # generic square mats via ensure_mat_def's overload
+            return f"wp_trace({self.expr(args[0])})"
         if key == "wp::store":
             if len(args) == 2:
                 # store through an element pointer (wp::indexref result or a

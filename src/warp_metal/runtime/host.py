@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import os
 import threading
 
 import numpy as np
@@ -384,8 +385,17 @@ class WarpArray:
             # multi-dim element read (host copy via the numpy view)
             return self.numpy_view()[key]
         if isinstance(key, (int, np.integer)):
+            if len(self.shape) == 0:
+                raise TypeError("scalar array is not indexable")
             if len(self.shape) > 1:
-                return self.numpy_view()[key]
+                # leading-index view: upstream arr[i] returns a wp.array view
+                # of one leading slice sharing the buffer (Newton steel takes
+                # per-world rows: row_dropped_all[0]); only 1-D indexing
+                # yields the element value
+                lead = 1
+                for s in self.shape[1:]:
+                    lead *= s
+                return self._slice_view(int(key) * lead, lead)
             return self.numpy[key]
         raise TypeError(f"unsupported array index {key!r}")
 
@@ -1209,6 +1219,15 @@ def _unit_for(kernel, block_dim: int | None = None):
         opts = {"block_dim": block_dim} if block_dim is not None else None
         unit = translate_kernel(kernel, opts)
         source = unit.source()
+        dump_dir = os.environ.get("WARP_METAL_DUMP_MSL")
+        if dump_dir:
+            # debugging aid: the Metal diagnostics buffer clips long error
+            # lists — dumping the exact MSL lets a standalone
+            # newLibraryWithSource probe recover the full diagnostics
+            os.makedirs(dump_dir, exist_ok=True)
+            dump_path = os.path.join(dump_dir, f"{kernel.__name__ or 'kernel'}.msl")
+            with open(dump_path, "w") as f:
+                f.write(source)
         lib = _mm.library_create(source)
         fn = _mm.function_get(lib, unit.kernel.name)
         pso = _mm.pso_create(fn)
