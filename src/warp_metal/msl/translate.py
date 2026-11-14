@@ -570,14 +570,24 @@ class KernelUnit:
         # argument buffer (Metal plain-buffer cap is 30)
         self.uses_argbuf = False
         self.device_bindings: list[tuple[str, str]] = []  # [(binding, elem msl)]
-        # tiled launch (wp.launch_tiled): threads-per-block the kernel was
-        # translated for, or None for plain 1-D launches. Parse-time tile
-        # shapes (vendored builtins read codegen.options["block_dim"]) and
-        # the emitted tid mapping both key off it.
+        # launch block size when one was supplied: wp.launch_tiled always
+        # (default 256), plain wp.launch only with an explicit block_dim.
+        # Parse-time tile shapes (vendored builtins read
+        # codegen.options["block_dim"]), wp.block_dim() folding and the
+        # threadgroup reduction lowering all key off it; the tid mapping
+        # reads the bounds off _dims instead (host appends block_dim for
+        # tiled launches), so it is routing-independent.
         self.block_dim: int | None = None
         # [(elem msl, op msl)] per wp::tile_reduce site, in body order —
         # kernel_src emits one threadgroup shared array per site
         self.tile_reduces: list[tuple[str, str]] = []
+        # True when the unit reaches any tile construct (tile vars,
+        # tile_reduce/sum/min/max, tile_zeros/extract/scatter, tile mesh
+        # query stubs). Introspection only — plain wp.launch of a tile kernel
+        # is accepted, matching upstream's degenerate tile semantics (the
+        # per-thread lowering is exact when every threadgroup lane runs, e.g.
+        # dim a multiple of block_dim; see tests/test_launch_routing.py).
+        self.uses_tile_ops = False
         # in-device wp.zeros() (wp::fixedarray_t) allocations: every site in
         # the unit (kernel + all @wp.func bodies) claims a unique byte offset
         # in the per-thread arena (`device uchar* _wp_arena`, bytes_per_thread
@@ -657,6 +667,9 @@ class KernelUnit:
             params.append(f"    device wp_mesh* _wp_mesh_table [[buffer({idx})]]")
             idx += 1
         params.append("    uint3 _gid [[thread_position_in_grid]]")
+        if self.tile_reduces:
+            # grid extent for the partial-threadgroup fold guard (_wp_live)
+            params.append("    uint3 _gsize [[threads_per_grid]]")
         fields = []
         for a in self.args:
             if a.kind == "scalar":
@@ -669,15 +682,31 @@ class KernelUnit:
                 fields.append(f"    wp_arr_meta {a.name}_m;")
         fields.append("    wp_arr_meta _dims;  // launch bounds for multi-dim tid")
         body = "\n".join(fn.lines) or "    ;"
+        if "_wp_live" in body and not (self.block_dim is not None and self.tile_reduces):
+            # static self-check (mirrors the one in fn_src): a kernel-body
+            # fold needs the preamble definition, which fires exactly when
+            # block_dim is set and tile_reduce sites exist
+            raise TranslationError(
+                f"kernel {self.kernel.name}: body uses _wp_live without the preamble "
+                "definition (tile_reduce lowered without block_dim — translation bug)"
+            )
         # tiled launch support: one threadgroup shared array per tile_reduce
         # site (function-scope threadgroup storage; sizes assume a
-        # power-of-two block_dim, enforced at launch)
+        # power-of-two block_dim, enforced at launch). Plain-launch tile
+        # boundary: wp.launch + tile_reduce runs the threadgroup tree
+        # semantics below, NOT upstream's per-work-item degenerate tile
+        # semantics — they agree on zero/degenerate tiles (the only form the
+        # Newton closure touches; trajectory green = no reduce hit or dim a
+        # multiple of block_dim) and differ on non-zero tiles. The fold is
+        # guarded by _wp_live so partial threadgroups (dim % block_dim != 0)
+        # never read uninitialized shared slots.
         preamble = "    const int _idx = (int)_gid.x;\n"
         if self.block_dim is not None:
             for k, (_elem, _combine) in enumerate(self.tile_reduces):
                 preamble += f"    threadgroup {_elem} _wp_tile_shr_{k}[{self.block_dim}];\n"
             if self.tile_reduces:
                 preamble += f"    const int _wp_lane = _idx % {self.block_dim};\n"
+                preamble += f"    const int _wp_live = min((int)_gsize.x - (_idx - _wp_lane), {self.block_dim});\n"
         defines_text = "\n".join(defines) + "\n" if defines else ""
         return (
             self._argbuf_struct(use_argbuf) + "\n\n"
@@ -736,15 +765,34 @@ def fn_src(fn: MSLFunction) -> str:
             params.append(f"    {p.msl} {p.name}")
     body = "\n".join(fn.lines) or "    ;"
     ret = "void" if fn.ret_msl is None else fn.ret_msl
-    params_text = ",\n".join(params)
+    # Hidden parameters go into the same list (order must mirror _call_user's
+    # argument forwarding: lane/live/shr slots, then arena, then mesh table).
+    # Never append to a params *string*: for a signatureless function (empty
+    # fn.params) `s += ",\n int _wp_lane"` emitted a leading comma and tore
+    # the parameter list loose at file scope.
     if fn.needs_lane:
-        params_text += ",\n    int _wp_lane"
+        params.append("    int _wp_lane")
+        params.append("    int _wp_live")
         for k, elem in fn.shr_slots:
-            params_text += f",\n    threadgroup {elem}* _wp_tile_shr_{k}"
+            params.append(f"    threadgroup {elem}* _wp_tile_shr_{k}")
     if fn.needs_arena:
-        params_text += ",\n    device uchar* _wp_arena"
+        params.append("    device uchar* _wp_arena")
     if fn.needs_mesh:
-        params_text += ",\n    device wp_mesh* _wp_mesh_table"
+        params.append("    device wp_mesh* _wp_mesh_table")
+    params_text = ",\n".join(params)
+    # shape self-check: every parameter line is 4-space indented, so a comma
+    # at the start of the list or of any line means a malformed signature
+    if params_text.startswith(",") or "\n," in params_text:
+        raise TranslationError(f"function {fn.name}: malformed parameter list (misplaced comma)")
+    if "_wp_live" in body and "int _wp_live" not in params_text:
+        # static self-check: every emission path that lowers _tile_reduce
+        # (kernel body / @wp.func body / loops / transitive calls) must pair
+        # each _wp_live use with a definition in scope — kernel preamble or
+        # the hidden needs_lane parameter here
+        raise TranslationError(
+            f"function {fn.name}: body uses _wp_live but its signature does not carry it "
+            "(tile_reduce lowered outside the needs_lane forwarding — translation bug)"
+        )
     return f"static {ret} {fn.name}(\n{params_text})\n" + "{\n" + body + "\n}\n"
 
 
@@ -829,9 +877,9 @@ class _BodyTranslator:
     def expr(self, src: str) -> str:
         src = src.strip()
         if "builtin_block_dim()" in src:
-            # wp.block_dim() folds to the tiled launch's compile-time size
+            # wp.block_dim() folds to the launch's compile-time block size
             if self.unit.block_dim is None:
-                raise TranslationError("wp.block_dim() outside a tiled launch")
+                raise TranslationError("wp.block_dim() requires an explicit block_dim launch")
             src = src.replace("builtin_block_dim()", str(self.unit.block_dim))
         m = re.match(r"^builtin_tid([1234])d\s*\((.*)\)$", src)
         if m:
@@ -885,25 +933,27 @@ class _BodyTranslator:
         return self._call(src)
 
     def _builtin_tid(self, n: str, arg_src: str) -> str:
+        """Translate ``builtin_tidNd`` to the upstream grid-coordinate form.
+
+        Upstream semantics (context.py ``launch`` / ``launch_tiled`` +
+        builtin.h ``tid()``): ``_idx`` is the flat THREAD index; ``wp.tid()``
+        returns coordinates of the row-major unravel over the launch bounds
+        (last dim fastest), with threads beyond the coordinate folded into
+        one bucket (``coord_mult``). ``_wp_args._dims`` carries the bounds —
+        the user dim for a plain launch, grid + ``[block_dim]`` for a tiled
+        launch — so a shared runtime helper covers every routing:
+          1-D plain: the flat index; N-D plain: leading coordinate
+          (dim=(a,b): ``_idx / b``);
+          tiled scalar: the BLOCK index (``_idx / block_dim``);
+          tiled 2-D: the (block, lane) pair.
+        """
         args = split_args(arg_src) if arg_src.strip() else []
-        if self.unit.block_dim is not None:
-            # tiled launch: the grid is dim*block_dim threads in
-            # block_dim-sized threadgroups. `wp.tid()` is the flattened
-            # GLOBAL thread index (upstream semantics) — kernels either use
-            # it directly or partition manually via wp.block_dim() math.
-            # The 2-D form maps (block, lane) for launch_tiled-style kernels.
-            if n == "1":
-                if args:
-                    raise TranslationError("builtin_tid1d takes no args")
-                return "_idx"
-            if n == "2" and len(args) == 2:
-                bd = self.unit.block_dim
-                return f"{args[0]} = _idx / {bd}; {args[1]} = _idx % {bd};"
-            raise TranslationError(f"builtin_tid{n}d is not supported in tiled launches")
         if n == "1":
             if args:
                 raise TranslationError("builtin_tid1d takes no args")
-            return "_idx"
+            return "wp_tid1(_idx, _wp_args._dims)"
+        if len(args) != int(n):
+            raise TranslationError(f"builtin_tid{n}d takes {n} out args, got {len(args)}")
         out = ", ".join(a.strip() for a in args)
         return f"wp_tid{n}({out}, _idx, _wp_args._dims)"
 
@@ -915,7 +965,12 @@ class _BodyTranslator:
         a log2(block_dim) barriered pairwise fold leaves the result at [0]
         for all threads to read. Requires uniform control flow around the
         call (true for every tile_reduce in the Newton closure) and a
-        power-of-two block_dim (validated at launch).
+        power-of-two block_dim (validated at launch). The fold is guarded by
+        ``_wp_lane + _wp_s < _wp_live``: in a partial threadgroup (plain
+        wp.launch with dim % block_dim != 0) the tail slots are never
+        written, and skipping them folds exactly [0, _wp_live) — no
+        uninitialized shared-memory reads, correct for every combine
+        (associativity keeps the guarded tree exact).
         """
         open_paren = rhs.index("(")
         close = _find_balanced(rhs, open_paren)
@@ -942,6 +997,7 @@ class _BodyTranslator:
             raise TranslationError(f"tile_reduce source {src!r} is not a tile variable")
         if self.unit.block_dim is None:
             raise TranslationError("wp::tile_reduce outside a tiled launch")
+        self.unit.uses_tile_ops = True
         k = len(self.unit.tile_reduces)  # unit-global slot (kernel + @wp.func sites share the numbering)
         self.unit.tile_reduces.append((elem, combine))
         self.used_shr.append((k, elem, combine))
@@ -955,7 +1011,7 @@ class _BodyTranslator:
             f"_wp_tile_shr_{k}[_wp_lane] = {src};",
             "threadgroup_barrier(mem_flags::mem_threadgroup);",
             f"for (int _wp_s = {bd} >> 1; _wp_s > 0; _wp_s >>= 1) {{",
-            f"    if (_wp_lane < _wp_s) {{",
+            f"    if (_wp_lane < _wp_s && _wp_lane + _wp_s < _wp_live) {{",
             f"        {shr_lhs} = {combined};",
             "    }",
             "    threadgroup_barrier(mem_flags::mem_threadgroup);",
@@ -1073,6 +1129,7 @@ class _BodyTranslator:
             # reduction lowered to already holds element 0 for every thread.
             # A non-constant or nonzero index is outside the closure (the
             # upstream tile has shape (1,), so only [0] is in-bounds anyway).
+            self.unit.uses_tile_ops = True
             idx_var = args[1].strip()
             idx = self.const_vars.get(idx_var)
             if idx != "0":
@@ -1081,9 +1138,9 @@ class _BodyTranslator:
                 )
             return self.expr(args[0])
         if key == "wp::block_dim":
-            # wp::block_dim() folds to the tiled launch's compile-time size
+            # wp::block_dim() folds to the launch's compile-time block size
             if self.unit.block_dim is None:
-                raise TranslationError("wp::block_dim() outside a tiled launch")
+                raise TranslationError("wp::block_dim() requires an explicit block_dim launch")
             return str(self.unit.block_dim)
         if key == "wp::bvh_get_group_root":
             # BVH host build lives in runtime/bvh.py (upstream bvh.cpp port,
@@ -1101,6 +1158,10 @@ class _BodyTranslator:
         # generic calls carry a template suffix (`wp::matrix_from_cols<wp::float32>`);
         # strip it for the plain-call table (cast/ctor tables keep the full key)
         base = key[4:].split("<", 1)[0]
+        if base.startswith("tile_"):
+            # tile-family calls (tile_mesh_query_aabb stub family etc.) ride
+            # launch_tiled (block, lane) semantics like every tile construct
+            self.unit.uses_tile_ops = True
         if base in _CALL_TABLE:
             return f"{_CALL_TABLE[base]}({', '.join(self.expr(a) for a in args)})"
         raise TranslationError(f"builtin {key!r} has no MSL translation")
@@ -1163,6 +1224,7 @@ class _BodyTranslator:
         if m:
             elem = msl_type(split_args(m.group(1))[0])
             self.tile_vars[m.group(2)] = elem
+            self.unit.uses_tile_ops = True
             # kept as an ordinary element-typed var: register tiles lower to
             # the thread's own value, shared tiles to the reduction result
             return [f"{elem} {m.group(2)} = {{}};"]
@@ -1342,6 +1404,7 @@ class _BodyTranslator:
             if rhs.startswith("wp::tile<"):
                 # wp::tile<T>(v): broadcast a register value into a per-thread
                 # tile — each thread already holds its own copy, so identity
+                self.unit.uses_tile_ops = True
                 open_paren = rhs.index("(")
                 close = _find_balanced(rhs, open_paren)
                 return [f"{target} = {self.expr(rhs[open_paren + 1 : close])};"]
@@ -1350,6 +1413,7 @@ class _BodyTranslator:
             if rhs.startswith("wp::tile_zeros<"):
                 # wp.tile_zeros(shape=(1,), ...): the tile is a per-thread
                 # element value in this lowering — zero it
+                self.unit.uses_tile_ops = True
                 return [f"{target} = {{}};"]
             m_cp = re.match(r"^wp::copy\((\w+)\)$", rhs)
             base = m_cp.group(1) if m_cp else (rhs.strip() if re.match(r"^\w+$", rhs.strip()) else None)
@@ -1453,6 +1517,7 @@ class _BodyTranslator:
             # thread writes its own copy (uniform for the live closure; the
             # mesh mid-phase user is dead — see the wp_mesh stub). idx is
             # always the compile-time constant 0 in the closure.
+            self.unit.uses_tile_ops = True
             open_p = len("wp::tile_scatter_masked(") - 1
             close = _find_balanced(stripped, open_p)
             sargs = split_args(stripped[open_p + 1 : close])
@@ -1563,9 +1628,9 @@ class _BodyTranslator:
         if m:
             return self._builtin_tid(m.group(1), m.group(2))
         if re.match(r"^builtin_block_dim\s*\(\s*\)$", src):
-            # wp.block_dim() folds to the tiled launch's compile-time size
+            # wp.block_dim() folds to the launch's compile-time block size
             if self.unit.block_dim is None:
-                raise TranslationError("wp.block_dim() outside a tiled launch")
+                raise TranslationError("wp.block_dim() requires an explicit block_dim launch")
             return str(self.unit.block_dim)
         m = re.match(r"^(wp::[A-Za-z_]\w*(?:<[^()]*>)?)\(", src)
         if not m:
@@ -1669,6 +1734,7 @@ class _BodyTranslator:
             raise TranslationError(f"call {name}: {len(args)} args for {len(fn.params)} params")
         if fn.needs_lane:
             out.append("_wp_lane")
+            out.append("_wp_live")
             for k, _elem in fn.shr_slots:
                 out.append(f"_wp_tile_shr_{k}")
             self.callee_needs_lane = True
@@ -1772,9 +1838,10 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
 
     unit = KernelUnit(name)
     if "block_dim" in opts:
-        # tiled launch: vendored parse consumed options["block_dim"] for the
-        # tile shapes; the emitter keys tid mapping / block_dim() / the
-        # threadgroup reduction off the same value
+        # launch-supplied block size (launch_tiled always; a plain launch
+        # only with an explicit block_dim): the vendored parse consumed
+        # options["block_dim"] for tile shapes, and wp.block_dim() folding /
+        # the threadgroup reduction lowering key off the same value
         unit.block_dim = int(opts["block_dim"])
 
     # ---- classify kernel args from the vendored type objects ----

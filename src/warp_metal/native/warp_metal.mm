@@ -15,7 +15,9 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <dispatch/dispatch.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef __cplusplus
@@ -211,17 +213,58 @@ uint64_t wmm_pso_max_threads_per_group(void *pso_handle) {
 
 // ---- dispatch (synchronous single kernel; batched commit is M2.5) ----
 
-int wmm_dispatch(void *pso_handle, void **buffer_handles, uint32_t n_buffers,
-                 uint32_t threads_x) {
+// Watchdog window for the completion wait, in seconds, read on EVERY
+// dispatch so tests can tune it via the environment. Default 120 s;
+// WARP_METAL_DISPATCH_TIMEOUT_S overrides (0 disables the watchdog and
+// restores the unbounded waitUntilCompleted). Without this bound a faulted
+// dispatch (out-of-bounds device access etc.) hangs the host forever inside
+// waitUntilCompleted — a fast, named failure is far more actionable.
+static double _dispatch_timeout_seconds(void) {
+    const char *s = getenv("WARP_METAL_DISPATCH_TIMEOUT_S");
+    if (s && *s) {
+        char *end = NULL;
+        double v = strtod(s, &end);
+        if (end != s && v >= 0.0) return v;
+    }
+    return 120.0;
+}
+
+// Encode, commit, and wait bounded by the watchdog. Shared by every dispatch
+// entry point. tg_x == 0 → threadgroup size auto (PSO max, clamped to the
+// grid); tg_x > 0 → exact threadgroup size (tiled launches and plain-launch
+// block_dim scheduling hints), validated against the PSO limit. require_tg
+// selects the tiled entry point's strict validation (0 is an error there).
+static int _dispatch_sync(void *pso_handle, void **buffer_handles, uint32_t n_buffers,
+                          uint32_t threads_x, uint32_t tg_x, const char *api, bool require_tg) {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pso_handle;
     if (!dev || !pso) {
-        _set_error(@"dispatch: missing device or pso");
+        _set_error([NSString stringWithFormat:@"%s: missing device or pso", api]);
         return -1;
+    }
+    if (tg_x > pso.maxTotalThreadsPerThreadgroup || (require_tg && tg_x == 0)) {
+        _set_error([NSString stringWithFormat:
+                    @"%s: block_dim %u exceeds the PSO threadgroup limit %lu%s",
+                    api, tg_x, (unsigned long)pso.maxTotalThreadsPerThreadgroup,
+                    require_tg ? "" : " (threadgroup sizes above the limit are invalid)"]);
+        return -3;
     }
 
     id<MTLCommandQueue> queue = [dev newCommandQueue];
     id<MTLCommandBuffer> cb = [queue commandBuffer];
+
+    // Completion handler must be attached BEFORE commit; it gives a
+    // deadline-bounded wait without polling latency (waitUntilCompleted
+    // has no timeout form).
+    double timeout = _dispatch_timeout_seconds();
+    dispatch_semaphore_t done = nil;
+    if (timeout > 0.0) {
+        done = dispatch_semaphore_create(0);
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> _completed) {
+            dispatch_semaphore_signal(done);
+        }];
+    }
+
     _residency_use(cb);
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
     [enc setComputePipelineState:pso];
@@ -231,16 +274,34 @@ int wmm_dispatch(void *pso_handle, void **buffer_handles, uint32_t n_buffers,
         [enc setBuffer:buf offset:0 atIndex:i];
     }
 
-    // spike kernels are 1D; threadgroup size clamped to PSO limit
-    NSUInteger tg = pso.maxTotalThreadsPerThreadgroup;
-    if (tg > threads_x) tg = threads_x;
+    NSUInteger tg = tg_x;
+    if (tg == 0) {
+        // 1-D dispatch; threadgroup size clamped to PSO limit and grid
+        tg = pso.maxTotalThreadsPerThreadgroup;
+        if (tg > threads_x) tg = threads_x;
+    }
     MTLSize grid = MTLSizeMake(threads_x, 1, 1);
     MTLSize tgs = MTLSizeMake(tg, 1, 1);
     [enc dispatchThreads:grid threadsPerThreadgroup:tgs];
     [enc endEncoding];
 
     [cb commit];
-    [cb waitUntilCompleted];
+    if (done != nil) {
+        long waited = dispatch_semaphore_wait(
+            done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)));
+        if (waited != 0) {
+            // Deadline hit while the command buffer is still in flight — it
+            // keeps running in the background (later dispatches use a fresh
+            // command queue), but the host fails loud instead of hanging.
+            _set_error([NSString stringWithFormat:
+                        @"%s: dispatch did not complete within %.1f s "
+                        "(watchdog; set WARP_METAL_DISPATCH_TIMEOUT_S to tune, 0 disables). "
+                        "Command-buffer status %ld, no error reported yet — the GPU likely "
+                        "faulted (out-of-bounds device access) or the kernel never terminates.",
+                        api, timeout, (long)cb.status]);
+            return -4;
+        }
+    }
     if (cb.status != MTLCommandBufferStatusCompleted || cb.error) {
         _set_error(cb.error.localizedDescription ?: @"command buffer failed");
         return -2;
@@ -248,44 +309,18 @@ int wmm_dispatch(void *pso_handle, void **buffer_handles, uint32_t n_buffers,
     return 0;
 }
 
+int wmm_dispatch(void *pso_handle, void **buffer_handles, uint32_t n_buffers,
+                 uint32_t threads_x, uint32_t tg_x) {
+    return _dispatch_sync(pso_handle, buffer_handles, n_buffers, threads_x, tg_x,
+                          "dispatch", false);
+}
+
 // tiled launch (wp.launch_tiled): the caller fixes the threadgroup size so
 // the kernel's block/lane tid mapping and threadgroup reductions are exact
 int wmm_dispatch_tiled(void *pso_handle, void **buffer_handles, uint32_t n_buffers,
                        uint32_t threads_x, uint32_t tg_x) {
-    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pso_handle;
-    if (!dev || !pso) {
-        _set_error(@"dispatch_tiled: missing device or pso");
-        return -1;
-    }
-    if (tg_x == 0 || tg_x > pso.maxTotalThreadsPerThreadgroup) {
-        _set_error(@"dispatch_tiled: block_dim exceeds the PSO threadgroup limit");
-        return -3;
-    }
-
-    id<MTLCommandQueue> queue = [dev newCommandQueue];
-    id<MTLCommandBuffer> cb = [queue commandBuffer];
-    _residency_use(cb);
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    [enc setComputePipelineState:pso];
-
-    for (uint32_t i = 0; i < n_buffers; i++) {
-        id<MTLBuffer> buf = (__bridge id<MTLBuffer>)buffer_handles[i];
-        [enc setBuffer:buf offset:0 atIndex:i];
-    }
-
-    MTLSize grid = MTLSizeMake(threads_x, 1, 1);
-    MTLSize tgs = MTLSizeMake(tg_x, 1, 1);
-    [enc dispatchThreads:grid threadsPerThreadgroup:tgs];
-    [enc endEncoding];
-
-    [cb commit];
-    [cb waitUntilCompleted];
-    if (cb.status != MTLCommandBufferStatusCompleted || cb.error) {
-        _set_error(cb.error.localizedDescription ?: @"command buffer failed");
-        return -2;
-    }
-    return 0;
+    return _dispatch_sync(pso_handle, buffer_handles, n_buffers, threads_x, tg_x,
+                          "dispatch_tiled", true);
 }
 
 void wmm_synchronize(void) {

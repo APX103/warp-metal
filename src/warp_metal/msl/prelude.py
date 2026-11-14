@@ -104,24 +104,45 @@ static inline wp_mesh_query_stub wp_tile_mesh_query_aabb(uint64_t id, vec3f lo, 
 static inline bool wp_tile_query_valid(wp_mesh_query_stub q) { return q.state != 0; }
 static inline int wp_tile_mesh_query_aabb_next(wp_mesh_query_stub q) { (void)q; return -1; }
 
-// multi-dim tid decomposition (builtin.h launch_coord: last dim fastest)
+// multi-dim tid decomposition (upstream builtin.h tid(): the launch's _idx
+// is the flat THREAD index; wp_tidN yields the first N coordinates of the
+// row-major unravel over the launch bounds — last dim varies fastest — after
+// folding the threads BEYOND coordinate N into one coordinate, exactly like
+// upstream launch_coord's coord_mult). _wp_args._dims carries the launch
+// bounds: a plain launch the user dim, a tiled launch grid + [block_dim] —
+// so under wp.launch_tiled scalar wp.tid() is the BLOCK index and wp_tid2
+// the (block, lane) pair. Shape entries of 0 (bounds padded to 4) act as 1,
+// mirroring upstream's 1-padded launch bounds.
+static inline int _wp_dim_or_1(int s) { return s ? s : 1; }
+static inline int wp_tid1(int idx, wp_arr_meta m) {
+    int mult = _wp_dim_or_1(m.shape[1]) * _wp_dim_or_1(m.shape[2]) * _wp_dim_or_1(m.shape[3]);
+    return idx / mult;
+}
 static inline void wp_tid2(thread int& i, thread int& j, int idx, wp_arr_meta m) {
-    j = idx % m.shape[1];
-    i = idx / m.shape[1];
+    idx /= _wp_dim_or_1(m.shape[2]) * _wp_dim_or_1(m.shape[3]);
+    int s1 = _wp_dim_or_1(m.shape[1]);
+    j = idx % s1;
+    i = idx / s1;
 }
 static inline void wp_tid3(thread int& i, thread int& j, thread int& k, int idx, wp_arr_meta m) {
-    k = idx % m.shape[2];
-    idx /= m.shape[2];
-    j = idx % m.shape[1];
-    i = idx / m.shape[1];
+    idx /= _wp_dim_or_1(m.shape[3]);
+    int s2 = _wp_dim_or_1(m.shape[2]);
+    k = idx % s2;
+    idx /= s2;
+    int s1 = _wp_dim_or_1(m.shape[1]);
+    j = idx % s1;
+    i = idx / s1;
 }
 static inline void wp_tid4(thread int& i, thread int& j, thread int& k, thread int& l, int idx, wp_arr_meta m) {
-    l = idx % m.shape[3];
-    idx /= m.shape[3];
-    k = idx % m.shape[2];
-    idx /= m.shape[2];
-    j = idx % m.shape[1];
-    i = idx / m.shape[1];
+    int s3 = _wp_dim_or_1(m.shape[3]);
+    l = idx % s3;
+    idx /= s3;
+    int s2 = _wp_dim_or_1(m.shape[2]);
+    k = idx % s2;
+    idx /= s2;
+    int s1 = _wp_dim_or_1(m.shape[1]);
+    j = idx % s1;
+    i = idx / s1;
 }
 
 // ---- array addressing (warp native array.h index(): strides in BYTES,

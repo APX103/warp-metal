@@ -1193,8 +1193,11 @@ def _arr_meta(arr: WarpArray | None) -> _ArrMeta:
 def _unit_for(kernel, block_dim: int | None = None):
     """Translate + compile + cache a PSO for a vendored Kernel.
 
-    ``block_dim`` keys the cache alongside the kernel: a tiled translation
-    bakes the block size into tid mapping and threadgroup reductions.
+    ``block_dim`` keys the cache alongside the kernel: it bakes parse-time
+    tile shapes and wp.block_dim() folding into the MSL. The tid mapping is
+    routing-independent (runtime decode off ``_dims``), so a plain and a
+    tiled launch with the same block_dim share one PSO — the emitted MSL is
+    identical.
     """
     with _PSO_LOCK:
         cached = _PSO_CACHE.get((id(kernel), block_dim))
@@ -1260,15 +1263,25 @@ def _null_buffer() -> int:
 _NULL_BUF: int | None = None
 
 
-def _launch_ssa(kernel, dim, merged, block_dim: int | None = None) -> None:
-    """Launch a vendored Kernel through the Adjoint-SSA MSL pipeline."""
+def _launch_ssa(kernel, dim, merged, block_dim: int | None = None, tiled: bool = False) -> None:
+    """Launch a vendored Kernel through the Adjoint-SSA MSL pipeline.
+
+    Routing (upstream context.py semantics):
+    - plain launch (``tiled=False``): total threads = prod(dim); ``block_dim``
+      is only the threadgroup scheduling size (CUDA's threads-per-block) and
+      never multiplies the thread count.
+    - tiled launch (``tiled=True``): ``block_dim`` is appended as the trailing
+      launch dimension (``launch_tiled`` semantics), so the grid is
+      prod(dim)*block_dim threads in block_dim-sized threadgroups and the
+      kernel's tid mapping reads the block_dim off ``_dims``.
+    """
     if getattr(kernel, "is_generic", False):
         kernel = _concretize_generic_kernel(kernel, merged)
     from .. import host_fallback
 
     fb = host_fallback.get(kernel)
     if fb is not None:
-        if block_dim is not None:
+        if tiled:
             raise RuntimeError(
                 f"launch_tiled: kernel '{kernel.key}' has a CPU fallback registered but tiled "
                 "ports are not supported (fallback ports take a flat thread count)"
@@ -1280,6 +1293,21 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None) -> None:
         # closure-external kernel with an explicit verified CPU fallback
         # (unified memory: same shared-storage buffers the device sees)
         fb(kernel, dim, merged)
+        return
+
+    # launch bounds: for a tiled launch block_dim joins as the trailing dim
+    # (upstream launch_tiled appends it), then threads = prod(bounds).
+    dims = dim if isinstance(dim, (tuple, list)) else (dim,)
+    dims = tuple(int(d) for d in dims)
+    if any(d < 0 for d in dims):
+        raise ValueError("Launch dimensions must be non-negative")
+    if tiled:
+        dims = dims + (block_dim,)
+    threads = 1
+    for d in dims:
+        threads *= d
+    if threads == 0:
+        # upstream launch() skips entirely when total_dim_size == 0
         return
     pso, unit = _unit_for(kernel, block_dim)
     Params = _params_struct(unit)
@@ -1355,15 +1383,10 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None) -> None:
     else:
         handles.extend(h for _name, h in device_bindings)
 
-    dims = dim if isinstance(dim, (tuple, list)) else (dim,)
-    dims = tuple(int(d) for d in dims)
-    threads = 1
-    for d in dims:
-        threads *= d
-    if block_dim is not None:
-        # tiled launch: `threads` is the BLOCK count — the grid is
-        # threads*block_dim threads in block_dim-sized threadgroups
-        threads *= block_dim
+    # _dims is the launch-bounds image the device tid helpers read (upstream
+    # launch_bounds_t): for tiled launches it includes the trailing
+    # block_dim, so scalar wp.tid() resolves to the block index and the 2-D
+    # form to (block, lane).
     params._dims.offset = 0
     params._dims.ndim = len(dims)
     for i in range(4):
@@ -1399,20 +1422,25 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None) -> None:
             owned = [handle] + ([argbuf_handle] if argbuf_handle is not None else [])
             if arena_handle is not None:
                 owned.append(arena_handle)
-            _CAPTURE_RECORDS.append(("metal", pso, list(handles), threads, block_dim, owned, array_refs))
+            _CAPTURE_RECORDS.append(
+                ("metal", pso, list(handles), threads, block_dim, owned, array_refs, tiled)
+            )
             return
         import os as _os
 
         if _os.environ.get("WARP_METAL_DEBUG_LAUNCH"):
             print(
                 f"[wmm-launch] kernel={getattr(kernel, 'key', kernel)} threads={threads} "
-                f"block_dim={block_dim} n_buffers={len(handles)} mesh={getattr(unit, 'needs_mesh', False)}",
+                f"block_dim={block_dim} tiled={tiled} n_buffers={len(handles)} "
+                f"mesh={getattr(unit, 'needs_mesh', False)}",
                 flush=True,
             )
-        if block_dim is not None:
+        if tiled:
             _mm.dispatch_tiled(pso, handles, threads, block_dim)
         else:
-            _mm.dispatch(pso, handles, threads)
+            # tg 0 = native auto threadgroup size; an explicit block_dim is
+            # the scheduling hint (never a thread-count multiplier)
+            _mm.dispatch(pso, handles, threads, block_dim if block_dim is not None else 0)
     finally:
         if _CAPTURE_RECORDS is None:
             _mm.buffer_release(handle)
@@ -1450,13 +1478,16 @@ def launch_tiled(
 ):
     """Tiled launch (upstream-compatible signature, forward-only).
 
-    ``dim`` is the BLOCK count (int, or a length-1 sequence); the kernel
-    reads ``wp.tid()`` as ``(block_index, lane)`` with ``wp.block_dim()``
-    folding to ``block_dim`` (default 256, matching upstream's default).
-    The vendored parse consumes ``block_dim`` for tile shapes, and the
-    emitter lowers tile_reduce to a barriered threadgroup tree reduction —
-    which requires a power-of-two ``block_dim`` (upstream warp makes the
-    same assumption for its register-tile layout).
+    ``dim`` is the BLOCK-grid shape (int, or a 1-3 dim sequence); upstream
+    appends ``block_dim`` as the trailing launch dimension, so the grid runs
+    prod(dim)*block_dim threads in block_dim-sized threadgroups and the
+    kernel reads ``wp.tid()`` as the block coordinate (scalar = block index,
+    2-D = ``(block_index, lane)``) with ``wp.block_dim()`` folding to
+    ``block_dim`` (default 256, matching upstream's default). The vendored
+    parse consumes ``block_dim`` for tile shapes, and the emitter lowers
+    tile_reduce to a barriered threadgroup tree reduction — which requires a
+    power-of-two ``block_dim`` (upstream warp makes the same assumption for
+    its register-tile layout).
     """
     if adjoint or record_tape:
         raise RuntimeError(
@@ -1480,16 +1511,15 @@ def launch_tiled(
         raise ValueError(f"launch_tiled block_dim must be a power of two, got {block_dim}")
 
     if isinstance(dim, (tuple, list)):
-        if len(dim) != 1:
-            raise ValueError(
-                f"launch_tiled dim must be an int or length-1 sequence (block count), got {dim!r}"
-            )
-        dim = int(dim[0])
+        dims = tuple(int(d) for d in dim)
+        if not 1 <= len(dims) <= 3:
+            # upstream: "wp.launch_tiled() requires a grid with fewer than 4 dimensions"
+            raise ValueError(f"launch_tiled dim must be an int or a 1-3 dim grid, got {dim!r}")
     else:
-        dim = int(dim)
+        dims = (int(dim),)
 
     merged = list(inputs or []) + list(outputs or [])
-    _launch_ssa(kernel, dim, merged, block_dim=block_dim)
+    _launch_ssa(kernel, dims, merged, block_dim=block_dim, tiled=True)
 
 
 def launch(
@@ -1510,12 +1540,14 @@ def launch(
     """Launch a kernel (upstream-compatible signature, forward-only).
 
     ``adj_*``/``adjoint``/``record_tape`` fail loudly (adjoint is a KEP
-    Non-Goal); ``stream``/``record_cmd``/``max_blocks``/``block_dim`` are
-    accepted for API parity (dispatch is synchronous, batching is Phase 2).
-    ``dim`` may be an int or a tuple (multi-dim grids flatten for now; the
-    emitter only reads ``tid`` — multi-dim indexing is M1.3 scope). Scalar
-    kernel params are passed interleaved in ``inputs``/``outputs`` in
-    declaration order, exactly like upstream warp.
+    Non-Goal); ``stream``/``record_cmd``/``max_blocks`` are accepted for API
+    parity (dispatch is synchronous, batching is Phase 2). ``dim`` may be an
+    int or a tuple: total threads = prod(dim), exactly upstream. An explicit
+    ``block_dim`` is only the threadgroup scheduling size (CUDA's
+    threads-per-block) — it never changes the thread count or the ``tid``
+    mapping (that is ``launch_tiled``'s job). Scalar kernel params are
+    passed interleaved in ``inputs``/``outputs`` in declaration order,
+    exactly like upstream warp.
     """
     if adj_inputs is not None or adj_outputs is not None or adjoint or record_tape:
         raise RuntimeError(
@@ -1536,7 +1568,7 @@ def launch(
     merged = list(inputs or []) + list(outputs or [])
 
     if hasattr(kernel, "adj"):  # vendored Kernel (M1.2+): Adjoint-SSA pipeline
-        _launch_ssa(kernel, dim, merged, block_dim=block_dim)
+        _launch_ssa(kernel, dim, merged, block_dim=block_dim, tiled=False)
         return
 
     # legacy spike path (M0.4 plain-function kernels)
@@ -1564,7 +1596,7 @@ def launch(
     if merged:
         raise ValueError("more launch arguments than kernel parameters")
 
-    _mm.dispatch(pso, handles, dim)
+    _mm.dispatch(pso, handles, dim, 0)  # 0 = auto threadgroup size (spike kernels are 1-D)
     for h in temp:
         _mm.buffer_release(h)
 
@@ -1739,11 +1771,11 @@ def capture_launch(graph, stream=None):
         for record in getattr(graph, "_records", []):
             kind = record[0]
             if kind == "metal":
-                _, pso, handles, threads, block_dim, _owned, _refs = record
-                if block_dim is not None:
+                _, pso, handles, threads, block_dim, _owned, _refs, tiled = record
+                if tiled:
                     _mm.dispatch_tiled(pso, handles, threads, block_dim)
                 else:
-                    _mm.dispatch(pso, handles, threads)
+                    _mm.dispatch(pso, handles, threads, block_dim if block_dim is not None else 0)
             elif kind == "fill":
                 _, arr, value = record
                 arr.numpy[...] = value

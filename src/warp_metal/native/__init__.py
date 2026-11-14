@@ -65,6 +65,7 @@ def _load() -> ctypes.CDLL:
                     ctypes.POINTER(ctypes.c_void_p),
                     ctypes.c_uint32,
                     ctypes.c_uint32,
+                    ctypes.c_uint32,
                 ]
                 lib.wmm_dispatch_tiled.restype = ctypes.c_int
                 lib.wmm_dispatch_tiled.argtypes = [
@@ -145,15 +146,26 @@ def pso_max_threads_per_group(pso_handle) -> int:
     return _load().wmm_pso_max_threads_per_group(pso_handle)
 
 
-def dispatch(pso_handle, buffer_handles, threads_x: int) -> None:
+def dispatch(pso_handle, buffer_handles, threads_x: int, tg_x: int = 0) -> None:
+    """Dispatch ``threads_x`` threads (1-D grid).
+
+    ``tg_x`` is the threadgroup size: 0 (default) picks the PSO maximum
+    clamped to the grid; a positive value pins it (a plain launch's
+    ``block_dim`` scheduling hint). The completion wait is bounded by the
+    dispatch watchdog (WARP_METAL_DISPATCH_TIMEOUT_S, default 120 s; 0
+    disables it) — a hung/faulted dispatch raises MetalError instead of
+    blocking forever.
+    """
     arr = (ctypes.c_void_p * len(buffer_handles))(*buffer_handles)
-    rc = _load().wmm_dispatch(pso_handle, arr, len(buffer_handles), threads_x)
+    rc = _load().wmm_dispatch(pso_handle, arr, len(buffer_handles), threads_x, tg_x)
     if rc != 0:
         raise MetalError(_load().wmm_last_error().decode())
 
 
 def dispatch_tiled(pso_handle, buffer_handles, threads_x: int, tg_x: int) -> None:
-    """Tiled dispatch with an exact threadgroup size (wp.launch_tiled)."""
+    """Tiled dispatch with an exact threadgroup size (wp.launch_tiled).
+
+    Same watchdog-bounded completion wait as :func:`dispatch`."""
     arr = (ctypes.c_void_p * len(buffer_handles))(*buffer_handles)
     rc = _load().wmm_dispatch_tiled(pso_handle, arr, len(buffer_handles), threads_x, tg_x)
     if rc != 0:
