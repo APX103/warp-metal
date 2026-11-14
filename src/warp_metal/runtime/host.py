@@ -1194,10 +1194,13 @@ def _unit_for(kernel, block_dim: int | None = None):
     """Translate + compile + cache a PSO for a vendored Kernel.
 
     ``block_dim`` keys the cache alongside the kernel: it bakes parse-time
-    tile shapes and wp.block_dim() folding into the MSL. The tid mapping is
-    routing-independent (runtime decode off ``_dims``), so a plain and a
-    tiled launch with the same block_dim share one PSO — the emitted MSL is
-    identical.
+    tile shapes and wp.block_dim() folding into the MSL — callers pass it
+    ONLY for launch_tiled (the sole per-block shared-semantics path). Plain
+    launches arrive with ``block_dim=None`` regardless of what the caller
+    supplied: their tile ops lower per-thread scalar (one-lane blocks, the
+    CPU-golden semantics), producing launch-layout-independent MSL. The tid
+    mapping is routing-independent (runtime decode off ``_dims``), so every
+    plain launch of a kernel shares one PSO.
     """
     with _PSO_LOCK:
         cached = _PSO_CACHE.get((id(kernel), block_dim))
@@ -1309,7 +1312,12 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None, tiled: bool =
     if threads == 0:
         # upstream launch() skips entirely when total_dim_size == 0
         return
-    pso, unit = _unit_for(kernel, block_dim)
+    # translation key: plain launches lower every tile per-thread scalar
+    # (one-lane blocks — the CPU-golden semantics upstream forces on the
+    # CPU path), so their MSL does not depend on the requested block_dim at
+    # all; only launch_tiled bakes the per-block shared lowering keyed by
+    # block_dim
+    pso, unit = _unit_for(kernel, block_dim if tiled else None)
     Params = _params_struct(unit)
 
     handles: list[int] = []
@@ -1438,9 +1446,11 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None, tiled: bool =
         if tiled:
             _mm.dispatch_tiled(pso, handles, threads, block_dim)
         else:
-            # tg 0 = native auto threadgroup size; an explicit block_dim is
-            # the scheduling hint (never a thread-count multiplier)
-            _mm.dispatch(pso, handles, threads, block_dim if block_dim is not None else 0)
+            # tg 0 = native auto threadgroup size. Plain launches never bake
+            # a block layout into the MSL (per-thread scalar tile lowering,
+            # no shared arrays, no barriers), so the auto choice is always
+            # correct and no scheduling hint is needed
+            _mm.dispatch(pso, handles, threads, 0)
     finally:
         if _CAPTURE_RECORDS is None:
             _mm.buffer_release(handle)
@@ -1543,11 +1553,11 @@ def launch(
     Non-Goal); ``stream``/``record_cmd``/``max_blocks`` are accepted for API
     parity (dispatch is synchronous, batching is Phase 2). ``dim`` may be an
     int or a tuple: total threads = prod(dim), exactly upstream. An explicit
-    ``block_dim`` is only the threadgroup scheduling size (CUDA's
-    threads-per-block) — it never changes the thread count or the ``tid``
-    mapping (that is ``launch_tiled``'s job). Scalar kernel params are
-    passed interleaved in ``inputs``/``outputs`` in declaration order,
-    exactly like upstream warp.
+    ``block_dim`` on a plain launch selects per-thread tile semantics (every
+    tile op collapses to the thread's own element — the CPU-golden
+    convention); per-block shared tile semantics require ``launch_tiled``.
+    Scalar kernel params are passed interleaved in ``inputs``/``outputs`` in
+    declaration order, exactly like upstream warp.
     """
     if adj_inputs is not None or adj_outputs is not None or adjoint or record_tape:
         raise RuntimeError(
@@ -1775,7 +1785,7 @@ def capture_launch(graph, stream=None):
                 if tiled:
                     _mm.dispatch_tiled(pso, handles, threads, block_dim)
                 else:
-                    _mm.dispatch(pso, handles, threads, block_dim if block_dim is not None else 0)
+                    _mm.dispatch(pso, handles, threads, 0)
             elif kind == "fill":
                 _, arr, value = record
                 arr.numpy[...] = value

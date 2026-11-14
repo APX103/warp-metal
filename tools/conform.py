@@ -373,6 +373,11 @@ CORPUS_TABLE = [
     ("newton._src.geometry.contact_reduction_global", "_zero_active_count_kernel", "zero_active_count_kernel"),
     ("newton._src.geometry.contact_reduction_global", "reduce_buffered_contacts_kernel", "reduce_buffered_contacts_kernel"),
     (
+        "newton._src.geometry.particle_surface_kernels",
+        "compute_particle_bounds",
+        "compute_particle_bounds",
+    ),
+    (
         "newton._src.geometry.narrow_phase",
         "narrow_phase_primitive_kernel",
         "narrow_phase_primitive_kernel",
@@ -462,6 +467,15 @@ def _alloc_array(pkg, key, val, device="cpu"):
         elem = _corpus_dtype(pkg, key[5:])
         out_arr = pkg.zeros(val, dtype=elem, device=device)
         return out_arr
+    if key.startswith("outinit:"):
+        # output array with a deterministic INITIAL value (e.g. the ±1e30
+        # bound sentinels the particle-bounds kernels reduce against):
+        # val is the numpy fill, val.shape[0] the element count
+        elem = _corpus_dtype(pkg, key[8:])
+        out_arr = pkg.zeros(int(val.shape[0]), dtype=elem, device=device)
+        view = _arr_view(out_arr)
+        view[:] = val.reshape(view.shape)
+        return out_arr
     if key.startswith("out:"):
         elem = _corpus_dtype(pkg, key[4:])
         shape = val if isinstance(val, tuple) else int(val)
@@ -486,6 +500,11 @@ def _pack_args(pkg, args, device="cpu", mod=None):
     annotations); struct values are ``{field: (key, val)}`` dicts using the
     same keys, with ``out:``-prefixed fields registered for comparison as
     ``"<arg>.<field>"``.
+
+    ``__dim__`` and ``__block_dim__`` entries are routing pins, not kernel
+    args: ``__block_dim__`` mirrors Newton's own tile launches (plain
+    ``wp.launch(..., block_dim=bd)``), which both conformance sides honor so
+    the block layout matches the kernel's ``block, lane = wp.tid()`` idiom.
     """
     import numpy as np
 
@@ -493,7 +512,7 @@ def _pack_args(pkg, args, device="cpu", mod=None):
     launch_args, out_arrays, out_names = [], [], []
     dim = _corpus_launch_dim(args)
     for name, key, val in args:
-        if name == "__dim__":
+        if name in ("__dim__", "__block_dim__"):
             continue
         if key.startswith("struct:"):
             cls = getattr(mod, key[7:])
@@ -524,7 +543,7 @@ def _pack_args(pkg, args, device="cpu", mod=None):
             for i, ref in enumerate(ids):
                 view[i] = 0 if ref is None else _PACKED_MESHES[ref]
             launch_args.append(arr)
-        elif key.startswith("arr:") or key.startswith("io:") or key.startswith(("arr2:", "out2:", "out:")):
+        elif key.startswith("arr:") or key.startswith("io:") or key.startswith(("arr2:", "out2:", "out:", "outinit:")):
             arr = _alloc_array(pkg, key, val, device)
             launch_args.append(arr)
             if key.startswith("out"):
@@ -579,6 +598,14 @@ def _pack_args(pkg, args, device="cpu", mod=None):
     return launch_args, dim, out_arrays, out_names
 
 
+def _corpus_block_dim(args):
+    """Explicit block_dim pin from a ``__block_dim__`` builder entry (or None)."""
+    for name, _key, val in args:
+        if name == "__block_dim__":
+            return int(val)
+    return None
+
+
 def run_corpus_golden(out_npz: Path) -> dict:
     """Golden phase (Newton venv, real warp): CPU reference for every entry."""
     import numpy as np
@@ -614,7 +641,8 @@ def run_corpus_golden(out_npz: Path) -> dict:
         mod = importlib.import_module(module)
         kern = _resolve_kernel(mod, qualname, factory)
         launch_args, dim, out_arrays, out_names = _pack_args(wp, args, device="cpu", mod=mod)
-        wp.launch(kern, dim, inputs=launch_args, outputs=[], device="cpu")
+        wp.launch(kern, dim, inputs=launch_args, outputs=[], device="cpu",
+                  block_dim=_corpus_block_dim(args))
         wp.synchronize()
         for i, name in enumerate(out_names):
             payload[f"{qualname}::{name}"] = _arr_view(out_arrays[i]).copy()
@@ -677,7 +705,8 @@ def run_corpus(golden_npz: Path) -> str:
             mod = importlib.import_module(module)
             kern = _resolve_kernel(mod, qualname, factory)
             launch_args, dim, out_arrays, out_names = _pack_args(wp, args, device="metal", mod=mod)
-            wp.launch(kern, dim, inputs=launch_args, outputs=[], device="metal")
+            wp.launch(kern, dim, inputs=launch_args, outputs=[], device="metal",
+                      block_dim=_corpus_block_dim(args))
             wp.synchronize()
             ok, detail = True, []
             for i, name in enumerate(out_names):

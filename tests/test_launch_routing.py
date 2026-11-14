@@ -127,10 +127,10 @@ class TestPlainLaunchBlockDim(unittest.TestCase):
         # kernel and runs degenerate per-work-item tile semantics there —
         # measured on CPU: every work item sums its own zero tile, so
         # out[i] = 0.0 for every i, at dim=4 AND dim=32 (block_dim=32).
-        # warp-metal must accept the launch (per-thread lowering) and match
-        # that reference. dim=32 exercises a full threadgroup; dim=4 a
-        # partial one — the fold is guarded by the live-lane count, so the
-        # unwritten tail slots are skipped rather than read uninitialized.
+        # warp-metal implements exactly that contract (round-5 single rule):
+        # ANY plain launch lowers tiles per-thread scalar regardless of the
+        # supplied block_dim, so the output is independent of the dispatch
+        # threadgroup layout and matches the CPU reference by construction.
         @wp.kernel
         def k(out: wp.array(dtype=wp.float32)):
             i = wp.tid()
@@ -167,8 +167,10 @@ class TestPlainLaunchBlockDim(unittest.TestCase):
             i = wp.tid()
             out[i] = block_zero_sum()
 
-        # plain launch, dim < block_dim (partial threadgroup): translates
-        # only when every _wp_live use is paired with a definition
+        # launch_tiled translation, dim covered by one threadgroup:
+        # translates only when every _wp_live use is paired with a
+        # definition. (Passing block_dim to the translator IS the tiled
+        # contract — plain launches never carry one and lower scalar.)
         from warp_metal.msl.translate import translate_kernel
 
         u = translate_kernel(k, {"block_dim": 32})
@@ -178,28 +180,49 @@ class TestPlainLaunchBlockDim(unittest.TestCase):
         # the @wp.func signature carries it alongside _wp_lane, and the
         # call site forwards it in the same order
         self.assertGreaterEqual(src.count("\n    int _wp_live,"), 1)
-        self.assertIn("(_wp_lane, _wp_live, _wp_tile_shr_0)", src)
+        self.assertIn("(_wp_lane, _wp_live, _wp_tile_shr_0", src)
         # syntax shape: the hidden params live inside a complete signature
         # (ret-type prefix + fn name + indented param lines). Regression
         # pins the torn-emission bug where an argless needs_lane function
         # emitted a bare parameter list at file scope (leading comma).
+        # M2.4: the function claims three shared arrays (the tile_zeros
+        # threadgroup-backed tile, the shape-(1,) reduction result tile, the
+        # BD-wide fold scratch), forwarded as trailing threadgroup pointers.
         fn_name = u.functions[0].name
+        self.assertEqual(
+            [
+                ln.strip()
+                for ln in src.splitlines()
+                if ln.strip().startswith("threadgroup float* _wp_tile_shr_")
+            ][:3],
+            [
+                "threadgroup float* _wp_tile_shr_0,",
+                "threadgroup float* _wp_tile_shr_1,",
+                "threadgroup float* _wp_tile_shr_2)",
+            ],
+        )
         self.assertIn(
             f"static float {fn_name}(\n"
             "    int _wp_lane,\n"
             "    int _wp_live,\n"
-            "    threadgroup float* _wp_tile_shr_0)",
+            "    threadgroup float* _wp_tile_shr_0,",
             src,
         )
         # negative shapes: no comma may start a line or open a param list,
-        # and no unindented hidden-param line may exist (torn signature)
+        # and no hidden-param name may begin a line (torn signature — the
+        # hidden param names as locals only ever appear mid-line or indented;
+        # fold locals like `int _wp_first_N` legitimately start lines)
         self.assertNotIn("(\n,", src)
         self.assertNotIn("\n,", src)
-        self.assertNotIn("\nint _wp_", src)
+        for ln in src.splitlines():
+            self.assertFalse(
+                ln.startswith("int _wp_lane") or ln.startswith("int _wp_live"),
+                f"torn hidden-param emission: {ln!r}",
+            )
 
-        # metal run: dim=4 (partial threadgroup) and dim=32 — reference
-        # hardcoded from a warp-lang 1.19.0 CPU measurement of the same
-        # kernel (plain wp.launch): all zeros
+        # metal run: dim=4 and dim=32, plain launches (per-thread scalar
+        # tile lowering) — reference hardcoded from a warp-lang 1.19.0 CPU
+        # measurement of the same kernel (plain wp.launch): all zeros
         for n, b in ((4, 32), (32, 32)):
             out = wp.full(n, 7.0, dtype=wp.float32, device="metal")
             wp.launch(k, dim=n, inputs=[out], block_dim=b, device="metal")

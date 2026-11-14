@@ -493,6 +493,113 @@ _RE_BRACE_CLOSE = re.compile(r"^\s*\}\s*$")
 _RE_RETURN = re.compile(r"^\s*return\s*(.*?);\s*$")
 
 
+# ---------------------------------------------------------------------------
+# tile variables (KEP-0001 M2.4): threadgroup-backed tile model
+# ---------------------------------------------------------------------------
+
+# Tile SSA decl (`wp::tile_register_t<T, wp::tile_layout_register_t<
+# wp::tile_shape_t<D0,...>>> var = ...` / `wp::tile_shared_t<T,
+# wp::tile_layout_strided_t<wp::tile_shape_t<D0,...>, wp::tile_stride_t<...>>,
+# ALIGN> var = ...`).
+_RE_TILE_DECL = re.compile(
+    r"^\s*(?:const\s+)?wp::tile_(register|shared)_t<([A-Za-z0-9_:<>,\s]+)>\s+(\w+)\s*=\s*.*?;\s*$"
+)
+_RE_TILE_SHAPE = re.compile(r"wp::tile_shape_t<([\d,\s]+)>")
+
+# Apple silicon exposes 32 KB of threadgroup memory per threadgroup
+# (MTLDevice maxThreadgroupMemoryLength; the runtime never overrides it).
+# Every shared tile array and reduction scratch array is statically
+# allocated at kernel scope, so the total is known at translation time and
+# oversubscription fails loud instead of faulting in the Metal compiler.
+_TILE_SHARED_BUDGET = 32 * 1024
+
+
+class TileVar:
+    """Translation-time representation of an SSA tile variable.
+
+    kind == "shr":    the tile lives in a kernel-scope ``threadgroup`` array
+                      ``_wp_tile_shr_{slot}`` of ``size`` elements — every
+                      ``tile_shared_t`` decl, every register decl whose shape
+                      is not the per-thread one-element form, and every
+                      reduction result (a shape-(1,) shared tile).
+    kind == "scalar": the tile is the thread's own element value — the
+                      ``wp.tile(v)`` broadcast / per-thread 1-element register
+                      form, kept on the M1 per-thread-scalar lowering.
+    """
+
+    __slots__ = ("kind", "elem", "slot", "size", "dims")
+
+    def __init__(self, kind: str, elem: str, slot: int = -1, size: int = 0, dims: list[int] | None = None):
+        self.kind = kind
+        self.elem = elem
+        self.slot = slot
+        self.size = size
+        self.dims = dims or []
+
+
+def _tile_shape_dims(layout_src: str) -> list[int]:
+    dims_text = _RE_TILE_SHAPE.search(layout_src)
+    if dims_text is None:
+        raise TranslationError(
+            f"tile layout {layout_src!r} carries no compile-time tile_shape_t (outside the closure)"
+        )
+    return [int(d) for d in dims_text.group(1).replace(" ", "").split(",") if d]
+
+
+# vector element types: make-function, component count, float-vs-int flavor
+_VEC_IDENT = {
+    "vec2f": ("make_vec2f", 2, "f"),
+    "vec3f": ("make_vec3f", 3, "f"),
+    "vec4f": ("make_vec4f", 4, "f"),
+    "vec5f": ("make_vec5f", 5, "f"),
+    "spatial_vectorf": ("make_spatial_vectorf", 6, "f"),
+    "vec2i": ("make_vec2i", 2, "i"),
+    "vec3i": ("make_vec3i", 3, "i"),
+    "vec4i": ("make_vec4i", 4, "i"),
+}
+
+_SCALAR_IDENT = {
+    # (min identity, max identity) — ±INFINITY for floats so a tile whose
+    # true extreme is infinite still reduces correctly
+    "float": ("INFINITY", "-INFINITY"),
+    "half": ("INFINITY", "-INFINITY"),
+    "int": ("2147483647", "(-2147483647 - 1)"),
+    "uint": ("4294967295u", "0u"),
+    "int64_t": ("INT64_MAX", "INT64_MIN"),
+    "uint64_t": ("UINT64_MAX", "0u"),
+    "bool": ("true", "false"),
+    "char": ("127", "(-127 - 1)"),
+    "uchar": ("255u", "0u"),
+    "short": ("32767", "(-32768)"),
+    "ushort": ("65535u", "0u"),
+}
+
+
+def _reduce_identity_init(elem: str, combine: str) -> str:
+    """Initializer for the neutral staging element of a tree-reduction fold.
+
+    Threads that own no tile element (tile smaller than the block, or a
+    partial threadgroup's absent lanes) stage the identity so the guarded
+    log2 tree stays exact for every combine.
+    """
+    if combine in ("+", "|"):
+        return "{}"
+    scalar = _SCALAR_IDENT.get(elem)
+    if scalar is not None:
+        return scalar[0] if combine == "wp_min" else scalar[1]
+    vec = _VEC_IDENT.get(elem)
+    if vec is not None:
+        make, n, flavor = vec
+        comp = ("INFINITY" if flavor == "f" else "2147483647") if combine == "wp_min" else (
+            "-INFINITY" if flavor == "f" else "(-2147483647 - 1)"
+        )
+        return f"{make}({', '.join([comp] * n)})"
+    raise TranslationError(
+        f"no neutral identity for a reduction over tile element {elem!r} "
+        "(struct tiles are outside the closure)"
+    )
+
+
 class ArgSpec:
     """One kernel/function argument, classified for MSL emission."""
 
@@ -570,8 +677,10 @@ class KernelUnit:
         # argument buffer (Metal plain-buffer cap is 30)
         self.uses_argbuf = False
         self.device_bindings: list[tuple[str, str]] = []  # [(binding, elem msl)]
-        # launch block size when one was supplied: wp.launch_tiled always
-        # (default 256), plain wp.launch only with an explicit block_dim.
+        # launch block size when one was supplied: wp.launch_tiled only
+        # (default 256). Plain launches NEVER carry one — their tile ops
+        # lower per-thread scalar (one-lane blocks, the CPU-golden
+        # convention) regardless of any caller-supplied block_dim.
         # Parse-time tile shapes (vendored builtins read
         # codegen.options["block_dim"]), wp.block_dim() folding and the
         # threadgroup reduction lowering all key off it; the tid mapping
@@ -579,8 +688,16 @@ class KernelUnit:
         # tiled launches), so it is routing-independent.
         self.block_dim: int | None = None
         # [(elem msl, op msl)] per wp::tile_reduce site, in body order —
-        # kernel_src emits one threadgroup shared array per site
+        # signals that a barriered tree fold exists (drives _wp_live preamble
+        # emission and the _gsize binding; the scratch arrays themselves are
+        # claimed in shr_arrays like every other shared tile array)
         self.tile_reduces: list[tuple[str, str]] = []
+        # every kernel-scope threadgroup array in claim order (shared tile
+        # vars, reduction scratch arrays, extract scratch slots):
+        # [(elem msl, size)] — kernel_src emits one
+        # ``threadgroup {elem} _wp_tile_shr_{k}[{size}]`` per entry and runs
+        # the 32 KB threadgroup-memory budget check over the total
+        self.shr_arrays: list[tuple[str, int]] = []
         # True when the unit reaches any tile construct (tile vars,
         # tile_reduce/sum/min/max, tile_zeros/extract/scatter, tile mesh
         # query stubs). Introspection only — plain wp.launch of a tile kernel
@@ -690,24 +807,79 @@ class KernelUnit:
                 f"kernel {self.kernel.name}: body uses _wp_live without the preamble "
                 "definition (tile_reduce lowered without block_dim — translation bug)"
             )
-        # tiled launch support: one threadgroup shared array per tile_reduce
-        # site (function-scope threadgroup storage; sizes assume a
-        # power-of-two block_dim, enforced at launch). Plain-launch tile
-        # boundary: wp.launch + tile_reduce runs the threadgroup tree
-        # semantics below, NOT upstream's per-work-item degenerate tile
-        # semantics — they agree on zero/degenerate tiles (the only form the
-        # Newton closure touches; trajectory green = no reduce hit or dim a
-        # multiple of block_dim) and differ on non-zero tiles. The fold is
-        # guarded by _wp_live so partial threadgroups (dim % block_dim != 0)
-        # never read uninitialized shared slots.
+        needs_lane = bool(self.shr_arrays or self.uses_tile_ops)
+        if "_wp_lane" in body and not needs_lane:
+            # static self-check: strided tile loops (load/store/map/zeros and
+            # the fold staging) need the preamble lane index, which fires
+            # exactly when a tile op exists (explicit-block_dim launches use
+            # _idx % block_dim; plain launches pin the degenerate lane 0)
+            raise TranslationError(
+                f"kernel {self.kernel.name}: body uses _wp_lane without the preamble "
+                "definition (tile op lowered without block_dim — translation bug)"
+            )
+        # 32 KB threadgroup-memory budget: every shared tile array is a
+        # static kernel-scope allocation, so the total is exact at
+        # translation time (see _TILE_SHARED_BUDGET)
+        budget_bytes = 0
+        for elem, size in self.shr_arrays:
+            ebytes = _ELEM_BYTES.get(elem)
+            if ebytes is None:
+                raise TranslationError(
+                    f"kernel {self.kernel.name}: tile element {elem!r} has no byte size "
+                    "(struct tiles are outside the closure)"
+                )
+            budget_bytes += ebytes * size
+        if budget_bytes > _TILE_SHARED_BUDGET:
+            raise TranslationError(
+                f"kernel {self.kernel.name}: threadgroup tile storage budget exceeded — "
+                f"{budget_bytes} bytes across {len(self.shr_arrays)} shared tile arrays > "
+                f"{_TILE_SHARED_BUDGET} (maxThreadgroupMemoryLength on Apple silicon); "
+                "shrink the tile shapes or split the kernel"
+            )
+        # tiled launch support: one threadgroup array per claimed slot
+        # (function-scope threadgroup storage; sizes are compile-time). The
+        # fold is guarded by _wp_live so partial threadgroups (plain wp.launch
+        # with dim % block_dim != 0) never read uninitialized shared slots.
         preamble = "    const int _idx = (int)_gid.x;\n"
         if self.block_dim is not None:
-            for k, (_elem, _combine) in enumerate(self.tile_reduces):
-                preamble += f"    threadgroup {_elem} _wp_tile_shr_{k}[{self.block_dim}];\n"
-            if self.tile_reduces:
+            for k, (elem, size) in enumerate(self.shr_arrays):
+                preamble += f"    threadgroup {elem} _wp_tile_shr_{k}[{size}];\n"
+            if self.shr_arrays or self.uses_tile_ops:
+                # scalar-carve-out tile ops (the wp.tile(v) per-thread form)
+                # use the lane index without claiming a shared array
                 preamble += f"    const int _wp_lane = _idx % {self.block_dim};\n"
+            if self.tile_reduces:
                 preamble += f"    const int _wp_live = min((int)_gsize.x - (_idx - _wp_lane), {self.block_dim});\n"
+        elif self.uses_tile_ops:
+            # plain launch without block_dim: per-thread degenerate tile
+            # mode — the thread is its own one-lane block (Newton's non-CUDA
+            # block_dim=1 convention, the semantics every plain-launch CPU
+            # golden was generated with). The lane index is constant 0, no
+            # shared arrays and no barriers are emitted, so the kernel is
+            # correct under ANY dispatch threadgroup size (including the
+            # native auto choice) — scheduling cannot change its output.
+            preamble += "    const int _wp_lane = 0;\n"
         defines_text = "\n".join(defines) + "\n" if defines else ""
+        # brace-balance static self-check over the emitted kernel body (the
+        # surrounding wrapper text is static templates): an unbalanced body
+        # surfaces at Metal compile time as "extraneous closing brace" —
+        # fail loud here instead, naming the kernel
+        depth = 0
+        for ch in body:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth < 0:
+                    raise TranslationError(
+                        f"kernel {self.kernel.name}: extraneous closing brace in emitted "
+                        "MSL body (brace imbalance — translation bug)"
+                    )
+        if depth != 0:
+            raise TranslationError(
+                f"kernel {self.kernel.name}: unbalanced braces in emitted MSL body "
+                f"({depth} unclosed opens — translation bug)"
+            )
         return (
             self._argbuf_struct(use_argbuf) + "\n\n"
             + f"struct Params_{self.kernel.name} {{\n" + "\n".join(fields) + "\n};\n\n"
@@ -793,7 +965,32 @@ def fn_src(fn: MSLFunction) -> str:
             f"function {fn.name}: body uses _wp_live but its signature does not carry it "
             "(tile_reduce lowered outside the needs_lane forwarding — translation bug)"
         )
-    return f"static {ret} {fn.name}(\n{params_text})\n" + "{\n" + body + "\n}\n"
+    if "_wp_lane" in body and not fn.needs_lane:
+        # plain-scalar tile ops inside a @wp.func: no caller forwards a lane
+        # (the unit lowered per-thread degenerate), so provide the constant
+        # zero lane locally — one-lane block per thread
+        body = "    const int _wp_lane = 0;\n" + body
+    text = f"static {ret} {fn.name}(\n{params_text})\n" + "{\n" + body + "\n}\n"
+    # brace-balance static self-check: an unbalanced emission surfaces at
+    # Metal compile time as "extraneous closing brace" — fail loud here
+    # instead, naming the function
+    depth = 0
+    for ch in text:
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                raise TranslationError(
+                    f"function {fn.name}: extraneous closing brace in emitted MSL "
+                    "(brace imbalance — translation bug)"
+                )
+    if depth != 0:
+        raise TranslationError(
+            f"function {fn.name}: unbalanced braces in emitted MSL ({depth} unclosed "
+            "opens — translation bug)"
+        )
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -818,12 +1015,17 @@ class _BodyTranslator:
         self.used_shr: list[tuple[int, str, str]] = []
         # `wp::Any var_N;` decls (wp.static temps) — typed at first assignment
         self.deferred_any: set[str] = set()
-        # tiled kernels: SSA tile var -> element msl type (tile_register_t /
-        # tile_shared_t vars are element-typed per-thread values here); and
-        # compile-time SSA constants (const var = literal) for tile_extract [0]
-        self.tile_vars: dict[str, str] = {}
+        # tiled kernels: SSA tile var -> TileVar (threadgroup-backed shared
+        # array or the per-thread one-element register form); plus
+        # compile-time SSA constants (const var = literal) for tile_extract
+        self.tile_vars: dict[str, TileVar] = {}
         self.const_vars: dict[str, str] = {}
-        self._shr_index = 0  # threadgroup shared-array slot per tile_reduce site
+        # lexically open braces, ["if" | "loop", ...]: cooperative tile ops
+        # (barrier emitters) must sit in uniform control flow — a reduce /
+        # scatter / shared-fill site lexically inside an `if` fails loud
+        # (upstream relies on documentation discipline; KEP-0001 M2.4 adds
+        # the translation-time checkpoint)
+        self._block_stack: list[str] = []
         # SSA vars holding a loaded wp_mesh points stub (dead mesh branch —
         # see _alias / the wp::load branch)
         self.mesh_stub_vars: set[str] = set()
@@ -872,15 +1074,76 @@ class _BodyTranslator:
             return f"{mm[0]}.{mm[1]}.data"
         return f"{spec.name}_data"
 
+    def _claim_shr(self, elem: str, size: int) -> int:
+        """Claim a kernel-scope threadgroup array slot (unit-global numbering,
+        shared by kernel body and all @wp.func bodies via the needs_lane
+        forwarding). The kernel preamble declares the array; function bodies
+        receive ``threadgroup elem*`` pointers."""
+        if _ELEM_BYTES.get(elem) is None:
+            raise TranslationError(
+                f"tile element {elem!r} has no byte size (struct tiles are outside the closure)"
+            )
+        k = len(self.unit.shr_arrays)
+        self.unit.shr_arrays.append((elem, size))
+        self.used_shr.append((k, elem, "+"))
+        return k
+
+    def _require_block_dim(self, what: str) -> int:
+        if self.unit.block_dim is None:
+            raise TranslationError(
+                f"{what} requires a launch with block_dim (wp.launch_tiled, or wp.launch "
+                "with an explicit block_dim): the threadgroup block layout is undefined otherwise"
+            )
+        return self.unit.block_dim
+
+    def _check_uniform(self, what: str) -> None:
+        """Barrier-uniformity checkpoint: cooperative tile ops emit
+        threadgroup barriers, which diverge if any lane takes a different
+        control-flow path. Upstream documents the discipline; this rejects
+        the lexically-nested case at translation time. Single-lane
+        threadgroups (Newton's non-CUDA block_dim=1 convention) cannot
+        diverge — their barriers are vacuous — so the checkpoint does not
+        apply there."""
+        if self.unit.block_dim == 1:
+            return
+        if "if" in self._block_stack:
+            raise TranslationError(
+                f"{what} sits inside non-uniform control flow (an `if` branch): the emitted "
+                "threadgroup barriers would diverge across lanes. Hoist the call to uniform "
+                "control flow or split the kernel (KEP-0001 M2.4 barrier-uniformity checkpoint)"
+            )
+
+    def _tvar(self, name: str, what: str) -> TileVar:
+        tvar = self.tile_vars.get(name)
+        if tvar is None:
+            raise TranslationError(f"{what}: source {name!r} is not a tile variable")
+        return tvar
+
     # -- expressions ---------------------------------------------------------
 
     def expr(self, src: str) -> str:
         src = src.strip()
+        if src in ("True", "False"):
+            # Python bool constants reach expression positions through call
+            # arguments (e.g. tile_scatter_masked's mask); MSL spells them
+            # lowercase — a raw `True` compiles as an undeclared identifier
+            return src.lower()
+        tvar = self.tile_vars.get(src)
+        if tvar is not None and tvar.kind == "shr":
+            # a threadgroup-backed tile only exists as a kernel-scope array —
+            # it is reachable through the tile builtins, never as a value
+            raise TranslationError(
+                f"tile variable {src!r} used outside a tile op (threadgroup-backed tiles "
+                "are only reachable through tile builtins)"
+            )
         if "builtin_block_dim()" in src:
-            # wp.block_dim() folds to the launch's compile-time block size
-            if self.unit.block_dim is None:
-                raise TranslationError("wp.block_dim() requires an explicit block_dim launch")
-            src = src.replace("builtin_block_dim()", str(self.unit.block_dim))
+            # wp.block_dim() folds to the launch's compile-time block size;
+            # plain launches run one-lane blocks (the CPU-golden convention),
+            # so the degenerate block size there is 1
+            src = src.replace(
+                "builtin_block_dim()",
+                str(self.unit.block_dim if self.unit.block_dim is not None else 1),
+            )
         m = re.match(r"^builtin_tid([1234])d\s*\((.*)\)$", src)
         if m:
             tid_src = self._builtin_tid(m.group(1), m.group(2))
@@ -958,32 +1221,50 @@ class _BodyTranslator:
         return f"wp_tid{n}({out}, _idx, _wp_args._dims)"
 
     def _tile_reduce(self, target: str, rhs: str) -> list[str]:
-        """Lower `target = wp::tile_reduce(op, tile_var);` to a threadgroup
-        tree reduction over a kernel-scope shared array.
+        """Lower a tile reduction site (``tile_reduce(op, var)`` /
+        ``tile_sum/min/max(var)`` / ``tile_argmin/argmax(var)``) to a
+        barriered threadgroup tree over a kernel-scope scratch array.
 
-        Every thread in the block participates: each writes its element, then
-        a log2(block_dim) barriered pairwise fold leaves the result at [0]
-        for all threads to read. Requires uniform control flow around the
-        call (true for every tile_reduce in the Newton closure) and a
-        power-of-two block_dim (validated at launch). The fold is guarded by
-        ``_wp_lane + _wp_s < _wp_live``: in a partial threadgroup (plain
-        wp.launch with dim % block_dim != 0) the tail slots are never
-        written, and skipping them folds exactly [0, _wp_live) — no
-        uninitialized shared-memory reads, correct for every combine
-        (associativity keeps the guarded tree exact).
+        Every thread in the block participates; a log2(block_dim) barriered
+        pairwise fold leaves the result at scratch[0]. Requires uniform
+        control flow around the call (checked) and a power-of-two block_dim
+        (validated at launch). The fold is guarded by
+        ``_wp_lane + _wp_s < _wp_live`` so partial threadgroups never read
+        unwritten slots. Sources:
+
+        - threadgroup-backed tile: strided per-thread accumulate over the
+          shared array, first-element seeded — threads that own no element
+          (tile smaller than the block) stage the neutral identity so the
+          tree stays exact for every combine;
+        - per-thread scalar broadcast tile: the M1 gather path (each lane
+          stages its own value; its linear index is the lane, which is what
+          the argmin/argmax index tree stages).
+
+        argmin/argmax run an int index tree alongside the value tree:
+        comparison key = value, ties resolve to the EARLIER linear index —
+        a deterministic refinement of upstream's "unspecified" tie order
+        (upstream tile_reduce.h ValueAndIndex). The result (for argmin the
+        INDEX, upstream returns a shape-(1,) int32 tile) is uniform across
+        the block and lands in the target tile's own one-element shared
+        array; every ``tile_extract(result, 0)`` is a direct read.
         """
         open_paren = rhs.index("(")
         close = _find_balanced(rhs, open_paren)
         parts = split_args(rhs[open_paren + 1 : close])
-        # convenience forms carry the op in the name: tile_sum/min/max(var);
-        # tile_reduce takes the operator as its first argument
-        m_conv = re.match(r"^wp::tile_(sum|min|max)\(", rhs)
+        # convenience forms carry the op in the name: tile_sum/min/max/argmin/
+        # argmax(var); tile_reduce takes the operator as its first argument
+        m_conv = re.match(r"^wp::tile_(sum|min|max|argmin|argmax)\(", rhs)
+        arg_op: str | None = None
         if m_conv:
             if len(parts) != 1:
                 raise TranslationError(f"{rhs.split('(')[0]} with {len(parts)} args (axis form is outside the closure)")
             src = parts[0].strip()
             op_name = m_conv.group(1)
-            combine = {"sum": "+", "min": "wp_min", "max": "wp_max"}[op_name]
+            if op_name in ("argmin", "argmax"):
+                arg_op = op_name
+                combine = "wp_min" if op_name == "argmin" else "wp_max"
+            else:
+                combine = {"sum": "+", "min": "wp_min", "max": "wp_max"}[op_name]
         else:
             if len(parts) != 2:
                 raise TranslationError(f"tile_reduce with {len(parts)} args (axis form is outside the closure)")
@@ -992,31 +1273,491 @@ class _BodyTranslator:
             if op_msl not in ("wp_min", "wp_max", "wp_bit_or"):
                 raise TranslationError(f"tile_reduce operator {op!r} is outside the closure (min/max/bit_or only)")
             combine = {"wp_min": "wp_min", "wp_max": "wp_max", "wp_bit_or": "|"}[op_msl]
-        elem = self.tile_vars.get(src)
-        if elem is None:
-            raise TranslationError(f"tile_reduce source {src!r} is not a tile variable")
+        tvar = self._tvar(src, "tile_reduce")
+        elem = tvar.elem
+        if arg_op and elem not in _SCALAR_IDENT:
+            raise TranslationError(
+                f"tile_{arg_op} over tile element {elem!r}: only scalar tiles are in the closure"
+            )
         if self.unit.block_dim is None:
-            raise TranslationError("wp::tile_reduce outside a tiled launch")
+            # plain launch without block_dim: per-thread degenerate lowering.
+            # The tile is the thread's own element (one-lane block), so the
+            # reduction is the identity and argmin/argmax resolve to the
+            # tile's only index (0) — exactly the plain-launch CPU semantics.
+            # No shared scratch, no barrier, no tree: the result never
+            # depends on the dispatch threadgroup layout.
+            self.unit.uses_tile_ops = True
+            self._tvar(target, "tile_reduce")  # validate the target tile
+            if arg_op:
+                return [f"{target} = 0;"]
+            return [f"{target} = {src};"]
+        bd = self._require_block_dim(rhs.split("(")[0])
+        self._check_uniform(rhs.split("(")[0])
         self.unit.uses_tile_ops = True
-        k = len(self.unit.tile_reduces)  # unit-global slot (kernel + @wp.func sites share the numbering)
-        self.unit.tile_reduces.append((elem, combine))
-        self.used_shr.append((k, elem, combine))
-        bd = self.unit.block_dim
-        shr_lhs = f"_wp_tile_shr_{k}[_wp_lane]"
-        shr_rhs = f"_wp_tile_shr_{k}[_wp_lane + _wp_s]"
-        combined = (
-            f"({shr_lhs} {combine} {shr_rhs})" if combine in ("+", "|") else f"{combine}({shr_lhs}, {shr_rhs})"
-        )
+        self.unit.tile_reduces.append((elem, combine))  # a fold exists (_wp_live preamble)
+        j = self._claim_shr(elem, bd)  # value scratch
+        if arg_op:
+            j_idx = self._claim_shr("int", bd)  # index scratch (int32, upstream's tile dtype)
+        lines: list[str] = []
+        if tvar.kind == "shr":
+            # strided per-thread accumulate over the shared array,
+            # first-element seeded; threads that own no element stage the
+            # neutral identity so the tree stays exact for every combine
+            arr = f"_wp_tile_shr_{tvar.slot}"
+            lines += [
+                f"{elem} _wp_ident_{j} = {_reduce_identity_init(elem, combine)};",
+                f"{elem} _wp_acc_{j} = _wp_ident_{j};",
+                f"bool _wp_has_{j} = false;",
+                f"int _wp_first_{j} = 0;",
+                f"for (int _wp_t = _wp_lane; _wp_t < {tvar.size}; _wp_t += {bd}) {{",
+            ]
+            stage = f"    if (!_wp_has_{j}) {{ _wp_acc_{j} = {arr}[_wp_t]; _wp_has_{j} = true; _wp_first_{j} = _wp_t; }}"
+            if arg_op:
+                # argmin/argmax: the staged index must track the improving
+                # extreme (not just the lane's first element), or a lane whose
+                # minimum occurs at a later element biases the global tie
+                # toward a wrong earlier index
+                cmp = "<" if arg_op == "argmin" else ">"
+                lines.append(stage)
+                lines.append(
+                    f"    else {{ if ({arr}[_wp_t] {cmp} _wp_acc_{j}) {{ _wp_acc_{j} = {arr}[_wp_t]; _wp_first_{j} = _wp_t; }} }}"
+                )
+            elif combine == "+":
+                lines.append(stage)
+                lines.append(f"    else {{ _wp_acc_{j} = _wp_acc_{j} + {arr}[_wp_t]; }}")
+            elif combine == "|":
+                lines.append(stage)
+                lines.append(f"    else {{ _wp_acc_{j} = _wp_acc_{j} | {arr}[_wp_t]; }}")
+            else:
+                lines.append(stage)
+                lines.append(f"    else {{ _wp_acc_{j} = {combine}(_wp_acc_{j}, {arr}[_wp_t]); }}")
+            lines += [
+                "}",
+                f"_wp_tile_shr_{j}[_wp_lane] = _wp_has_{j} ? _wp_acc_{j} : _wp_ident_{j};",
+            ]
+            if arg_op:
+                lines.append(f"_wp_tile_shr_{j_idx}[_wp_lane] = _wp_has_{j} ? _wp_first_{j} : 2147483647;")
+        else:
+            # scalar broadcast tile: each lane stages its own element
+            lines += [
+                f"_wp_tile_shr_{j}[_wp_lane] = {src};",
+            ]
+            if arg_op:
+                lines.append(f"_wp_tile_shr_{j_idx}[_wp_lane] = _wp_lane;")
+        lines.append("threadgroup_barrier(mem_flags::mem_threadgroup);")
+        if arg_op:
+            # two-array tree: value is the comparison key, ties take the
+            # earlier linear index
+            if arg_op == "argmin":
+                take = (
+                    f"(_wp_tile_shr_{j}[_wp_lane + _wp_s] < _wp_tile_shr_{j}[_wp_lane]"
+                    f" || (_wp_tile_shr_{j}[_wp_lane + _wp_s] == _wp_tile_shr_{j}[_wp_lane]"
+                    f" && _wp_tile_shr_{j_idx}[_wp_lane + _wp_s] < _wp_tile_shr_{j_idx}[_wp_lane]))"
+                )
+            else:
+                take = (
+                    f"(_wp_tile_shr_{j}[_wp_lane + _wp_s] > _wp_tile_shr_{j}[_wp_lane]"
+                    f" || (_wp_tile_shr_{j}[_wp_lane + _wp_s] == _wp_tile_shr_{j}[_wp_lane]"
+                    f" && _wp_tile_shr_{j_idx}[_wp_lane + _wp_s] < _wp_tile_shr_{j_idx}[_wp_lane]))"
+                )
+            lines += [
+                f"for (int _wp_s = {bd} >> 1; _wp_s > 0; _wp_s >>= 1) {{",
+                "    if (_wp_lane < _wp_s && _wp_lane + _wp_s < _wp_live) {",
+                f"        if ({take}) {{",
+                f"            _wp_tile_shr_{j}[_wp_lane] = _wp_tile_shr_{j}[_wp_lane + _wp_s];",
+                f"            _wp_tile_shr_{j_idx}[_wp_lane] = _wp_tile_shr_{j_idx}[_wp_lane + _wp_s];",
+                "        }",
+                "    }",
+                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "}",
+            ]
+        else:
+            shr_lhs = f"_wp_tile_shr_{j}[_wp_lane]"
+            shr_rhs = f"_wp_tile_shr_{j}[_wp_lane + _wp_s]"
+            combined = (
+                f"({shr_lhs} {combine} {shr_rhs})" if combine in ("+", "|") else f"{combine}({shr_lhs}, {shr_rhs})"
+            )
+            lines += [
+                f"for (int _wp_s = {bd} >> 1; _wp_s > 0; _wp_s >>= 1) {{",
+                "    if (_wp_lane < _wp_s && _wp_lane + _wp_s < _wp_live) {",
+                f"        {shr_lhs} = {combined};",
+                "    }",
+                "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "}",
+            ]
+        # the reduction lands in the TARGET tile's own one-element array (the
+        # shape-(1,) result var), never in the source tile — writing the
+        # source slot would clobber its element 0 and leave the result
+        # uninitialized. argmin/argmax publish the INDEX (j_idx), not the
+        # folded value. Every lane writes the same uniform value, so the
+        # subsequent extract sees a consistent value without another barrier.
+        tgt = self._tvar(target, "tile_reduce")
+        res_val = f"_wp_tile_shr_{j_idx}[0]" if arg_op else f"_wp_tile_shr_{j}[0]"
+        if tgt.kind == "shr":
+            lines.append(f"_wp_tile_shr_{tgt.slot}[0] = {res_val};")
+        else:
+            lines.append(f"{target} = {res_val};")
+        return lines
+
+    # -- tile load/store/map (KEP-0001 M2.4 P2) ------------------------------
+    #
+    # Every shared-storage tile is a full-shape threadgroup array read and
+    # written with per-thread strided passes (lane, lane+BD, ...) over the
+    # linear row-major tile index — a simplified version of upstream's
+    # three-channel (global -> shared -> register) tile.h:2115-2139 lowering:
+    # global <-> shared directly, register-ization deferred (correctness
+    # first). Bounds handling mirrors upstream tile.h: tile_load zero-fills
+    # coordinates at or past the source extent (upper bound only — negatives
+    # wrap through wp_address like every array access), tile_store silently
+    # drops them, both selected by the compile-time bounds_check template.
+
+    def _tile_addr(self, spec: ArgSpec, idx_srcs: list[str]) -> str:
+        meta = self._meta_ref(spec)
+        return f"wp_address({self._data_expr(spec)}, {meta}, {', '.join(idx_srcs)})"
+
+    def _parse_tile_io(self, rhs: str, what: str, with_shape: bool) -> tuple[str, bool, list[int], list[str]]:
+        """(elem, bounds_check, dims, call args) behind a tile_load/tile_store
+        template call. tile_load carries the shape in its template
+        (``<elem, bc, aligned, D0, ...>``); tile_store's template is only
+        ``<elem, bc, aligned>`` and the shape comes from the source tile var."""
+        open_p = rhs.index("(")
+        m_t = re.match(r"^wp::tile_(load|store)<(.+)>$", rhs[:open_p].strip())
+        if m_t is None:
+            raise TranslationError(f"cannot parse {what} template {rhs!r}")
+        targs = split_args(m_t.group(2))
+        n_template = 3 + (1 if with_shape else 0)
+        if len(targs) < n_template:
+            raise TranslationError(f"{what} template {rhs!r} is malformed")
+        elem = msl_type(targs[0])
+        bc = targs[1].strip() == "true"
+        dims = [int(a.strip()) for a in targs[3:]] if with_shape else []
+        if with_shape and (not dims or len(dims) > 2):
+            raise TranslationError(
+                f"{what} with shape {dims}: only 1-D/2-D tiles are in the closure (KEP-0001 M2.4)"
+            )
+        close = _find_balanced(rhs, open_p)
+        cargs = split_args(rhs[open_p + 1 : close])
+        if with_shape and len(cargs) != 1 + len(dims):
+            raise TranslationError(f"{what} needs one offset per array dimension, got {len(cargs) - 1}")
+        return elem, bc, dims, cargs
+
+    def _tile_io_spec(self, arg: str, what: str) -> ArgSpec:
+        spec = self._array_arg_spec(arg)
+        if spec is None:
+            raise TranslationError(f"{what} source {arg!r} is not an array binding")
+        return spec
+
+    def _tile_load(self, target: str, rhs: str) -> list[str]:
+        elem, bc, dims, cargs = self._parse_tile_io(rhs, "tile_load", with_shape=True)
+        spec = self._tile_io_spec(cargs[0], "tile_load")
+        tvar = self.tile_vars.get(target)
+        if tvar is None:
+            raise TranslationError(f"tile_load target {target!r} is not a tile variable")
+        if tvar.elem != elem:
+            raise TranslationError(f"tile_load elem {elem} does not match target tile {tvar.elem}")
+        self.unit.uses_tile_ops = True
+        bd = None
+        if tvar.kind == "shr":
+            # shared storage only exists with a defined block layout; the
+            # per-thread scalar form (plain launches and wp.tile(v)
+            # broadcasts) needs no block geometry at all
+            bd = self._require_block_dim("wp::tile_load")
+            self._check_uniform("wp::tile_load into a shared tile")
+        meta = self._meta_ref(spec)
+        offs = [self.expr(a) for a in cargs[1:]]
+        n = tvar.size
+        lines = [f"{{ {elem} _wp_z = {{}};"]
+        # bounds_check=True: zero-fill coordinates at or past the upper
+        # extent; bounds_check=False: unconditional access (the caller
+        # guarantees in-bounds, matching upstream)
+        def _load_if(lhs: str, addr: str, s_checks: list[str]) -> str:
+            if bc:
+                ok = " && ".join(s_checks)
+                return f"if ({ok}) {{ {lhs} = *{addr}; }} else {{ {lhs} = _wp_z; }}"
+            return f"{lhs} = *{addr};"
+
+        if tvar.kind == "shr":
+            arr = f"_wp_tile_shr_{tvar.slot}"
+            if len(dims) == 1:
+                lines += [
+                    f"for (int _wp_t = _wp_lane; _wp_t < {n}; _wp_t += {bd}) {{",
+                    f"    int _wp_s0 = ({offs[0]}) + _wp_t;",
+                    f"    {_load_if(f'{arr}[_wp_t]', self._tile_addr(spec, ['_wp_s0']), [f'_wp_s0 < {meta}.shape[0]'])}",
+                    "}",
+                ]
+            else:
+                cols = dims[1]
+                lines += [
+                    f"for (int _wp_t = _wp_lane; _wp_t < {n}; _wp_t += {bd}) {{",
+                    f"    int _wp_i0 = _wp_t / {cols};",
+                    f"    int _wp_i1 = _wp_t - _wp_i0 * {cols};",
+                    f"    int _wp_s0 = ({offs[0]}) + _wp_i0;",
+                    f"    int _wp_s1 = ({offs[1]}) + _wp_i1;",
+                    "    " + _load_if(
+                        f"{arr}[_wp_t]",
+                        self._tile_addr(spec, ["_wp_s0", "_wp_s1"]),
+                        [f"_wp_s0 < {meta}.shape[0]", f"_wp_s1 < {meta}.shape[1]"],
+                    ),
+                    "}",
+                ]
+            lines += ["threadgroup_barrier(mem_flags::mem_threadgroup);", "}"]
+        else:
+            # per-thread one-element register form: this thread owns linear
+            # element _wp_lane
+            if len(dims) != 1:
+                raise TranslationError("tile_load into a per-thread tile is 1-D only in the closure")
+            lines += [
+                f"int _wp_s0 = ({offs[0]}) + _wp_lane;",
+                "    " + _load_if(target, self._tile_addr(spec, ["_wp_s0"]), [f"_wp_s0 < {meta}.shape[0]"]),
+                "}",
+            ]
+        return lines
+
+    def _tile_store(self, rhs: str) -> list[str]:
+        elem, bc, _tpl_dims, cargs = self._parse_tile_io(rhs, "tile_store", with_shape=False)
+        # the template arg arrives as a Python bool; MSL spells it lowercase
+        # (a raw `True` interpolates as an undeclared identifier)
+        bc_msl = "true" if bc else "false"
+        if len(cargs) < 2:
+            raise TranslationError(f"tile_store needs (array, offsets..., source): {rhs!r}")
+        spec = self._tile_io_spec(cargs[0], "tile_store")
+        src_name = cargs[-1].strip()
+        tvar = self.tile_vars.get(src_name)
+        if tvar is None:
+            raise TranslationError(f"tile_store source {src_name!r} is not a tile variable")
+        if tvar.elem != elem:
+            raise TranslationError(f"tile_store elem {elem} does not match source tile {tvar.elem}")
+        self.unit.uses_tile_ops = True
+        meta = self._meta_ref(spec)
+        offs = [self.expr(a) for a in cargs[1:-1]]
+        nd = len(offs)
+        if nd > 2:
+            raise TranslationError(f"tile_store with {nd} offsets: only 1-D/2-D stores are in the closure")
+        # no barrier: every thread writes only global-memory coordinates
+        # derived from its own strided slots (no cross-lane visibility need)
+        if tvar.kind == "shr":
+            bd = self._require_block_dim("wp::tile_store")
+            arr = f"_wp_tile_shr_{tvar.slot}"
+            n = tvar.size
+            if nd == 1:
+                return [
+                    f"for (int _wp_t = _wp_lane; _wp_t < {n}; _wp_t += {bd}) {{",
+                    f"    int _wp_s0 = ({offs[0]}) + _wp_t;",
+                    f"    if (_wp_s0 < {meta}.shape[0] || !{bc_msl}) {{ *{self._tile_addr(spec, ['_wp_s0'])} = {arr}[_wp_t]; }}",
+                    "}",
+                ]
+            cols = tvar.dims[1] if len(tvar.dims) == 2 else 0
+            if cols <= 0:
+                raise TranslationError(
+                    f"tile_store source tile {src_name!r} has no 2-D shape to unravel against"
+                )
+            return [
+                f"for (int _wp_t = _wp_lane; _wp_t < {n}; _wp_t += {bd}) {{",
+                f"    int _wp_i0 = _wp_t / {cols};",
+                f"    int _wp_i1 = _wp_t - _wp_i0 * {cols};",
+                f"    int _wp_s0 = ({offs[0]}) + _wp_i0;",
+                f"    int _wp_s1 = ({offs[1]}) + _wp_i1;",
+                f"    if ((_wp_s0 < {meta}.shape[0] && _wp_s1 < {meta}.shape[1]) || !{bc_msl}) "
+                f"{{ *{self._tile_addr(spec, ['_wp_s0', '_wp_s1'])} = {arr}[_wp_t]; }}",
+                "}",
+            ]
+        if nd != 1:
+            raise TranslationError("tile_store from a per-thread tile is 1-D only in the closure")
         return [
-            f"_wp_tile_shr_{k}[_wp_lane] = {src};",
-            "threadgroup_barrier(mem_flags::mem_threadgroup);",
-            f"for (int _wp_s = {bd} >> 1; _wp_s > 0; _wp_s >>= 1) {{",
-            f"    if (_wp_lane < _wp_s && _wp_lane + _wp_s < _wp_live) {{",
-            f"        {shr_lhs} = {combined};",
-            "    }",
-            "    threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"int _wp_s0 = ({offs[0]}) + _wp_lane;",
+            f"if (_wp_s0 < {meta}.shape[0] || !{bc_msl}) {{ *{self._tile_addr(spec, ['_wp_s0'])} = {src_name}; }}",
+        ]
+
+    def _tile_map(self, target: str, rhs: str) -> list[str]:
+        m = re.match(r"^wp::tile_(binary|unary)_map\(", rhs)
+        if m is None:
+            raise TranslationError(f"cannot parse tile_map {rhs!r}")
+        arity = 2 if m.group(1) == "binary" else 1
+        open_p = rhs.index("(")
+        close = _find_balanced(rhs, open_p)
+        args = split_args(rhs[open_p + 1 : close])
+        if len(args) != 1 + arity:
+            raise TranslationError(
+                f"tile_{m.group(1)}_map with {len(args) - 1} operand(s): only unary/binary maps "
+                "are in the closure (ternary maps have no _CALL_TABLE operator)"
+            )
+        op = args[0].strip()
+        op_msl = _CALL_TABLE.get(op[4:] if op.startswith("wp::") else op)
+        if op_msl is None:
+            raise TranslationError(f"tile_map operator {op!r} has no MSL translation")
+        self.unit.uses_tile_ops = True
+        tvar = self.tile_vars.get(target)
+        if tvar is None:
+            raise TranslationError(f"tile_map target {target!r} is not a tile variable")
+        ops = [self.tile_vars.get(a.strip()) for a in args[1:]]
+        if any(o is None for o in ops):
+            raise TranslationError(f"tile_map operand is not a tile variable in {rhs!r}")
+        if any(o.kind == "shr" for o in ops):
+            if tvar.kind != "shr":
+                raise TranslationError(
+                    f"tile_map over a shared tile requires a shared target tile ({target!r} is per-thread)"
+                )
+            bd = self._require_block_dim("wp::tile_map")
+            self._check_uniform("wp::tile_map over a shared tile")
+            reads = [
+                f"(_wp_tile_shr_{o.slot}[_wp_t])" if o.kind == "shr" else self._tile_scalar_read(a, o)
+                for a, o in zip([a.strip() for a in args[1:]], ops)
+            ]
+            arr = f"_wp_tile_shr_{tvar.slot}"
+            return [
+                f"for (int _wp_t = _wp_lane; _wp_t < {tvar.size}; _wp_t += {bd}) {{",
+                f"    {arr}[_wp_t] = {op_msl}({', '.join(reads)});",
+                "}",
+                "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            ]
+        # per-thread one-element form: element-wise, no barrier
+        exprs = [self._tile_scalar_read(a.strip(), o) for a, o in zip([a.strip() for a in args[1:]], ops)]
+        return [f"{target} = {op_msl}({', '.join(exprs)});"]
+
+    def _tile_scalar_read(self, name: str, tvar: TileVar) -> str:
+        """Value expression for a tile operand: the thread's own element."""
+        return name  # scalar tiles are plain MSL lvalues
+
+    def _tile_zeros(self, target: str, rhs: str) -> list[str]:
+        open_p = rhs.index("(")
+        m_t = re.match(r"^wp::tile_zeros<(.+)>$", rhs[:open_p].strip())
+        if m_t is None:
+            raise TranslationError(f"cannot parse tile_zeros template {rhs!r}")
+        zargs = split_args(m_t.group(1))
+        elem = msl_type(zargs[0])
+        dims = [int(a.strip()) for a in zargs[1:]]
+        size = 1
+        for d in dims:
+            size *= d
+        tvar = self.tile_vars.get(target)
+        if tvar is None:
+            raise TranslationError(f"tile_zeros target {target!r} is not a tile variable")
+        if tvar.elem != elem:
+            raise TranslationError(f"tile_zeros elem {elem} does not match target tile {tvar.elem}")
+        self.unit.uses_tile_ops = True
+        if tvar.kind == "scalar":
+            # per-thread register form: the M1 per-thread zero stands
+            return [f"{target} = {{}};"]
+        bd = self._require_block_dim("wp::tile_zeros with storage=\"shared\"")
+        self._check_uniform("wp::tile_zeros into a shared tile")
+        arr = f"_wp_tile_shr_{tvar.slot}"
+        return [
+            f"for (int _wp_t = _wp_lane; _wp_t < {tvar.size}; _wp_t += {bd}) {{",
+            f"    {arr}[_wp_t] = {{}};",
             "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _tile_broadcast(self, target: str, rhs: str) -> list[str]:
+        """``var = wp::tile<T>(v);`` — broadcast a register value into a tile.
+
+        Per-thread target: identity (each thread keeps its own copy, M1).
+        Shared target (upstream spills broadcasts when any lane can read any
+        element, e.g. before a dynamic extract): a strided fill of the
+        threadgroup array + barrier.
+        """
+        self.unit.uses_tile_ops = True
+        open_paren = rhs.index("(")
+        close = _find_balanced(rhs, open_paren)
+        val_src = self.expr(rhs[open_paren + 1 : close])
+        tvar = self.tile_vars.get(target)
+        if tvar is not None and tvar.kind == "shr":
+            bd = self._require_block_dim("wp::tile broadcast into a shared tile")
+            self._check_uniform("wp::tile broadcast into a shared tile")
+            arr = f"_wp_tile_shr_{tvar.slot}"
+            return [
+                f"for (int _wp_t = _wp_lane; _wp_t < {tvar.size}; _wp_t += {bd}) {{",
+                f"    {arr}[_wp_t] = {val_src};",
+                "}",
+                "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            ]
+        return [f"{target} = {val_src};"]
+
+    def _tile_scatter(self, stripped: str) -> list[str]:
+        """``wp::tile_scatter_masked(tile, idx, v, mask);`` — each masked
+        thread writes its slot of the SHARED tile, then a barrier orders the
+        write before any cross-lane read (single-lane writes are visible to
+        the whole block — the M1 per-thread-copy defect is gone)."""
+        self.unit.uses_tile_ops = True
+        open_p = len("wp::tile_scatter_masked(") - 1
+        close = _find_balanced(stripped, open_p)
+        sargs = split_args(stripped[open_p + 1 : close])
+        if len(sargs) != 4:
+            raise TranslationError(f"tile_scatter_masked with {len(sargs)} args")
+        tvar = self._tvar(sargs[0].strip(), "tile_scatter_masked")
+        if tvar.kind != "shr":
+            if self.unit.block_dim is None:
+                # plain launch without block_dim: per-thread degenerate
+                # lowering — the tile is the thread's own single element,
+                # written only when the index selects it (element 0) and the
+                # mask is set. No barrier: nothing is cross-lane visible.
+                tgt = sargs[0].strip()
+                return [
+                    f"if ({self.expr(sargs[3])} && ({self.expr(sargs[1])}) == 0) "
+                    f"{{ {tgt} = {self.expr(sargs[2])}; }}",
+                ]
+            raise TranslationError(
+                f"tile_scatter_masked target {sargs[0].strip()!r} is not a shared-storage tile: "
+                "the per-thread-copy lowering dropped writes to non-writing lanes (M1 defect, "
+                "fixed in M2.4) — declare the tile with storage=\"shared\""
+            )
+        self._check_uniform("wp::tile_scatter_masked")
+        arr = f"_wp_tile_shr_{tvar.slot}"
+        return [
+            f"if ({self.expr(sargs[3])}) {{ {arr}[{self.expr(sargs[1])}] = {self.expr(sargs[2])}; }}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _tile_extract_target(self, target: str, rhs: str) -> list[str] | None:
+        """Statement-position ``target = wp::tile_extract(src, idx);``.
+
+        Returns None when the extract must stay an expression (direct forms
+        are handled in _call). Scratch forms (non-zero index on a per-thread
+        tile: the owning thread writes a one-element scratch slot, two
+        barriers order it — upstream tile.h extract semantics) only lower
+        here because they emit statements.
+        """
+        open_p = rhs.index("(")
+        close = _find_balanced(rhs, open_p)
+        args = split_args(rhs[open_p + 1 : close])
+        if len(args) != 2:
+            raise TranslationError(f"tile_extract with {len(args)} args")
+        src = args[0].strip()
+        tvar = self._tvar(src, "tile_extract")
+        idx_var = args[1].strip()
+        idx_const = self.const_vars.get(idx_var)
+        if tvar.kind == "shr":
+            arr = f"_wp_tile_shr_{tvar.slot}"
+            if idx_const is not None:
+                k = int(idx_const)
+                if not 0 <= k < tvar.size:
+                    raise TranslationError(
+                        f"wp::tile_extract index {k} out of bounds for tile of {tvar.size} element(s)"
+                    )
+                return [f"{target} = {arr}[{k}];"]
+            # dynamic index: every element lives in the shared array, so the
+            # read is direct (upstream's negative-index normalization is
+            # already in the SSA index expression)
+            return [f"{target} = {arr}[{self.expr(idx_var)}];"]
+        if idx_const == "0":
+            return [f"{target} = {src};"]  # per-thread form: identity (M1)
+        if idx_const is None:
+            raise TranslationError(
+                f"wp::tile_extract with a runtime index on a per-thread tile ({src!r}): "
+                "the degenerate tile holds a single element, so only the constant index 0 "
+                "is in the closure (upstream spills to shared storage, which needs an "
+                "explicit block_dim launch)"
+            )
+        # constant non-zero index: the owning lane writes, everyone reads
+        bd = self._require_block_dim("wp::tile_extract from a per-thread tile")
+        self._check_uniform("wp::tile_extract broadcast")
+        self.unit.uses_tile_ops = True
+        k = self._claim_shr(tvar.elem, 1)
+        return [
+            f"if (_wp_lane == {int(idx_const)}) {{ _wp_tile_shr_{k}[0] = {src}; }}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
             f"{target} = _wp_tile_shr_{k}[0];",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
         ]
 
     def _call(self, src: str) -> str:
@@ -1125,22 +1866,46 @@ class _BodyTranslator:
                 args[0] = f"_wp_mesh_table[{self.expr(args[0])}]"
             return f"{route}({', '.join(self.expr(a) for a in args)})"
         if key == "wp::tile_extract":
-            # extract [0] from a reduced shape-(1,) tile: the shared var the
-            # reduction lowered to already holds element 0 for every thread.
-            # A non-constant or nonzero index is outside the closure (the
-            # upstream tile has shape (1,), so only [0] is in-bounds anyway).
+            # Expression-position extract. Shared-storage tiles (including
+            # reduction results, which land in their own one-element shared
+            # array): the read is direct — every element lives in the
+            # threadgroup array, already ordered by the producing op's
+            # barrier. Per-thread tiles: only the constant-0 identity is an
+            # expression (non-zero extracts broadcast through a scratch slot
+            # and lower at statement position only — see
+            # _tile_extract_target).
             self.unit.uses_tile_ops = True
             idx_var = args[1].strip()
-            idx = self.const_vars.get(idx_var)
-            if idx != "0":
-                raise TranslationError(
-                    f"wp::tile_extract index {idx_var!r} is not the compile-time constant 0 (outside the closure)"
-                )
-            return self.expr(args[0])
+            idx_const = self.const_vars.get(idx_var)
+            src = args[0].strip()
+            tvar = self._tvar(src, "tile_extract")
+            if tvar.kind == "shr":
+                arr = f"_wp_tile_shr_{tvar.slot}"
+                if idx_const is not None:
+                    k = int(idx_const)
+                    if not 0 <= k < tvar.size:
+                        raise TranslationError(
+                            f"wp::tile_extract index {k} out of bounds for tile of {tvar.size} element(s)"
+                        )
+                    return f"{arr}[{k}]"
+                return f"{arr}[{self.expr(idx_var)}]"
+            if idx_const == "0":
+                return src
+            raise TranslationError(
+                f"wp::tile_extract({src!r}, non-zero index) must be assigned to a local first: "
+                "the scratch broadcast emits statements and only lowers at statement position"
+            )
+        if key in ("wp::tile_binary_map", "wp::tile_unary_map", "wp::tile_map"):
+            raise TranslationError(
+                "wp::tile_map is only supported as an assignment RHS (`m = wp.tile_map(op, a, b);`) — "
+                "nested-in-expression maps are outside the closure"
+            )
         if key == "wp::block_dim":
-            # wp::block_dim() folds to the launch's compile-time block size
+            # wp::block_dim() folds to the launch's compile-time block size;
+            # plain launches run one-lane blocks (CPU-golden convention), so
+            # the degenerate block size there is 1
             if self.unit.block_dim is None:
-                raise TranslationError("wp::block_dim() requires an explicit block_dim launch")
+                return "1"
             return str(self.unit.block_dim)
         if key == "wp::bvh_get_group_root":
             # BVH host build lives in runtime/bvh.py (upstream bvh.cpp port,
@@ -1183,7 +1948,12 @@ class _BodyTranslator:
 
         # control flow: label/goto → while(true)/break/continue
         if m := _RE_LABEL.match(line):
-            return ["while (true) {"] if m.group(1) == "start" else ["}"]
+            if m.group(1) == "start":
+                self._block_stack.append("loop")
+                return ["while (true) {"]
+            if self._block_stack:
+                self._block_stack.pop()
+            return ["}"]
         if _RE_GOTO.search(line):
             def _repl(mo):
                 return "continue;" if mo.group(1).startswith("start_") else "break;"
@@ -1193,6 +1963,7 @@ class _BodyTranslator:
             return [_RE_ITER.sub(lambda mo: f"wp_{mo.group(1)}(", out)]
         if m := _RE_IF_OPEN.match(line):
             cond = m.group(1).strip()
+            self._block_stack.append("if")
             # array truthiness (`if arr:` — upstream emits `if (array_var)`
             # via array_t's non-null data check; warp-metal binds a real
             # buffer even for None args, so truthiness reads the meta's
@@ -1209,25 +1980,48 @@ class _BodyTranslator:
         if _RE_ELSE.match(line):
             return ["} else {"]
         if _RE_BRACE_CLOSE.match(line):
+            if self._block_stack:
+                self._block_stack.pop()
             return ["}"]
         if m := _RE_RETURN.match(line):
             return [f"return {self.expr(m.group(1))};".replace("return ;", "return;")]
 
         # tile value decls (`wp::tile_register_t<T, layout> var_N = ...{};` /
         # `wp::tile_shared_t<T, layout, B> var_N = wp::tile_alloc_empty<...>();`):
-        # the tile is a per-thread element value in this lowering — remember
-        # the element type and drop the decl (assigned before every read)
-        m = re.match(
-            r"^\s*(?:const\s+)?wp::tile_(?:register|shared)_t<([A-Za-z0-9_:<>,\s]+)>\s+(\w+)\s*=\s*.*?;\s*$",
-            line,
-        )
+        # shared tiles and register tiles whose shape is not the per-thread
+        # one-element form are threadgroup-backed (the kernel preamble owns
+        # the array; the decl itself emits nothing), `wp.tile(v)` broadcasts
+        # keep the M1 per-thread element value
+        m = _RE_TILE_DECL.match(line)
         if m:
-            elem = msl_type(split_args(m.group(1))[0])
-            self.tile_vars[m.group(2)] = elem
+            kind_word, template, name = m.group(1), m.group(2), m.group(3)
+            elem = msl_type(split_args(template)[0])
+            dims = _tile_shape_dims(split_args(template)[1])
             self.unit.uses_tile_ops = True
-            # kept as an ordinary element-typed var: register tiles lower to
-            # the thread's own value, shared tiles to the reduction result
-            return [f"{elem} {m.group(2)} = {{}};"]
+            if kind_word == "register" and (
+                self.unit.block_dim is None or dims == [self.unit.block_dim]
+            ):
+                # per-thread 1-element register form (wp.tile(v) broadcast and
+                # friends). Plain launches without block_dim keep the M1
+                # per-thread degenerate lowering for every register tile —
+                # plain-launch tile semantics stay untouched.
+                self.tile_vars[name] = TileVar("scalar", elem, dims=dims)
+                return [f"{elem} {name} = {{}};"]
+            if kind_word == "shared" and self.unit.block_dim is None:
+                # plain launch without block_dim: requested shared storage
+                # degrades to the per-thread scalar form like every other
+                # tile (one-lane blocks — the thread holds its own element).
+                # Shared storage is meaningless without a defined block
+                # layout, and per-thread semantics are what the plain-launch
+                # CPU goldens were generated with.
+                self.tile_vars[name] = TileVar("scalar", elem, dims=dims)
+                return [f"{elem} {name} = {{}};"]
+            size = 1
+            for d in dims:
+                size *= d
+            slot = self._claim_shr(elem, size)
+            self.tile_vars[name] = TileVar("shr", elem, slot, size, dims)
+            return []
 
         # plain assignment `name = expr;` (targets may be struct members:
         # `var_contact_data.field = ...`) — must be tried before the decl
@@ -1401,20 +2195,27 @@ class _BodyTranslator:
                 # declare with a deduced `auto` type at the point of init
                 self.deferred_any.discard(target)
                 return [f"const auto {target} = {self.expr(rhs)};"]
-            if rhs.startswith("wp::tile<"):
-                # wp::tile<T>(v): broadcast a register value into a per-thread
-                # tile — each thread already holds its own copy, so identity
+            if rhs.startswith("wp::tile_alloc_empty<"):
+                # tile reservation (`var = wp::tile_alloc_empty<...>();`): the
+                # threadgroup array (or per-thread value from the decl) is
+                # already allocated — the fill arrives with the producing op
                 self.unit.uses_tile_ops = True
-                open_paren = rhs.index("(")
-                close = _find_balanced(rhs, open_paren)
-                return [f"{target} = {self.expr(rhs[open_paren + 1 : close])};"]
-            if rhs.startswith("wp::tile_reduce(") or rhs.startswith("wp::tile_sum(") or rhs.startswith("wp::tile_min(") or rhs.startswith("wp::tile_max("):
+                return []
+            if rhs.startswith("wp::tile_extract("):
+                out = self._tile_extract_target(target, rhs)
+                if out is not None:
+                    return out
+                # direct forms ride the expression path below
+            if rhs.startswith("wp::tile_load<"):
+                return self._tile_load(target, rhs)
+            if rhs.startswith(("wp::tile_binary_map(", "wp::tile_unary_map(")):
+                return self._tile_map(target, rhs)
+            if rhs.startswith("wp::tile<"):
+                return self._tile_broadcast(target, rhs)
+            if rhs.startswith("wp::tile_reduce(") or rhs.startswith("wp::tile_sum(") or rhs.startswith("wp::tile_min(") or rhs.startswith("wp::tile_max(") or rhs.startswith("wp::tile_argmin(") or rhs.startswith("wp::tile_argmax("):
                 return self._tile_reduce(target, rhs)
             if rhs.startswith("wp::tile_zeros<"):
-                # wp.tile_zeros(shape=(1,), ...): the tile is a per-thread
-                # element value in this lowering — zero it
-                self.unit.uses_tile_ops = True
-                return [f"{target} = {{}};"]
+                return self._tile_zeros(target, rhs)
             m_cp = re.match(r"^wp::copy\((\w+)\)$", rhs)
             base = m_cp.group(1) if m_cp else (rhs.strip() if re.match(r"^\w+$", rhs.strip()) else None)
             if rhs.startswith("wp::mesh_get(") or (base is not None and base in self.mesh_vars):
@@ -1512,18 +2313,9 @@ class _BodyTranslator:
             ]
 
         if stripped.startswith("wp::tile_scatter_masked("):
-            # wp.tile_scatter_masked(tile, idx, v, mask): a shared shape-(1,)
-            # tile written by the masked threads. Per-thread lowering: each
-            # thread writes its own copy (uniform for the live closure; the
-            # mesh mid-phase user is dead — see the wp_mesh stub). idx is
-            # always the compile-time constant 0 in the closure.
-            self.unit.uses_tile_ops = True
-            open_p = len("wp::tile_scatter_masked(") - 1
-            close = _find_balanced(stripped, open_p)
-            sargs = split_args(stripped[open_p + 1 : close])
-            if len(sargs) != 4:
-                raise TranslationError(f"tile_scatter_masked with {len(sargs)} args")
-            return [f"if ({self.expr(sargs[3])}) {{ {sargs[0].strip()} = {self.expr(sargs[2])}; }}"]
+            return self._tile_scatter(stripped)
+        if stripped.startswith("wp::tile_store<"):
+            return self._tile_store(stripped)
 
         m_ca = re.match(r"^\s*(\w+(?:\.\w+)*)\s*([+\-*/])=\s*(.+?);\s*$", line)
         if m_ca:
@@ -1828,6 +2620,17 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
     # a missing key reads as None != NOT_GUARANTEED and turns ON the det
     # codegen path (WP_DET_SCATTER_OR_FALLBACK macros). Force plain mode.
     opts["deterministic"] = DeterministicMode.NOT_GUARANTEED
+    plain_scalar_tiles = False
+    if opts.get("block_dim") is None:
+        # plain launch without an explicit block_dim: parse tile shapes under
+        # the degenerate one-lane block (Newton's non-CUDA CPU convention —
+        # the shape every plain-launch golden was generated with), but keep
+        # unit.block_dim None so every TileVar lowers per-thread scalar (no
+        # shared arrays, no barriers). The emitted MSL is then independent
+        # of the dispatch threadgroup layout, so the host may hand it any
+        # threadgroup size including the native auto choice.
+        opts["block_dim"] = 1
+        plain_scalar_tiles = True
 
     adj = kernel.adj
     adj.build(None, opts)
@@ -1837,7 +2640,7 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
     name = re.sub(r"\W", "_", base)
 
     unit = KernelUnit(name)
-    if "block_dim" in opts:
+    if "block_dim" in opts and not plain_scalar_tiles:
         # launch-supplied block size (launch_tiled always; a plain launch
         # only with an explicit block_dim): the vendored parse consumed
         # options["block_dim"] for tile shapes, and wp.block_dim() folding /
@@ -2023,12 +2826,13 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
         if line.strip() == "}" and depth == 0:
             break  # function-closing brace (early `return` blocks nest deeper)
         out = tr.stmt(line)
+        # real brace delta per emitted line (NOT endswith heuristics): tile
+        # ops open blocks mid-line (`{ float _wp_z = {};`), so an endswith
+        # check under-counts opens, drifts negative, and the function's
+        # closing brace never breaks the loop — it leaks into fn.lines as an
+        # extraneous `}` and the MSL fails to compile
         for emitted in out:
-            s = emitted.strip()
-            if s.endswith("{"):
-                depth += 1
-            elif s == "}":
-                depth -= 1
+            depth += emitted.count("{") - emitted.count("}")
         fn.lines.extend(out)
     if tr.used_shr:
         # tile ops inside a @wp.func (own sites or transitively through a

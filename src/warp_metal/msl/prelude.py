@@ -1128,6 +1128,25 @@ static inline uint wp_atomic_max_ret_at(device uint* d, wp_arr_meta m, int i, ui
 static inline float wp_atomic_max_ret_at(device float* d, wp_arr_meta m, int i, float v) {
     return wp_atomic_max_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), v);
 }
+// vector atomics: upstream vec.h:1841-1850 does component-wise atomic_min/max
+// through the scalar cores and returns the old vector (Newton
+// compute_particle_bounds reduces bounds as vec3 arrays)
+static inline vec3f wp_atomic_min_ret_at(device vec3f* d, wp_arr_meta m, int i, vec3f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    vec3f old;
+    old.x = wp_atomic_min_ret(c + 0, v.x);
+    old.y = wp_atomic_min_ret(c + 1, v.y);
+    old.z = wp_atomic_min_ret(c + 2, v.z);
+    return old;
+}
+static inline vec3f wp_atomic_max_ret_at(device vec3f* d, wp_arr_meta m, int i, vec3f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    vec3f old;
+    old.x = wp_atomic_max_ret(c + 0, v.x);
+    old.y = wp_atomic_max_ret(c + 1, v.y);
+    old.z = wp_atomic_max_ret(c + 2, v.z);
+    return old;
+}
 // 2D _ret_at variants (array2d atomics, e.g. world extents reduction)
 static inline float wp_atomic_add_ret_at(device float* d, wp_arr_meta m, int i, int j, float v) {
     return wp_atomic_add_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);

@@ -792,6 +792,42 @@ def b_reduce_buffered_contacts_kernel(rng):
     )
 
 
+def b_compute_particle_bounds(rng):
+    """particle_surface_kernels.compute_particle_bounds (KEP-0001 M2.4: the
+    tile_min/tile_max/tile_sum closure kernel).
+
+    Newton's own non-CUDA launch is dim=(n_blocks, tile_size) with
+    block_dim=tile_size=1 (particle_surface.py ``tile_size = ... if
+    device.is_cuda else 1``) — block-partition-invariant outputs (commutative
+    atomics only), so both conformance sides agree; ``__block_dim__`` pins
+    that routing on both sides. Fixture: 24 particles, two exclusions —
+    particle 7 carries no ACTIVE flag (use_flags=1 exercises _is_active) and
+    particle 5 carries a +inf y (exercises _is_finite_position) — plus the
+    ±1e30 bound sentinels via ``outinit:`` so the atomic_min/max start where
+    Newton's reset_bounds leaves them. lower/upper are single-vec3 arrays
+    (the kernels write slot 0); active_count is the grid-count array with
+    the valid-particle total landing at index _GRID_ACTIVE_COUNT=2.
+    """
+    n = 24
+    pos = rng.uniform(-2.0, 2.0, (n, 3)).astype(np.float32)
+    pos[5, 1] = np.float32("inf")  # non-finite position: excluded from bounds
+    flags = np.ones(n, dtype=np.int32)  # ParticleFlags.ACTIVE set
+    flags[7] = 0  # inactive: excluded from bounds and the valid count
+    return (
+        [
+            ("positions", "arr:vec3", pos),
+            ("flags", "arr:i32", flags),
+            ("use_flags", "scalar:i32", 1),
+            ("lower", "outinit:vec3", np.full((1, 3), 1.0e30, dtype=np.float32)),
+            ("upper", "outinit:vec3", np.full((1, 3), -1.0e30, dtype=np.float32)),
+            ("active_count", "outinit:i32", np.zeros(8, dtype=np.int32)),
+            ("__dim__", "", (n, 1)),
+            ("__block_dim__", "", 1),
+        ],
+        [],
+    )
+
+
 def b_narrow_phase_primitive_kernel(rng):
     """narrow_phase_primitive_kernel (write_contact_simple, non-speculative).
 
