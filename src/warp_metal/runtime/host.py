@@ -1247,6 +1247,14 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None) -> None:
                 owned.append(arena_handle)
             _CAPTURE_RECORDS.append(("metal", pso, list(handles), threads, block_dim, owned, array_refs))
             return
+        import os as _os
+
+        if _os.environ.get("WARP_METAL_DEBUG_LAUNCH"):
+            print(
+                f"[wmm-launch] kernel={getattr(kernel, 'key', kernel)} threads={threads} "
+                f"block_dim={block_dim} n_buffers={len(handles)} mesh={getattr(unit, 'needs_mesh', False)}",
+                flush=True,
+            )
         if block_dim is not None:
             _mm.dispatch_tiled(pso, handles, threads, block_dim)
         else:
