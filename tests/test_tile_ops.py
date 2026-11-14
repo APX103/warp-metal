@@ -18,7 +18,13 @@ block convention upstream's CPU path forces, which is what the plain-launch
 goldens encode. Each Metal-gated test launches on Metal and checks against
 an independent numpy computation; the translate-only pins (32 KB threadgroup
 budget, barrier-uniformity checkpoint, plain-launch scalar routing) run
-everywhere. Skips cleanly when no Metal device is present.
+everywhere. The P5 chunk adds the Newton-closure cooperative ops: bitonic
+tile_sort (in place at power-of-two sizes, padded scratch otherwise, keys
+distinct in the fixtures so the permutation is unique), the tile_stack LIFO
+family (deterministic lane-rank slot assignment matching upstream's CPU
+fiber order, struct payloads included), and the tile_mesh_query_aabb
+traversal (lane-0 private iterator + shared handoff, one face per call —
+the CPU golden batching). Skips cleanly when no Metal device is present.
 """
 
 import re
@@ -918,6 +924,623 @@ def k_upper_solve_inplace(a: wp.array2d(dtype=wp.float32), y: wp.array(dtype=wp.
     v = wp.tile_load(y, shape=(4,), offset=(blk * 4,), storage="shared")
     wp.tile_upper_solve_inplace(lt, v)
     wp.tile_store(out, v, offset=(blk * 4,))
+
+
+# ---- KEP-0001 M2.4 P5 kernels: tile_sort / tile_stack / tile_mesh_query_aabb
+
+# deterministic mesh scene for the tile_mesh_query_aabb test (same two-part
+# quad+tetrahedron scene as tests/test_mesh_query.py: 8 points / 6 faces)
+POINTS = np.array(
+    [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [3.0, 0.0, 0.0],
+        [4.0, 0.0, 0.0],
+        [3.5, 1.0, 0.0],
+        [3.5, 0.4, 0.9],
+    ],
+    dtype=np.float32,
+)
+INDICES = np.array(
+    [
+        0, 1, 2,  # quad lower
+        0, 2, 3,  # quad upper
+        4, 5, 6,  # tetra base
+        4, 6, 7,  # tetra side a
+        5, 7, 6,  # tetra side b
+        4, 7, 5,  # tetra side c
+    ],
+    dtype=np.int32,
+)
+N_TRI = len(INDICES) // 3
+FACE_LOWER = POINTS[INDICES.reshape(N_TRI, 3)].min(axis=1)
+FACE_UPPER = POINTS[INDICES.reshape(N_TRI, 3)].max(axis=1)
+
+
+@wp.struct
+class StackPair:
+    idx: int
+    val: float
+
+
+@wp.kernel
+def k_sort_pairs(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.int32)):
+    blk = wp.tid()
+    off = blk * 8
+    keys = wp.tile_load(a, shape=(8,), offset=(off,), storage="shared")
+    vals = wp.tile_load(b, shape=(8,), offset=(off,), storage="shared")
+    wp.tile_sort(keys, vals)
+    wp.tile_store(a, keys, offset=(off,))
+    wp.tile_store(b, vals, offset=(off,))
+
+
+@wp.kernel
+def k_sort_six(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.int32)):
+    # non-power-of-two tile: sorts through the padded scratch (6 -> 8), the
+    # padded keys are the type's max identity so they never leak into the
+    # first 6 slots on copy-back
+    blk = wp.tid()
+    off = blk * 6
+    keys = wp.tile_load(a, shape=(6,), offset=(off,), storage="shared")
+    vals = wp.tile_load(b, shape=(6,), offset=(off,), storage="shared")
+    wp.tile_sort(keys, vals)
+    wp.tile_store(a, keys, offset=(off,))
+    wp.tile_store(b, vals, offset=(off,))
+
+
+@wp.kernel
+def k_sort_ivec(a: wp.array(dtype=wp.int32), b: wp.array(dtype=wp.vec3)):
+    blk = wp.tid()
+    off = blk * 8
+    keys = wp.tile_load(a, shape=(8,), offset=(off,), storage="shared")
+    vals = wp.tile_load(b, shape=(8,), offset=(off,), storage="shared")
+    wp.tile_sort(keys, vals)
+    wp.tile_store(a, keys, offset=(off,))
+    wp.tile_store(b, vals, offset=(off,))
+
+
+@wp.kernel
+def k_sort_six_i64(a: wp.array(dtype=wp.int64), b: wp.array(dtype=wp.int32)):
+    blk = wp.tid()
+    off = blk * 6
+    keys = wp.tile_load(a, shape=(6,), offset=(off,), storage="shared")
+    vals = wp.tile_load(b, shape=(6,), offset=(off,), storage="shared")
+    wp.tile_sort(keys, vals)
+    wp.tile_store(a, keys, offset=(off,))
+    wp.tile_store(b, vals, offset=(off,))
+
+
+@wp.kernel
+def k_sort_sentinel(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.int32)):
+    # the Newton SAP pattern: 1e30 padding keys sort to the end
+    blk = wp.tid()
+    keys = wp.tile_load(a, shape=(8,), storage="shared")
+    vals = wp.tile_load(b, shape=(8,), storage="shared")
+    wp.tile_sort(keys, vals)
+    wp.tile_store(a, keys)
+    wp.tile_store(b, vals)
+
+
+@wp.kernel
+def k_sort_plain(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.int32)):
+    # plain launch: 1-element tiles — the identity
+    i = wp.tid()
+    keys = wp.tile_load(a, shape=(1,), offset=(i,))
+    vals = wp.tile_load(b, shape=(1,), offset=(i,))
+    wp.tile_sort(keys, vals)
+    wp.tile_store(a, keys, offset=(i,))
+    wp.tile_store(b, vals, offset=(i,))
+
+
+@wp.kernel
+def k_stack_compact(data: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32), num: wp.array(dtype=wp.int32)):
+    # one push per lane with a per-lane mask, then a full drain in a single
+    # pop (8 lanes, capacity 8): contributors land in stack slots 0..k-1 in
+    # lane order, and the pop hands slot count-1-r to lane r, so out[j]
+    # ends up holding the j-th contributor's value
+    blk, lane = wp.tid()
+    s = wp.tile_stack(capacity=8, dtype=wp.int32)
+    v = data[blk * 8 + lane]
+    wp.tile_stack_push(s, v, v > 2)
+    if lane == 0:
+        num[blk] = wp.tile_stack_count(s)
+    res, slot = wp.tile_stack_pop(s)
+    if slot >= 0:
+        out[blk * 8 + slot] = res
+
+
+@wp.kernel
+def k_stack_saturate(push_slots: wp.array(dtype=wp.int32), pop_slots: wp.array(dtype=wp.int32), num: wp.array(dtype=wp.int32)):
+    # 8 offers into a capacity-4 stack: lanes 0..3 take slots 0..3, lanes
+    # 4..7 drop with -1 and the count saturates at 4; the drain hands the
+    # top slots to the lowest lanes (3,2,1,0) and -1 to the rest
+    blk, lane = wp.tid()
+    s = wp.tile_stack(capacity=4, dtype=wp.int32)
+    push_slots[blk * 8 + lane] = wp.tile_stack_push(s, lane + 1, True)
+    if lane == 0:
+        num[blk] = wp.tile_stack_count(s)
+    _res, pop_slot = wp.tile_stack_pop(s)
+    pop_slots[blk * 8 + lane] = pop_slot
+
+
+@wp.kernel
+def k_stack_lifo(out: wp.array(dtype=wp.int32)):
+    # two full pushes then a complete drain in two pops: values from the
+    # LATER push pop first (LIFO across pushes), lane r of pop #1 taking
+    # stack slot 15-r and pop #2 slot 7-r
+    blk, lane = wp.tid()
+    s = wp.tile_stack(capacity=16, dtype=wp.int32)
+    wp.tile_stack_push(s, 100 + lane, True)
+    wp.tile_stack_push(s, 200 + lane, True)
+    r0, s0 = wp.tile_stack_pop(s)
+    r1, s1 = wp.tile_stack_pop(s)
+    out[blk * 16 + s0] = r0
+    out[blk * 16 + s1] = r1
+
+
+@wp.kernel
+def k_stack_struct(data: wp.array(dtype=wp.float32), out_i: wp.array(dtype=wp.int32), out_v: wp.array(dtype=wp.float32)):
+    # the sdf_contact EdgeCullResult pattern: (int, float) pairs pushed and
+    # popped as one atomic stack element — the pairing must survive
+    blk, lane = wp.tid()
+    s = wp.tile_stack(capacity=8, dtype=StackPair)
+    p = StackPair()
+    p.idx = lane
+    p.val = data[lane]
+    wp.tile_stack_push(s, p, lane % 2 == 0)
+    res, slot = wp.tile_stack_pop(s)
+    if slot >= 0:
+        out_i[blk * 8 + slot] = res.idx
+        out_v[blk * 8 + slot] = res.val
+
+
+@wp.kernel
+def k_stack_clear(num: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+    blk, lane = wp.tid()
+    s = wp.tile_stack(capacity=8, dtype=wp.int32)
+    wp.tile_stack_push(s, lane, True)
+    wp.tile_stack_clear(s)
+    c0 = wp.tile_stack_count(s)
+    wp.tile_stack_push(s, lane + 10, lane < 2)
+    if lane == 0:
+        num[blk] = c0
+    res, slot = wp.tile_stack_pop(s)
+    if slot >= 0:
+        out[blk * 8 + slot] = res
+
+
+@wp.kernel
+def k_stack_plain(data: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+    # plain launch: per-thread serial stack (one-lane block) — push, pop
+    # back, count visible per thread
+    i = wp.tid()
+    s = wp.tile_stack(capacity=4, dtype=wp.int32)
+    wp.tile_stack_push(s, data[i], data[i] > 2)
+    res, slot = wp.tile_stack_pop(s)
+    out[i * 2] = wp.where(slot >= 0, res, -7)
+    out[i * 2 + 1] = slot
+
+
+@wp.kernel
+def k_meshq_faces(mesh_id: wp.uint64, lo: wp.vec3, hi: wp.vec3, counts: wp.array(dtype=wp.int32)):
+    # the collision_core idiom: construct, guard with tile_query_valid,
+    # advance, untile, count each reported face once
+    query = wp.tile_mesh_query_aabb(mesh_id, lo, hi)
+    while wp.tile_query_valid(query):
+        result_tile = wp.tile_mesh_query_aabb_next(query)
+        face = wp.untile(result_tile)
+        if face >= 0:
+            wp.atomic_add(counts, face, 1)
+
+
+@wp.kernel
+def k_meshq_plain(mesh_id: wp.uint64, lowers: wp.array(dtype=wp.vec3), uppers: wp.array(dtype=wp.vec3), counts: wp.array(dtype=wp.int32)):
+    # plain launch: each thread drives its own scalar query over its own box
+    t = wp.tid()
+    query = wp.tile_mesh_query_aabb(mesh_id, lowers[t], uppers[t])
+    while wp.tile_query_valid(query):
+        result_tile = wp.tile_mesh_query_aabb_next(query)
+        face = wp.untile(result_tile)
+        if face >= 0:
+            wp.atomic_add(counts, t * 6 + face, 1)
+
+
+# ---- P5 numpy references ----------------------------------------------------
+
+
+def _perm_sort_ref(keys: np.ndarray, vals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Ascending key sort with the payload permuted along; keys must be
+    distinct so the permutation is unique."""
+    perm = np.argsort(keys)
+    return keys[perm], vals[perm]
+
+
+class TestTileSort(unittest.TestCase):
+    def setUp(self):
+        if _SKIP:
+            raise unittest.SkipTest(_SKIP_MSG)
+
+    def _blocks(self, n_blocks, n_per):
+        # distinct keys per block (a shuffled permutation of distinct values)
+        rng = np.random.default_rng(41)
+        keys = np.concatenate(
+            [rng.permutation(np.arange(n_per, dtype=np.float32) + 0.5) for _ in range(n_blocks)]
+        ).astype(np.float32)
+        vals = np.concatenate(
+            [np.arange(n_per, dtype=np.int32) + blk * 100 for blk in range(n_blocks)]
+        )
+        return keys, vals
+
+    def test_sort_pairs_pow2(self):
+        n_blocks = 3
+        keys, vals = self._blocks(n_blocks, 8)
+        aa = wp.zeros(n_blocks * 8, dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = keys
+        bb = wp.zeros(n_blocks * 8, dtype=wp.int32, device="metal")
+        bb.numpy_view()[:] = vals
+        wp.launch_tiled(k_sort_pairs, dim=n_blocks, inputs=[aa, bb], block_dim=BD, device="metal")
+        wp.synchronize()
+        for blk in range(n_blocks):
+            ek, ev = _perm_sort_ref(keys[blk * 8 : (blk + 1) * 8], vals[blk * 8 : (blk + 1) * 8])
+            np.testing.assert_allclose(aa.numpy_view()[blk * 8 : (blk + 1) * 8], ek, rtol=TOL)
+            np.testing.assert_array_equal(bb.numpy_view()[blk * 8 : (blk + 1) * 8], ev)
+
+    def test_sort_six_non_pow2(self):
+        n_blocks = 2
+        keys, vals = self._blocks(n_blocks, 6)
+        aa = wp.zeros(n_blocks * 6, dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = keys
+        bb = wp.zeros(n_blocks * 6, dtype=wp.int32, device="metal")
+        bb.numpy_view()[:] = vals
+        wp.launch_tiled(k_sort_six, dim=n_blocks, inputs=[aa, bb], block_dim=BD, device="metal")
+        wp.synchronize()
+        for blk in range(n_blocks):
+            ek, ev = _perm_sort_ref(keys[blk * 6 : (blk + 1) * 6], vals[blk * 6 : (blk + 1) * 6])
+            np.testing.assert_allclose(aa.numpy_view()[blk * 6 : (blk + 1) * 6], ek, rtol=TOL)
+            np.testing.assert_array_equal(bb.numpy_view()[blk * 6 : (blk + 1) * 6], ev)
+
+    def test_sort_int_keys_vec_payload(self):
+        rng = np.random.default_rng(42)
+        n_blocks = 2
+        keys = np.concatenate([rng.permutation(np.arange(8, dtype=np.int32) - 4) for _ in range(n_blocks)])
+        vals = rng.uniform(-2, 2, (n_blocks * 8, 3)).astype(np.float32)
+        aa = wp.zeros(n_blocks * 8, dtype=wp.int32, device="metal")
+        aa.numpy_view()[:] = keys
+        bb = wp.zeros(n_blocks * 8, dtype=wp.vec3, device="metal")
+        bb.numpy_view()[:] = vals
+        wp.launch_tiled(k_sort_ivec, dim=n_blocks, inputs=[aa, bb], block_dim=BD, device="metal")
+        wp.synchronize()
+        for blk in range(n_blocks):
+            ek, ev = _perm_sort_ref(keys[blk * 8 : (blk + 1) * 8], vals[blk * 8 : (blk + 1) * 8])
+            np.testing.assert_array_equal(aa.numpy_view()[blk * 8 : (blk + 1) * 8], ek)
+            np.testing.assert_allclose(bb.numpy_view()[blk * 8 : (blk + 1) * 8].reshape(-1, 3), ev, rtol=TOL)
+
+    def test_sort_i64_keys_non_pow2(self):
+        # 64-bit key comparisons + the padded scratch (6 -> 8; real keys are
+        # distinct from the INT64_MAX padding identity so the permutation is
+        # unique)
+        n_blocks = 2
+        keys = np.concatenate(
+            [np.array([-9223372036854775808, 5, -3, 9223372036854775806, 1, 4], dtype=np.int64) for _ in range(n_blocks)]
+        )
+        vals = np.concatenate(
+            [np.arange(6, dtype=np.int32) + blk * 50 for blk in range(n_blocks)]
+        )
+        aa = wp.zeros(n_blocks * 6, dtype=wp.int64, device="metal")
+        aa.numpy_view()[:] = keys
+        bb = wp.zeros(n_blocks * 6, dtype=wp.int32, device="metal")
+        bb.numpy_view()[:] = vals
+        wp.launch_tiled(k_sort_six_i64, dim=n_blocks, inputs=[aa, bb], block_dim=BD, device="metal")
+        wp.synchronize()
+        for blk in range(n_blocks):
+            ek, ev = _perm_sort_ref(keys[blk * 6 : (blk + 1) * 6], vals[blk * 6 : (blk + 1) * 6])
+            np.testing.assert_array_equal(aa.numpy_view()[blk * 6 : (blk + 1) * 6], ek)
+            np.testing.assert_array_equal(bb.numpy_view()[blk * 6 : (blk + 1) * 6], ev)
+
+    def test_sort_sentinels_land_at_end(self):
+        # the broad_phase_sap pattern: 1e30 padding keys sort past every real
+        # key, payload follows
+        keys = np.array([3.0, 1e30, 1.0, 1e30, 2.0, 7.0, 0.5, 1e30], dtype=np.float32)
+        vals = np.arange(8, dtype=np.int32)
+        aa = wp.zeros(8, dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = keys
+        bb = wp.zeros(8, dtype=wp.int32, device="metal")
+        bb.numpy_view()[:] = vals
+        wp.launch_tiled(k_sort_sentinel, dim=1, inputs=[aa, bb], block_dim=BD, device="metal")
+        wp.synchronize()
+        # real keys sort ascending with their payload; the three equal 1e30
+        # sentinels occupy the last three slots in UNSPECIFIED order (upstream
+        # leaves equal-key order undefined) — check them as a set
+        ek, ev = _perm_sort_ref(keys, vals)
+        np.testing.assert_allclose(aa.numpy_view(), ek, rtol=TOL)
+        got = bb.numpy_view()
+        np.testing.assert_array_equal(got[:5], ev[:5])
+        self.assertEqual(sorted(got[5:].tolist()), [1, 3, 7])
+
+    def test_plain_launch_identity(self):
+        keys = np.array([5.0, 1.0, 4.0, 2.0], dtype=np.float32)
+        vals = np.array([9, 8, 7, 6], dtype=np.int32)
+        aa = wp.zeros(4, dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = keys
+        bb = wp.zeros(4, dtype=wp.int32, device="metal")
+        bb.numpy_view()[:] = vals
+        wp.launch(k_sort_plain, dim=4, inputs=[aa, bb], device="metal")
+        wp.synchronize()
+        np.testing.assert_allclose(aa.numpy_view(), keys, rtol=TOL)
+        np.testing.assert_array_equal(bb.numpy_view(), vals)
+
+
+class TestTileStack(unittest.TestCase):
+    def setUp(self):
+        if _SKIP:
+            raise unittest.SkipTest(_SKIP_MSG)
+
+    def test_compact_masked_push_drain(self):
+        rng = np.random.default_rng(43)
+        n_blocks = 2
+        data = rng.integers(-3, 8, n_blocks * 8).astype(np.int32)
+        aa = wp.zeros(n_blocks * 8, dtype=wp.int32, device="metal")
+        aa.numpy_view()[:] = data
+        out = wp.full(n_blocks * 8, -99, dtype=wp.int32, device="metal")
+        num = wp.zeros(n_blocks, dtype=wp.int32, device="metal")
+        wp.launch_tiled(k_stack_compact, dim=n_blocks, inputs=[aa, out, num], block_dim=BD, device="metal")
+        wp.synchronize()
+        for blk in range(n_blocks):
+            chunk = data[blk * 8 : (blk + 1) * 8]
+            contributors = chunk[chunk > 2]  # lane order
+            k = len(contributors)
+            self.assertEqual(int(num.numpy_view()[blk]), k)
+            got = out.numpy_view()[blk * 8 : (blk + 1) * 8]
+            np.testing.assert_array_equal(got[:k], contributors)
+            np.testing.assert_array_equal(got[k:], np.full(8 - k, -99, dtype=np.int32))
+
+    def test_saturate_and_slot_assignment(self):
+        n_blocks = 2
+        push_slots = wp.full(n_blocks * 8, -7, dtype=wp.int32, device="metal")
+        pop_slots = wp.full(n_blocks * 8, -7, dtype=wp.int32, device="metal")
+        num = wp.zeros(n_blocks, dtype=wp.int32, device="metal")
+        wp.launch_tiled(k_stack_saturate, dim=n_blocks, inputs=[push_slots, pop_slots, num], block_dim=BD, device="metal")
+        wp.synchronize()
+        for blk in range(n_blocks):
+            # lanes 0..3 claim slots 0..3, lanes 4..7 drop
+            np.testing.assert_array_equal(
+                push_slots.numpy_view()[blk * 8 : (blk + 1) * 8], np.array([0, 1, 2, 3, -1, -1, -1, -1], dtype=np.int32)
+            )
+            # the drain hands the top slots to the lowest lanes
+            np.testing.assert_array_equal(
+                pop_slots.numpy_view()[blk * 8 : (blk + 1) * 8], np.array([3, 2, 1, 0, -1, -1, -1, -1], dtype=np.int32)
+            )
+            self.assertEqual(int(num.numpy_view()[blk]), 4)  # saturated, not 8
+
+    def test_lifo_across_pushes(self):
+        n_blocks = 2
+        out = wp.full(n_blocks * 16, -99, dtype=wp.int32, device="metal")
+        wp.launch_tiled(k_stack_lifo, dim=n_blocks, inputs=[out], block_dim=BD, device="metal")
+        wp.synchronize()
+        want = np.concatenate([100 + np.arange(8), 200 + np.arange(8)]).astype(np.int32)
+        for blk in range(n_blocks):
+            np.testing.assert_array_equal(out.numpy_view()[blk * 16 : (blk + 1) * 16], want)
+
+    def test_struct_payload_pairing(self):
+        rng = np.random.default_rng(44)
+        data = rng.uniform(-5, 5, 8).astype(np.float32)
+        aa = wp.zeros(8, dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = data
+        out_i = wp.full(8, -1, dtype=wp.int32, device="metal")
+        out_v = wp.full(8, -1.0, dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_stack_struct, dim=1, inputs=[aa, out_i, out_v], block_dim=BD, device="metal")
+        wp.synchronize()
+        # even lanes contribute; the popped values must keep (idx, val) paired
+        for slot in range(4):
+            idx = slot * 2
+            self.assertEqual(int(out_i.numpy_view()[slot]), idx)
+            np.testing.assert_allclose(out_v.numpy_view()[slot], data[idx], rtol=TOL)
+        np.testing.assert_array_equal(out_i.numpy_view()[4:], np.full(4, -1, dtype=np.int32))
+
+    def test_clear_resets_and_repush(self):
+        n_blocks = 2
+        num = wp.full(n_blocks, 77, dtype=wp.int32, device="metal")
+        out = wp.full(n_blocks * 8, -99, dtype=wp.int32, device="metal")
+        wp.launch_tiled(k_stack_clear, dim=n_blocks, inputs=[num, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        for blk in range(n_blocks):
+            self.assertEqual(int(num.numpy_view()[blk]), 0)  # count right after clear
+            got = out.numpy_view()[blk * 8 : (blk + 1) * 8]
+            np.testing.assert_array_equal(got[:2], np.array([10, 11], dtype=np.int32))
+            np.testing.assert_array_equal(got[2:], np.full(6, -99, dtype=np.int32))
+
+    def test_plain_launch_serial(self):
+        data = np.array([1, 5, 3, 9], dtype=np.int32)
+        aa = wp.zeros(4, dtype=wp.int32, device="metal")
+        aa.numpy_view()[:] = data
+        out = wp.full(8, -99, dtype=wp.int32, device="metal")
+        wp.launch(k_stack_plain, dim=4, inputs=[aa, out], device="metal")
+        wp.synchronize()
+        got = out.numpy_view().reshape(4, 2)
+        for i in range(4):
+            if data[i] > 2:
+                np.testing.assert_array_equal(got[i], [data[i], 0])
+            else:
+                np.testing.assert_array_equal(got[i], [-7, -1])
+
+
+class TestTileMeshQuery(unittest.TestCase):
+    def setUp(self):
+        if _SKIP:
+            raise unittest.SkipTest(_SKIP_MSG)
+
+    def _mesh(self):
+        pa = wp.zeros(len(POINTS), dtype=wp.vec3, device="metal")
+        pa.numpy()[:] = POINTS
+        ia = wp.zeros(len(INDICES), dtype=wp.int32, device="metal")
+        ia.numpy()[:] = INDICES
+        return wp.Mesh(points=pa, indices=ia)
+
+    @staticmethod
+    def _ref_faces(lo, hi):
+        # broad-phase reference: faces whose cached AABBs overlap the box
+        hit = np.all((FACE_LOWER <= hi) & (FACE_UPPER >= lo), axis=1)
+        return set(np.nonzero(hit)[0].tolist())
+
+    def test_tiled_query_counts_each_face_once(self):
+        mesh = self._mesh()
+        boxes = [
+            ((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)),  # quad corner: face 0
+            ((-0.1, -0.1, -0.1), (1.1, 1.1, 0.1)),  # whole quad: faces 0,1
+            ((3.2, -0.2, -0.2), (3.8, 0.8, 1.0)),  # tetra: several faces
+            ((10.0, 10.0, 10.0), (11.0, 11.0, 11.0)),  # miss: zero iterations
+        ]
+        for lo, hi in boxes:
+            counts = wp.zeros(N_TRI, dtype=wp.int32, device="metal")
+            wp.launch_tiled(
+                k_meshq_faces, dim=1, inputs=[mesh.id, wp.vec3(*lo), wp.vec3(*hi), counts], block_dim=BD, device="metal"
+            )
+            wp.synchronize()
+            want = self._ref_faces(np.array(lo, dtype=np.float32), np.array(hi, dtype=np.float32))
+            got = counts.numpy_view()
+            for f in range(N_TRI):
+                self.assertEqual(int(got[f]), 1 if f in want else 0, f"box {lo}..{hi} face {f}")
+
+    def test_plain_query_per_thread_boxes(self):
+        mesh = self._mesh()
+        boxes = [
+            ((-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)),
+            ((-0.1, -0.1, -0.1), (1.1, 1.1, 0.1)),
+            ((3.2, -0.2, -0.2), (3.8, 0.8, 1.0)),
+            ((10.0, 10.0, 10.0), (11.0, 11.0, 11.0)),
+            ((-1.0, -1.0, -1.0), (5.0, 5.0, 5.0)),
+        ]
+        lowers = wp.zeros(len(boxes), dtype=wp.vec3, device="metal")
+        lowers.numpy_view()[:] = np.array([b[0] for b in boxes], dtype=np.float32)
+        uppers = wp.zeros(len(boxes), dtype=wp.vec3, device="metal")
+        uppers.numpy_view()[:] = np.array([b[1] for b in boxes], dtype=np.float32)
+        counts = wp.zeros(len(boxes) * N_TRI, dtype=wp.int32, device="metal")
+        wp.launch(k_meshq_plain, dim=len(boxes), inputs=[mesh.id, lowers, uppers, counts], device="metal")
+        wp.synchronize()
+        for t, (lo, hi) in enumerate(boxes):
+            want = self._ref_faces(np.array(lo, dtype=np.float32), np.array(hi, dtype=np.float32))
+            got = counts.numpy_view()[t * N_TRI : (t + 1) * N_TRI]
+            for f in range(N_TRI):
+                self.assertEqual(int(got[f]), 1 if f in want else 0, f"box {lo}..{hi} face {f}")
+
+
+# ---- P5 translate-only pins (run on CPU; no Metal launch) -------------------
+
+
+class TestTileP5Pins(unittest.TestCase):
+    """Fail-loud boundaries of the P5 closure (CPU-safe): sort budget and
+    uniformity, stack uniformity, and the plain-launch scalar routing."""
+
+    def _translate(self, kern, block_dim=None):
+        from warp_metal.msl.translate import translate_kernel
+
+        opts = {"block_dim": block_dim} if block_dim else {}
+        return translate_kernel(kern, opts)
+
+    def test_sort_uniformity_rejection(self):
+        @wp.kernel
+        def k_bad(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.int32)):
+            blk = wp.tid()
+            keys = wp.tile_load(a, shape=(8,), offset=(blk * 8,), storage="shared")
+            vals = wp.tile_load(b, shape=(8,), offset=(blk * 8,), storage="shared")
+            if blk == 0:
+                wp.tile_sort(keys, vals)
+
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._translate(k_bad, BD)
+        self.assertIn("non-uniform control flow", str(ctx.exception))
+
+    def test_sort_scratch_budget_rejection(self):
+        # 3000-element int32 key+payload tiles fit (24 KB), but the padded
+        # bitonic scratch (4096 + 4096 slots = 32 KB) pushes the total past
+        # the 32 KB threadgroup budget — the scratch must be accounted
+        @wp.kernel
+        def k_big(a: wp.array(dtype=wp.int32), b: wp.array(dtype=wp.int32)):
+            keys = wp.tile_load(a, shape=(3000,), storage="shared")
+            vals = wp.tile_load(b, shape=(3000,), storage="shared")
+            wp.tile_sort(keys, vals)
+
+        u = self._translate(k_big, BD)
+        with self.assertRaises(NotImplementedError) as ctx:
+            u.source()
+        self.assertIn("threadgroup tile storage budget exceeded", str(ctx.exception))
+
+    def test_sort_max_documented_size_translates(self):
+        # the documented boundary: float32 keys + int32 payload at n=4096
+        # (power of two) sort in place at exactly the 32 KB budget — n beyond
+        # that is rejected by the budget check, never by silent Metal failure
+        @wp.kernel
+        def k_max(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.int32)):
+            keys = wp.tile_load(a, shape=(4096,), storage="shared")
+            vals = wp.tile_load(b, shape=(4096,), storage="shared")
+            wp.tile_sort(keys, vals)
+
+        u = self._translate(k_max, BD)
+        src = u.source()  # no scratch arrays: sorts in place at exactly 32 KB
+        self.assertIn("for (int _wp_k = 2; _wp_k <= 4096; _wp_k <<= 1)", src)
+        self.assertEqual(len(u.shr_arrays), 2)
+
+    def test_stack_uniformity_rejection(self):
+        @wp.kernel
+        def k_bad_push(a: wp.array(dtype=wp.int32), flag: wp.array(dtype=wp.int32)):
+            blk, lane = wp.tid()
+            s = wp.tile_stack(capacity=4, dtype=wp.int32)
+            if flag[0] > 0:
+                wp.tile_stack_push(s, lane, True)
+
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._translate(k_bad_push, BD)
+        self.assertIn("non-uniform control flow", str(ctx.exception))
+
+    def test_stack_count_single_thread_read_allowed(self):
+        # tile_stack_count is non-cooperative (upstream: callable from a
+        # single thread) — a read inside a runtime `if` must NOT trip the
+        # uniformity checkpoint
+        @wp.kernel
+        def k_count_if(flag: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+            blk, lane = wp.tid()
+            s = wp.tile_stack(capacity=4, dtype=wp.int32)
+            wp.tile_stack_push(s, lane, True)
+            if flag[0] > 0:
+                if lane == 0:
+                    out[blk] = wp.tile_stack_count(s)
+
+        u = self._translate(k_count_if, BD)
+        src = u.source()
+        self.assertIn("_wp_tile_shr_1[0]", src)  # count slot read survives
+
+    def test_mesh_query_uniformity_rejection(self):
+        @wp.kernel
+        def k_bad_mesh(mesh_id: wp.uint64, lo: wp.vec3, hi: wp.vec3, counts: wp.array(dtype=wp.int32), flag: wp.array(dtype=wp.int32)):
+            if flag[0] > 0:
+                query = wp.tile_mesh_query_aabb(mesh_id, lo, hi)
+                while wp.tile_query_valid(query):
+                    result_tile = wp.tile_mesh_query_aabb_next(query)
+                    face = wp.untile(result_tile)
+                    if face >= 0:
+                        wp.atomic_add(counts, face, 1)
+
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._translate(k_bad_mesh, BD)
+        self.assertIn("non-uniform control flow", str(ctx.exception))
+
+    def test_plain_sort_no_barriers(self):
+        # plain launch: 1-element tiles sort to identity — no shared arrays,
+        # no barriers, output independent of the dispatch threadgroup size
+        @wp.kernel
+        def k_plain(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.int32)):
+            i = wp.tid()
+            keys = wp.tile_load(a, shape=(1,), offset=(i,))
+            vals = wp.tile_load(b, shape=(1,), offset=(i,))
+            wp.tile_sort(keys, vals)
+            wp.tile_store(a, keys, offset=(i,))
+            wp.tile_store(b, vals, offset=(i,))
+
+        u = self._translate(k_plain)
+        self.assertEqual(u.shr_arrays, [])
+        self.assertNotIn("threadgroup_barrier", u.source())
 
 
 # ---- P3+P4 numpy references -----------------------------------------------

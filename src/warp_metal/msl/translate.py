@@ -253,8 +253,15 @@ def msl_type(ctype: str) -> str:
         return "wp_mesh_query_ray_t"  # M2.2 struct-return ray hit
     if ctype == "wp::mesh_query_aabb_t":
         return "wp_mesh_query_aabb_t"  # M2.2 aabb/sphere iterator (prelude)
+    if ctype == "wp::mesh_query_aabb_thread_block_t":
+        # tile_mesh_query_aabb query handle: the M2.2 per-lane scalar iterator.
+        # Under the cooperative lowering every lane holds the struct but only
+        # lane 0's copy is advanced (results hand off through shared slots —
+        # see _meshq_construct/_meshq_next); on a plain launch each thread
+        # drives its own iterator, exactly upstream's CPU fiber semantics
+        return "wp_mesh_query_aabb_t"
     if ctype.startswith("wp::mesh_query"):
-        return "wp_mesh_query_stub"  # tiled AABB query handle stub (prelude)
+        raise TranslationError(f"{ctype!r} has no MSL mapping (outside the KEP-0001 closure)")
     if ctype == "wp::spatial_vector_t<wp::float32>":
         return "spatial_vectorf"
     if m := _RE_ARRAY_T.match(ctype):
@@ -278,6 +285,23 @@ _ELEM_BYTES = {
     "quatf": 16, "transformf": 28, "spatial_vectorf": 24,
     "mat22f": 16, "mat33f": 36, "mat44f": 64,
 }
+
+
+def _shr_elem_bytes(elem: str, unit: "KernelUnit") -> int:
+    """Byte size of a shared-array element: scalar/vector table first, then
+    user structs (fields packed in declaration order — the MSL struct def is
+    exactly the declaration-order field sequence; nested structs recurse).
+    Unknown elements fail loud (upstream struct tiles carry padding/reordering
+    this size model cannot prove)."""
+    b = _ELEM_BYTES.get(elem)
+    if b is not None:
+        return b
+    fields = unit.struct_fields.get(elem)
+    if fields is None:
+        raise TranslationError(
+            f"tile element {elem!r} has no byte size (struct tiles are outside the closure)"
+        )
+    return sum(_shr_elem_bytes(t, unit) for _label, t in fields)
 
 
 def array_elem_msl(ctype: str) -> str:
@@ -380,10 +404,10 @@ _CALL_TABLE = {
     # spatial
     "spatial_top": "wp_spatial_top",
     "spatial_bottom": "wp_spatial_bottom",
-    # tiled mesh AABB query (Phase-1 stubs, prelude — no meshes exist)
-    "tile_mesh_query_aabb": "wp_tile_mesh_query_aabb",
-    "tile_query_valid": "wp_tile_query_valid",
-    "tile_mesh_query_aabb_next": "wp_tile_mesh_query_aabb_next",
+    # tile_mesh_query_aabb / tile_query_valid / tile_mesh_query_aabb_next are
+    # NOT table calls: they lower through dedicated statement/expression
+    # branches (_meshq_construct / _meshq_next) that own the shared handoff
+    # slots and barriers (KEP-0001 M2.4 P5)
     "untile": "wp_untile",
     # BVH device query family (KEP-0001 M2.1; prelude _BVH_QUERY_OPS —
     # upstream bvh.h port). The SSA resolves wp.bvh_query_next to the
@@ -638,6 +662,48 @@ class TileVar:
         return lines, self.coord_addr(coords)
 
 
+def _swap_line(elem: str, arr: str, i: str, j: str) -> str:
+    """One-line compare-exchange of two array slots (any MSL value type)."""
+    return f"{{ {elem} _wp_tmp = {arr}[{i}]; {arr}[{i}] = {arr}[{j}]; {arr}[{j}] = _wp_tmp; }}"
+
+
+# tile_sort padding identity per key MSL type: the LARGEST value as an MSL
+# literal (the Metal environment has no INT64_MAX/UINT64_MAX macros; INFINITY
+# is available). Padded scratch slots sort past every real key and are
+# dropped on copy-back.
+_SORT_PAD = {
+    "float": "INFINITY",
+    "half": "INFINITY",
+    "int": "2147483647",
+    "uint": "4294967295u",
+    "int64_t": "9223372036854775807ll",
+    "uint64_t": "18446744073709551615ull",
+}
+
+
+class StackVar:
+    """Translation-time representation of an SSA tile_stack variable.
+
+    tier == "shr" (launch_tiled): the stack lives in three kernel-scope
+    threadgroup arrays — ``_wp_tile_shr_{data_slot}`` (capacity elements of
+    the payload type), ``_wp_tile_shr_{count_slot}`` (one int), and
+    ``_wp_tile_shr_{stage_slot}`` (block_dim ints of push-rank staging).
+    tier == "scalar" (plain launch): per-thread ``{name}_d[{capacity}]`` /
+    ``{name}_c`` locals (one-lane block — the stack is the thread's own).
+    """
+
+    __slots__ = ("tier", "elem", "cap", "data_slot", "count_slot", "stage_slot", "name")
+
+    def __init__(self, tier: str, elem: str, cap: int, name: str):
+        self.tier = tier
+        self.elem = elem
+        self.cap = cap
+        self.data_slot = -1
+        self.count_slot = -1
+        self.stage_slot = -1
+        self.name = name
+
+
 def _rowmajor_strides(dims: list[int]) -> list[int]:
     """Row-major element strides of ``dims`` (last dim contiguous)."""
     strides: list[int] = []
@@ -803,6 +869,11 @@ class KernelUnit:
         # emission and the _gsize binding; the scratch arrays themselves are
         # claimed in shr_arrays like every other shared tile array)
         self.tile_reduces: list[tuple[str, str]] = []
+        # True when any non-reduce lowering also needs the _wp_live partial
+        # threadgroup guard (tile_stack push/pop rank walks): joins
+        # tile_reduces in driving the _wp_live preamble definition and the
+        # _gsize kernel binding
+        self.uses_live = False
         # every kernel-scope threadgroup array in claim order (shared tile
         # vars, reduction scratch arrays, extract scratch slots):
         # [(elem msl, size)] — kernel_src emits one
@@ -895,7 +966,7 @@ class KernelUnit:
             params.append(f"    device wp_mesh* _wp_mesh_table [[buffer({idx})]]")
             idx += 1
         params.append("    uint3 _gid [[thread_position_in_grid]]")
-        if self.tile_reduces:
+        if self.tile_reduces or self.uses_live:
             # grid extent for the partial-threadgroup fold guard (_wp_live)
             params.append("    uint3 _gsize [[threads_per_grid]]")
         fields = []
@@ -910,13 +981,15 @@ class KernelUnit:
                 fields.append(f"    wp_arr_meta {a.name}_m;")
         fields.append("    wp_arr_meta _dims;  // launch bounds for multi-dim tid")
         body = "\n".join(fn.lines) or "    ;"
-        if "_wp_live" in body and not (self.block_dim is not None and self.tile_reduces):
+        if "_wp_live" in body and not (
+            self.block_dim is not None and (self.tile_reduces or self.uses_live)
+        ):
             # static self-check (mirrors the one in fn_src): a kernel-body
-            # fold needs the preamble definition, which fires exactly when
-            # block_dim is set and tile_reduce sites exist
+            # fold or stack rank walk needs the preamble definition, which
+            # fires exactly when block_dim is set and a _wp_live site exists
             raise TranslationError(
                 f"kernel {self.kernel.name}: body uses _wp_live without the preamble "
-                "definition (tile_reduce lowered without block_dim — translation bug)"
+                "definition (live-guarded tile op lowered without block_dim — translation bug)"
             )
         needs_lane = bool(self.shr_arrays or self.uses_tile_ops)
         if "_wp_lane" in body and not needs_lane:
@@ -933,13 +1006,7 @@ class KernelUnit:
         # translation time (see _TILE_SHARED_BUDGET)
         budget_bytes = 0
         for elem, size in self.shr_arrays:
-            ebytes = _ELEM_BYTES.get(elem)
-            if ebytes is None:
-                raise TranslationError(
-                    f"kernel {self.kernel.name}: tile element {elem!r} has no byte size "
-                    "(struct tiles are outside the closure)"
-                )
-            budget_bytes += ebytes * size
+            budget_bytes += _shr_elem_bytes(elem, self) * size
         if budget_bytes > _TILE_SHARED_BUDGET:
             raise TranslationError(
                 f"kernel {self.kernel.name}: threadgroup tile storage budget exceeded — "
@@ -959,7 +1026,7 @@ class KernelUnit:
                 # scalar-carve-out tile ops (the wp.tile(v) per-thread form)
                 # use the lane index without claiming a shared array
                 preamble += f"    const int _wp_lane = _idx % {self.block_dim};\n"
-            if self.tile_reduces:
+            if self.tile_reduces or self.uses_live:
                 preamble += f"    const int _wp_live = min((int)_gsize.x - (_idx - _wp_lane), {self.block_dim});\n"
         elif self.uses_tile_ops:
             # plain launch without block_dim: per-thread degenerate tile
@@ -1131,6 +1198,13 @@ class _BodyTranslator:
         # compile-time SSA constants (const var = literal) for tile_extract
         self.tile_vars: dict[str, TileVar] = {}
         self.const_vars: dict[str, str] = {}
+        # SSA tile_stack vars (wp.tile_stack decls) -> StackVar: cooperative
+        # block-wide LIFO stacks (launch_tiled: shared data/count/rank-stage
+        # arrays) or the per-thread arena-tier degenerate (plain launches)
+        self.stack_vars: dict[str, "StackVar"] = {}
+        # SSA tile_mesh_query_aabb query vars -> (result slot, latch slot):
+        # the shared handoff slots backing the cooperative traversal
+        self.meshq_slots: dict[str, tuple[int, int]] = {}
         # unique suffix for bare kernel-scope index decls (register-tile
         # stores emit `int _wp_s{N}` OUTSIDE any loop scope — two stores in
         # one kernel must not redeclare the same name)
@@ -1198,11 +1272,10 @@ class _BodyTranslator:
         """Claim a kernel-scope threadgroup array slot (unit-global numbering,
         shared by kernel body and all @wp.func bodies via the needs_lane
         forwarding). The kernel preamble declares the array; function bodies
-        receive ``threadgroup elem*`` pointers."""
-        if _ELEM_BYTES.get(elem) is None:
-            raise TranslationError(
-                f"tile element {elem!r} has no byte size (struct tiles are outside the closure)"
-            )
+        receive ``threadgroup elem*`` pointers. Struct elements require their
+        MSL def to have been emitted first (translate_kernel pre-passes
+        tile_stack payload structs), so the byte size is derivable."""
+        _shr_elem_bytes(elem, self.unit)
         k = len(self.unit.shr_arrays)
         self.unit.shr_arrays.append((elem, size))
         self.used_shr.append((k, elem, "+"))
@@ -2709,6 +2782,375 @@ class _BodyTranslator:
             lines += self._solve_phase_lines(a_t, x_t, None, "bwd", a_swap=not upper)
         return lines
 
+    # -- tile_sort / tile_stack / tile_mesh_query_aabb (KEP-0001 M2.4 P5) ----
+    #
+    # Newton-closure cooperative ops. Single-rule split like every tile op:
+    # launch_tiled lowers the shared-storage (threadgroup) forms below; any
+    # plain launch lowers per-thread (one-lane block: a 1-element sort is the
+    # identity, a stack is the thread's own serial LIFO, a mesh query is the
+    # thread's own scalar iterator — exactly upstream's CPU block_dim=1
+    # semantics, which is what the plain-launch goldens encode).
+
+    def _stack_var(self, name: str, what: str) -> "StackVar":
+        sv = self.stack_vars.get(name)
+        if sv is None:
+            raise TranslationError(f"{what}: source {name!r} is not a tile_stack variable")
+        return sv
+
+    def _stack_count_expr(self, sv: StackVar) -> str:
+        if sv.tier == "shr":
+            return f"_wp_tile_shr_{sv.count_slot}[0]"
+        return f"{sv.name}_c"
+
+    def _stack_data_expr(self, sv: StackVar) -> str:
+        if sv.tier == "shr":
+            return f"_wp_tile_shr_{sv.data_slot}"
+        return f"{sv.name}_d"
+
+    def _parse_stack_decl(self, line: str) -> list[str] | None:
+        """``wp::tile_stack_t<T, C> var = wp::tile_stack_alloc<T, C>();`` —
+        the tile_stack primal decl. Registers a StackVar; the cooperative tier
+        claims (data, count, rank-stage) shared slots, the per-thread tier
+        declares locals. Returns None when the line is not a stack decl."""
+        m = re.match(
+            r"^\s*wp::tile_stack_t<(.+),\s*(\d+)>\s+(var_\w+)\s*=\s*"
+            r"wp::tile_stack_alloc<(.+),\s*(\d+)>\(\);\s*$",
+            line,
+        )
+        if m is None:
+            return None
+        dtype_ctype, cap, name, alloc_dtype, alloc_cap = m.group(1).strip(), int(m.group(2)), m.group(3), m.group(4).strip(), int(m.group(5))
+        if dtype_ctype != alloc_dtype or cap != alloc_cap:
+            raise TranslationError(f"tile_stack decl/alloc template mismatch in {line!r}")
+        if cap <= 0:
+            raise TranslationError(f"tile_stack capacity must be positive, got {cap}")
+        elem = msl_type(dtype_ctype)
+        sv = StackVar("shr" if self.unit.block_dim is not None else "scalar", elem, cap, name)
+        self.stack_vars[name] = sv
+        if sv.tier == "shr":
+            sv.data_slot = self._claim_shr(elem, cap)
+            sv.count_slot = self._claim_shr("int", 1)
+            sv.stage_slot = self._claim_shr("int", self.unit.block_dim)
+            return []
+        # per-thread tier: locals at function scope (SSA stack decls hoist to
+        # the primal-vars section, so this is top scope even when the Python
+        # source declares the stack inside a loop)
+        return [
+            f"{elem} {name}_d[{cap}];",
+            f"int {name}_c = 0;",
+            f"    (void)({name}_d); (void)({name}_c);  // keep -Wunused-variable diagnostics from clipping the error buffer",
+        ]
+
+    def _stack_init(self, target: str, rhs: str) -> list[str]:
+        """``var = wp::tile_stack_init<T, C>();`` — count := 0 and (cooperative
+        tier) the strided data zero-fill; upstream tile_stack_t operator=(int)
+        (tile.h:6198). Emits the barrier every stack op pairs with."""
+        m = re.match(r"^wp::tile_stack_init<(.+),\s*(\d+)>\(\)$", rhs)
+        if m is None:
+            raise TranslationError(f"cannot parse tile_stack_init {rhs!r}")
+        sv = self._stack_var(target, "tile_stack_init")
+        elem, cap = sv.elem, sv.cap
+        if sv.tier == "scalar":
+            return [
+                f"{sv.name}_c = 0;",
+                f"{{ {elem} _wp_z = {{}}; for (int _wp_i = 0; _wp_i < {cap}; ++_wp_i) {{ {sv.name}_d[_wp_i] = _wp_z; }} }}",
+            ]
+        self.unit.uses_tile_ops = True
+        bd = self._require_block_dim("wp::tile_stack_init")
+        self._check_uniform("wp::tile_stack_init")
+        data = self._stack_data_expr(sv)
+        return [
+            f"{{ {elem} _wp_z = {{}}; for (int _wp_i = _wp_lane; _wp_i < {cap}; _wp_i += {bd}) {{ {data}[_wp_i] = _wp_z; }} }}",
+            f"if (_wp_lane == 0) {{ _wp_tile_shr_{sv.count_slot}[0] = 0; }}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _stack_push(self, target: str, rhs: str) -> list[str]:
+        """``slot = wp::tile_stack_push(stack, value, has_value);`` — every
+        contributing lane claims one free slot (upstream tile.h:6247 hands out
+        slots by atomic-increment order, which is lane order between barriers
+        on upstream's CPU fiber runtime; the deterministic lane-rank refinement
+        is exactly that CPU order, so goldens match bit-for-bit). The count
+        saturates at capacity and surplus values drop with slot -1."""
+        sargs = self._parse_tile_call(rhs, "tile_stack_push", False)[0]
+        if len(sargs) != 3:
+            raise TranslationError(f"tile_stack_push with {len(sargs)} args (needs stack, value, has_value)")
+        sv = self._stack_var(sargs[0].strip(), "tile_stack_push")
+        value = self.expr(sargs[1])
+        has_value = self.expr(sargs[2])
+        if sv.tier == "scalar":
+            # one-lane block: the serial push (upstream CPU block_dim=1)
+            return [
+                f"{{ int _wp_slot = -1;",
+                f"    if ({has_value}) {{ int _wp_i = {sv.name}_c; if (_wp_i < {sv.cap}) {{ {sv.name}_d[_wp_i] = {value}; {sv.name}_c = _wp_i + 1; _wp_slot = _wp_i; }} }}",
+                f"    {target} = _wp_slot; }}",
+            ]
+        self.unit.uses_tile_ops = True
+        self.unit.uses_live = True
+        bd = self._require_block_dim("wp::tile_stack_push")
+        self._check_uniform("wp::tile_stack_push")
+        arr = f"_wp_tile_shr_{sv.data_slot}"
+        stage = f"_wp_tile_shr_{sv.stage_slot}"
+        cnt = f"_wp_tile_shr_{sv.count_slot}"
+        # leading barrier (upstream: orders prior count reads before this
+        # push's count write), then lane-rank staging and a serial rank walk
+        return [
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{stage}[_wp_lane] = ({has_value}) ? 1 : 0;",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{{ int _wp_base = {cnt}[0]; int _wp_rank = 0; int _wp_total = 0;",
+            f"    for (int _wp_j = 0; _wp_j < _wp_live; ++_wp_j) {{ int _wp_v = {stage}[_wp_j]; if (_wp_j < _wp_lane) _wp_rank += _wp_v; _wp_total += _wp_v; }}",
+            f"    int _wp_slot = _wp_base + _wp_rank;",
+            f"    bool _wp_ok = ({has_value}) && (_wp_slot < {sv.cap});",
+            f"    if (_wp_ok) {{ {arr}[_wp_slot] = {value}; }}",
+            f"    if (_wp_lane == 0) {{ {cnt}[0] = min(_wp_base + _wp_total, {sv.cap}); }}",
+            f"    {target} = _wp_ok ? _wp_slot : -1; }}",
+            # trailing barrier: every lane sees the clamped count before any
+            # subsequent count read or push (upstream's closing sync)
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _stack_pop(self, src: str) -> list[str]:
+        """``wp::tile_stack_pop(stack, out_value, out_slot);`` — the block
+        hands out up to one element per live lane from the TOP of the stack
+        (later pushes pop first — upstream tile.h:6276 atomic decrement
+        order, mirrored deterministically: lane r takes slot count-1-r).
+        Popping an empty stack is harmless (slot -1, zero value)."""
+        open_p = src.index("(")
+        close = _find_balanced(src, open_p)
+        sargs = split_args(src[open_p + 1 : close])
+        if len(sargs) != 3:
+            raise TranslationError(f"tile_stack_pop with {len(sargs)} args (needs stack, out_value, out_slot)")
+        sv = self._stack_var(sargs[0].strip(), "tile_stack_pop")
+        out_value, out_slot = sargs[1].strip(), sargs[2].strip()
+        elem = sv.elem
+        if sv.tier == "scalar":
+            return [
+                f"{{ int _wp_slot = -1; {elem} _wp_v = {{}};",
+                f"    if ({sv.name}_c > 0) {{ {sv.name}_c -= 1; _wp_slot = {sv.name}_c; _wp_v = {sv.name}_d[_wp_slot]; }}",
+                f"    {out_slot} = _wp_slot; {out_value} = _wp_v; }}",
+            ]
+        self.unit.uses_tile_ops = True
+        self.unit.uses_live = True
+        self._require_block_dim("wp::tile_stack_pop")
+        self._check_uniform("wp::tile_stack_pop")
+        arr = f"_wp_tile_shr_{sv.data_slot}"
+        cnt = f"_wp_tile_shr_{sv.count_slot}"
+        # leading barrier (upstream), then a top-down handout: hand =
+        # min(count, _wp_live) elements go to lanes 0..hand-1, highest slots
+        # first; the remainder stays for the next pop call
+        return [
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{{ int _wp_count = {cnt}[0];",
+            f"    int _wp_hand = min(_wp_count, _wp_live);",
+            f"    int _wp_slot = _wp_count - 1 - _wp_lane;",
+            f"    bool _wp_ok = (_wp_lane < _wp_hand);",
+            f"    {out_slot} = _wp_ok ? _wp_slot : -1;",
+            f"    {out_value} = _wp_ok ? {arr}[_wp_slot] : {elem}{{}};",
+            f"    if (_wp_lane == 0) {{ {cnt}[0] = _wp_count - _wp_hand; }} }}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _stack_clear(self, src: str) -> list[str]:
+        """``wp::tile_stack_clear(stack);`` — count := 0 (upstream
+        tile.h:6300; thread 0 writes, barrier brackets the write)."""
+        open_p = src.index("(")
+        close = _find_balanced(src, open_p)
+        sargs = split_args(src[open_p + 1 : close])
+        if len(sargs) != 1:
+            raise TranslationError(f"tile_stack_clear with {len(sargs)} args")
+        sv = self._stack_var(sargs[0].strip(), "tile_stack_clear")
+        if sv.tier == "scalar":
+            return [f"{sv.name}_c = 0;"]
+        self.unit.uses_tile_ops = True
+        self._require_block_dim("wp::tile_stack_clear")
+        self._check_uniform("wp::tile_stack_clear")
+        return [
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"if (_wp_lane == 0) {{ _wp_tile_shr_{sv.count_slot}[0] = 0; }}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _tile_sort(self, src: str) -> list[str]:
+        """``wp::tile_sort(keys, values);`` — in-place ascending key-value
+        sort (upstream tile.h radix sort; the observable contract is: keys
+        ascending, values permuted together, equal-key order unspecified).
+        Bitonic network over the shared arrays — every phase is a strided
+        lane pass closed by a barrier, so each pass is one uniform
+        compare-exchange round.
+
+        Max supported tile size: the padded scratch must fit the 32 KB
+        threadgroup budget shared with every other tile array — for float32
+        keys + int32 payload that is n <= 4096 (two padded arrays of
+        next_pow2(n)); the budget check fails loud beyond it (the launch then
+        also needs the other tiles to fit). Requires power-of-two block_dim
+        (validated at launch) and uniform control flow (checked).
+        """
+        open_p = src.index("(")
+        close = _find_balanced(src, open_p)
+        sargs = split_args(src[open_p + 1 : close])
+        if len(sargs) != 2:
+            raise TranslationError(f"tile_sort with {len(sargs)} args (needs keys, values)")
+        k_t = self._tvar(sargs[0].strip(), "tile_sort")
+        v_t = self._tvar(sargs[1].strip(), "tile_sort")
+        self.unit.uses_tile_ops = True
+        if self.unit.block_dim is None:
+            # plain scalar tier: one-element tiles — the identity
+            if k_t.kind != "scalar" or v_t.kind != "scalar":
+                raise TranslationError("tile_sort on a plain launch lowers per-thread scalar tiles only")
+            return []
+        if k_t.dims != v_t.dims:
+            raise TranslationError(f"tile_sort shape mismatch keys {k_t.dims} values {v_t.dims}")
+        if len(k_t.dims) != 1:
+            raise TranslationError(f"tile_sort over {k_t.dims}: 1-D tiles only in the closure")
+        # upstream places both tiles in shared storage whatever they were
+        # created with; the closure keeps the fail-loud form (the per-thread
+        # scalar carve-out — e.g. a wp.tile(v) broadcast — has no array to
+        # sort; declare the operands with storage="shared" like the Newton
+        # SAP kernel does)
+        if k_t.kind != "shr" or v_t.kind != "shr":
+            raise TranslationError(
+                "tile_sort operands must be shared-storage tiles (storage=\"shared\"): "
+                f"got {'scalar' if k_t.kind != 'shr' else k_t.dims} keys / "
+                f"{'scalar' if v_t.kind != 'shr' else v_t.dims} values"
+            )
+        # padding identity sorts LAST (ascending): the largest value of the
+        # key type, as MSL literal tokens (INT64_MAX and friends are not in
+        # the MSL environment — literals keep the padded scratch compiling)
+        key_pad = _SORT_PAD.get(k_t.elem)
+        if key_pad is None:
+            raise TranslationError(
+                f"tile_sort key element {k_t.elem!r} is outside the closure "
+                "(float32/int32/uint32/int64/uint64 keys only, as upstream)"
+            )
+        bd = self._require_block_dim("wp::tile_sort")
+        self._check_uniform("wp::tile_sort")
+        n = k_t.size
+        karr = f"_wp_tile_shr_{k_t.slot}"
+        varr = f"_wp_tile_shr_{v_t.slot}"
+
+        def _bitonic(arr_k: str, arr_v: str, size: int) -> list[str]:
+            lines = [
+                f"for (int _wp_k = 2; _wp_k <= {size}; _wp_k <<= 1) {{",
+                f"    for (int _wp_j = _wp_k >> 1; _wp_j > 0; _wp_j >>= 1) {{",
+                f"        for (int _wp_t = _wp_lane; _wp_t < {size}; _wp_t += {bd}) {{",
+                "            int _wp_l = _wp_t ^ _wp_j;",
+                "            if (_wp_l > _wp_t) {",
+                "            bool _wp_asc = ((_wp_t & _wp_k) == 0);",
+                f"            if (_wp_asc ? ({arr_k}[_wp_t] > {arr_k}[_wp_l]) : ({arr_k}[_wp_t] < {arr_k}[_wp_l])) {{",
+                f"                {_swap_line(k_t.elem, arr_k, '_wp_t', '_wp_l')}",
+                f"                {_swap_line(v_t.elem, arr_v, '_wp_t', '_wp_l')}",
+                "            }",
+                "            }",
+                "        }",
+                "        threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "    }",
+                "}",
+            ]
+            return lines
+
+        pow2 = n & (n - 1) == 0
+        if pow2 and k_t.is_contig() and v_t.is_contig():
+            # in place: no extra storage
+            return _bitonic(karr, varr, n)
+        # non-power-of-two (or strided view) tiles sort through a padded
+        # scratch: keys pad with the type's max identity (sentinels like
+        # Newton SAP's 1e30 sort past it untouched), payload pads with {}
+        npow = 1
+        while npow < n:
+            npow *= 2
+        ks = self._claim_shr(k_t.elem, npow)
+        vs = self._claim_shr(v_t.elem, npow)
+        sk, sv_arr = f"_wp_tile_shr_{ks}", f"_wp_tile_shr_{vs}"
+        k_lin = k_t.lin_addr("_wp_t", prefix="_wp_sk")
+        v_lin = v_t.lin_addr("_wp_t", prefix="_wp_sv")
+        return [
+            f"for (int _wp_t = _wp_lane; _wp_t < {npow}; _wp_t += {bd}) {{",
+            *(f"    {ln};" for ln in k_lin[0] + v_lin[0]),
+            f"    {sk}[_wp_t] = (_wp_t < {n}) ? {karr}[{k_lin[1]}] : {key_pad};",
+            f"    {sv_arr}[_wp_t] = (_wp_t < {n}) ? {varr}[{v_lin[1]}] : {v_t.elem}{{}};",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            *_bitonic(sk, sv_arr, npow),
+            f"for (int _wp_t = _wp_lane; _wp_t < {n}; _wp_t += {bd}) {{",
+            *(f"    {ln};" for ln in k_lin[0] + v_lin[0]),
+            f"    {karr}[{k_lin[1]}] = {sk}[_wp_t];",
+            f"    {varr}[{v_lin[1]}] = {sv_arr}[_wp_t];",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _meshq_slots_for(self, qvar: str, what: str) -> tuple[int, int]:
+        slots = self.meshq_slots.get(qvar)
+        if slots is None:
+            raise TranslationError(
+                f"{what}: query {qvar!r} has no shared handoff slots "
+                "(no wp::tile_mesh_query_aabb construction reached it)"
+            )
+        return slots
+
+    def _meshq_construct(self, target: str, rhs: str) -> list[str]:
+        """``query = wp::tile_mesh_query_aabb(id, lo, hi);`` — every lane
+        builds its private wp_mesh_query_aabb_t (only lane 0's copy is ever
+        advanced), and lane 0 pre-seeds the shared valid latch so the first
+        ``while tile_query_valid`` test enters the loop (upstream tile_mesh.h
+        pre-seeds last_valid_shared_mem the same way). One face is handed out
+        per _meshq_next call — upstream's CUDA batches block_dim faces per
+        call, the CPU golden hands out one; the visited-face SET is identical
+        and Newton consumes faces independently, so the serial handoff (which
+        matches the CPU golden bit-for-bit) is the closure lowering."""
+        args, _ = self._parse_tile_call(rhs, "tile_mesh_query_aabb", False)
+        if len(args) != 3:
+            raise TranslationError(f"tile_mesh_query_aabb with {len(args)} args (needs id, lower, upper)")
+        self.used_mesh = True
+        self.unit.uses_tile_ops = True
+        lo, hi = self.expr(args[1]), self.expr(args[2])
+        call = f"wp_mesh_query_aabb(_wp_mesh_table[{self.expr(args[0])}], {lo}, {hi})"
+        if self.unit.block_dim is None:
+            # plain scalar tier: each thread drives its own scalar query
+            return [f"{target} = {call};"]
+        self._require_block_dim("wp::tile_mesh_query_aabb")
+        self._check_uniform("wp::tile_mesh_query_aabb")
+        res = self._claim_shr("int", 1)
+        latch = self._claim_shr("int", 1)
+        self.meshq_slots[target] = (res, latch)
+        return [
+            f"{target} = {call};",
+            f"if (_wp_lane == 0) {{ _wp_tile_shr_{latch}[0] = 1; _wp_tile_shr_{res}[0] = -1; }}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _meshq_next(self, target: str, rhs: str) -> list[str]:
+        """``tile = wp::tile_mesh_query_aabb_next(query);`` — lane 0 advances
+        the private iterator one step and latches validity; lane 0 receives
+        the face index, all other lanes receive -1 (upstream's CPU tile
+        carries the index at linear slot 0 and -1 elsewhere — the per-thread
+        untile of a block_dim-wide register tile reads exactly slot
+        lane)."""
+        args, _ = self._parse_tile_call(rhs, "tile_mesh_query_aabb_next", False)
+        if len(args) != 1:
+            raise TranslationError(f"tile_mesh_query_aabb_next with {len(args)} args")
+        qvar = args[0].strip()
+        if self.unit.block_dim is None:
+            # plain scalar tier: the thread's own iterator, upstream CPU form
+            return [
+                f"{{ int _wp_mqi = -1; bool _wp_mqv = wp_mesh_query_aabb_next({qvar}, _wp_mqi);",
+                f"    {qvar}.last_query_valid = _wp_mqv; {target} = _wp_mqi; }}",
+            ]
+        res, latch = self._meshq_slots_for(qvar, "wp::tile_mesh_query_aabb_next")
+        self._require_block_dim("wp::tile_mesh_query_aabb_next")
+        self._check_uniform("wp::tile_mesh_query_aabb_next")
+        return [
+            f"if (_wp_lane == 0) {{ int _wp_mqi = -1;",
+            f"    bool _wp_mqv = wp_mesh_query_aabb_next({qvar}, _wp_mqi);",
+            f"    _wp_tile_shr_{res}[0] = _wp_mqv ? _wp_mqi : -1;",
+            f"    _wp_tile_shr_{latch}[0] = _wp_mqv ? 1 : 0; }}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+            f"{target} = (_wp_lane == 0) ? _wp_tile_shr_{res}[0] : -1;",
+            # trailing barrier before the next advance reuses the slots
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
     def _tile_assign_stmt(self, rhs: str) -> list[str]:
         """``wp::tile_assign(dst, src, offs...)`` — copy src into dst at the
         offset (upstream tile.h:5943). The source is snapshotted into scratch
@@ -2893,6 +3335,22 @@ class _BodyTranslator:
                 args = list(args)
                 args[0] = f"_wp_mesh_table[{self.expr(args[0])}]"
             return f"{route}({', '.join(self.expr(a) for a in args)})"
+        if key == "wp::tile_stack_count":
+            # stack count read: a plain shared-memory read (no barrier —
+            # upstream tile.h:6313 leans on the closing sync of every
+            # count-writing op); safe from a single thread or an `if`, since
+            # the value is uniform across the block
+            sv = self._stack_var(args[0].strip(), "wp::tile_stack_count")
+            return self._stack_count_expr(sv)
+        if key == "wp::tile_query_valid":
+            # latch read: shared slot (cooperative tier) or the per-thread
+            # query's own flag (plain tier); uniform after the producing
+            # op's barrier
+            qvar = args[0].strip()
+            if self.unit.block_dim is None:
+                return f"({qvar}.last_query_valid)"
+            _res, latch = self._meshq_slots_for(qvar, "wp::tile_query_valid")
+            return f"(_wp_tile_shr_{latch}[0] != 0)"
         if key == "wp::tile_extract":
             # Expression-position extract. Shared-storage tiles (including
             # reduction results, which land in their own one-element shared
@@ -3026,6 +3484,14 @@ class _BodyTranslator:
             return ["}"]
         if m := _RE_RETURN.match(line):
             return [f"return {self.expr(m.group(1))};".replace("return ;", "return;")]
+
+        # tile_stack decl (`wp::tile_stack_t<T, C> var = wp::tile_stack_alloc<
+        # T, C>();`): claims the cooperative slots (launch_tiled) or declares
+        # the per-thread locals (plain launch); init arrives with the
+        # wp::tile_stack_init assignment
+        out = self._parse_stack_decl(line)
+        if out is not None:
+            return out
 
         # tile value decls (`wp::tile_register_t<T, layout> var_N = ...{};` /
         # `wp::tile_shared_t<T, layout, B> var_N = wp::tile_alloc_empty<...>();`):
@@ -3310,6 +3776,14 @@ class _BodyTranslator:
                 # lower/upper_solve reach the SSA without the wp:: namespace;
                 # cholesky_solve keeps it
                 return self._tile_solve(target, rhs)
+            if rhs.startswith("wp::tile_stack_init<"):
+                return self._stack_init(target, rhs)
+            if rhs.startswith("wp::tile_stack_push("):
+                return self._stack_push(target, rhs)
+            if rhs.startswith("wp::tile_mesh_query_aabb("):
+                return self._meshq_construct(target, rhs)
+            if rhs.startswith("wp::tile_mesh_query_aabb_next("):
+                return self._meshq_next(target, rhs)
             if rhs.startswith("wp::view("):
                 # `v = wp::view(parent, idx);` — an array-prefix slice
                 # (``parent[i]`` on an N-D array yields an (N-1)-D view over
@@ -3454,6 +3928,14 @@ class _BodyTranslator:
 
         if stripped.startswith("wp::tile_scatter_masked("):
             return self._tile_scatter(stripped)
+        if stripped.startswith("wp::tile_sort("):
+            # in-place key-value sort (the SSA strips the trailing semicolon
+            # below; the parser wants the bare call)
+            return self._tile_sort(stripped.removesuffix(";"))
+        if stripped.startswith("wp::tile_stack_pop("):
+            return self._stack_pop(stripped.removesuffix(";"))
+        if stripped.startswith("wp::tile_stack_clear("):
+            return self._stack_clear(stripped.removesuffix(";"))
         if stripped.startswith("wp::tile_store<"):
             return self._tile_store(stripped)
         if stripped.startswith(("wp::tile_matmul_acc(", "wp::tile_matmul(")):
@@ -3815,6 +4297,15 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
 
     # ---- classify kernel args from the vendored type objects ----
     from ..frontend.codegen import Var as _Var
+    from ..frontend.types import is_tile_stack as _is_tile_stack
+    from ..frontend.types import type_is_struct as _type_is_struct
+
+    # tile_stack payload structs must have their MSL def (and byte-size
+    # fields record) emitted before any stack slot claims its size — the
+    # shared data array stores the struct by value
+    for var in adj.variables:
+        if _is_tile_stack(var.type) and _type_is_struct(var.type.dtype):
+            _emit_struct_def(var.type.dtype, unit, _codegen)
 
     array_args: dict[str, ArgSpec] = {}
     for var in adj.args:

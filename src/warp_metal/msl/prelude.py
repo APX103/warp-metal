@@ -90,19 +90,12 @@ struct wp_arr_meta {
 struct wp_mesh_array { device vec3f* data; wp_arr_meta m; };
 struct wp_mesh_array_i { device int* data; wp_arr_meta m; };
 
-// tiled mesh AABB query (Newton tile_mesh_query_aabb): Phase-1 stub — the
-// query returns state=0 so the `while wp.tile_query_valid(query)` loop never
-// iterates (mesh-vs-convex mid phase pairs cannot exist without real BVH
-// queries, which arrive with M2.1/M2.2)
-struct wp_mesh_query_stub { int state; };
-static inline wp_mesh_query_stub wp_tile_mesh_query_aabb(uint64_t id, vec3f lo, vec3f hi) {
-    wp_mesh_query_stub q;
-    q.state = 0;
-    (void)id; (void)lo; (void)hi;
-    return q;
-}
-static inline bool wp_tile_query_valid(wp_mesh_query_stub q) { return q.state != 0; }
-static inline int wp_tile_mesh_query_aabb_next(wp_mesh_query_stub q) { (void)q; return -1; }
+// tiled mesh AABB query (Newton tile_mesh_query_aabb, KEP-0001 M2.4 P5): the
+// cooperative query reuses the wp_mesh_query_aabb_t iterator below as the
+// lane-0-private traversal state; results hand off to the block through
+// per-kernel threadgroup slots emitted by the translator (_meshq_construct /
+// _meshq_next). The M1 fail-loud stub that used to live here is gone — the
+// real traversal is the wp_mesh_query_aabb/wp_mesh_query_aabb_next pair.
 
 // multi-dim tid decomposition (upstream builtin.h tid(): the launch's _idx
 // is the flat THREAD index; wp_tidN yields the first N coordinates of the
