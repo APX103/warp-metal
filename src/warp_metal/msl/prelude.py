@@ -1149,6 +1149,13 @@ static inline spatial_vectorf wp_atomic_sub_ret_at(device spatial_vectorf* d, wp
     r.v.z = atomic_fetch_sub_explicit((device atomic_float*)(base + 5), v.v.z, memory_order_relaxed);
     return r;
 }
+// wp.atomic_cas on int64: this Metal runtime has no native 64-bit atomic
+// functions (see the 64-bit atomic policy note above); the emulated uint64
+// CAS pair works on the identical two's-complement bit pattern.
+static inline int64_t wp_atomic_cas_ret_at(device int64_t* d, wp_arr_meta m, int i, int64_t expected, int64_t desired) {
+    return (int64_t)wp_atomic_cas_ret_at(
+        (device uint64_t*)d, m, i, (uint64_t)expected, (uint64_t)desired);
+}
 
 // ---- bit ops (builtin.h bit_and/bit_or/bit_xor/lshift/rshift) ----
 static inline int wp_bit_and(int a, int b) { return a & b; }

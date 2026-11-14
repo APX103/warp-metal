@@ -1599,8 +1599,33 @@ def capture_launch(graph, stream=None):
 
 
 def capture_if(condition, on_true=None, on_false=None, stream=None, **kwargs):
-    """Conditional graph nodes are CUDA-graph machinery — fail loudly."""
-    raise NotImplementedError("wp.capture_if is not supported by warp-metal (CUDA-graph construct)")
+    """Upstream-faithful eager branch outside graph capture.
+
+    Upstream semantics: outside a CUDA/APIC capture (the only mode this
+    backend has), ``capture_if`` reads the condition element and invokes the
+    chosen callback eagerly with ``**kwargs``. Graph objects as callbacks
+    (replay inside a recorded conditional) remain the M2.5 boundary and fail
+    loud.
+    """
+    if on_true is None and on_false is None:
+        return
+    if not isinstance(condition, WarpArray) or condition.numpy.dtype != np.int32:
+        raise TypeError("Condition must be a Warp array of int32 with a single element")
+    condition_value = bool(condition.numpy[0])
+    if condition_value:
+        if on_true is None:
+            return
+        if callable(on_true):
+            on_true(**kwargs)
+        else:
+            raise TypeError("on_true must be a Callable or a Graph (Graph replay: Phase 2, M2.5)")
+    else:
+        if on_false is None:
+            return
+        if callable(on_false):
+            on_false(**kwargs)
+        else:
+            raise TypeError("on_false must be a Callable or a Graph (Graph replay: Phase 2, M2.5)")
 
 
 def capture_while(condition, while_body=None, stream=None, **kwargs):

@@ -267,8 +267,21 @@ class TestCapturePassthrough(unittest.TestCase):
         wp.capture_launch(g)  # empty replay: honest no-op
 
     def test_graph_constructs_fail_loud(self):
-        with self.assertRaises(NotImplementedError):
-            wp.capture_if(True)
+        # capture_if outside capture = upstream eager semantics (callable
+        # dispatch on the condition element); Graph callbacks and
+        # capture_while stay the M2.5 boundary and fail loud.
+        cond = wp.zeros(1, dtype=wp.int32, device="metal")
+        called = []
+
+        wp.capture_if(cond, on_true=lambda: called.append(1))
+        self.assertEqual(called, [])
+        wp.capture_if(cond, on_false=lambda: called.append(2))
+        self.assertEqual(called, [2])
+        cond.numpy[0] = 1
+        wp.capture_if(cond, on_true=lambda: called.append(3))
+        self.assertEqual(called, [2, 3])
+        with self.assertRaises(TypeError):
+            wp.capture_if(cond, on_true=object())
         with self.assertRaises(NotImplementedError):
             wp.capture_while(lambda: True)
 

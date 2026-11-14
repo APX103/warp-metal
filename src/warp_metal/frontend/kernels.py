@@ -494,16 +494,30 @@ def func_grad(forward_fn):
 def func_replay(forward_fn):
     """Register the decorated function as the replay variant of ``forward_fn``.
 
-    Forward-only backend: recorded, never used by Metal forward codegen.
+    Mirrors upstream: the replay function is wrapped as a ``Function``
+    (``replay_<key>``) so caller-side inspection of ``custom_replay_func.adj``
+    — deferred parse — sees the upstream object shape. The Metal backend is
+    forward-only: the replay body is parsed but never emitted.
     """
     def wrapper(replay_fn):
-        try:
-            m = _get_module(forward_fn.__module__, forward_fn.__qualname__)
-            target = m.functions.get(codegen.make_full_qualified_name(forward_fn))
-            if target is not None:
-                target.custom_replay_func = replay_fn
-        except Exception:
-            pass
+        m = _get_module(forward_fn.__module__, forward_fn.__qualname__)
+        target = m.functions.get(codegen.make_full_qualified_name(forward_fn))
+        if target is None:
+            return replay_fn  # forward not (yet) registered: record nothing
+        target.custom_replay_func = Function(
+            replay_fn,
+            key=f"replay_{target.key}",
+            namespace=target.namespace,
+            input_types=target.input_types,
+            value_func=target.value_func,
+            export_func=target.export_func,
+            dispatch_func=target.dispatch_func,
+            module=target.module,
+            skip_reverse_codegen=True,
+            skip_adding_overload=True,
+            code_transformers=list(getattr(target.adj, "transformers", None) or []),
+            inline_hint=target.inline_hint,
+        )
         return replay_fn
 
     return wrapper
