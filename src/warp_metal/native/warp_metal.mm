@@ -11,7 +11,8 @@
 //   - runtime MSL -> MTLLibrary compilation, PSO cache is Python-side
 //   - synchronous compute dispatch: eager launches commit and wait per
 //     kernel; capture replay (M2.5) batches consecutive records into one
-//     command buffer via wmm_dispatch_batch
+//     command buffer via wmm_dispatch_batch — kernels as compute sections,
+//     eligible array copies / zero-fills as blit sections on the same CB
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -345,22 +346,57 @@ int wmm_dispatch_tiled(void *pso_handle, void **buffer_handles, uint32_t n_buffe
                           "dispatch_tiled", true);
 }
 
+// One batch record (M2.5): a compute dispatch section or a blit op (buffer
+// copy / zero-fill), executed in array order on one command buffer. Compute
+// records carry the pipeline + buffer bindings (+ thread sizing); blit
+// records carry raw buffer handles with BYTE offsets/sizes — the Python
+// side converts element offsets to bytes (offset_elems included) and has
+// already validated blit eligibility (same device, byte-identical element
+// layout, no overlapping src/dst ranges), segmenting everything else back
+// to the host replay path. The stride is queryable
+// (wmm_batch_record_stride) so the ctypes mirror can fail loud on any ABI
+// drift instead of misreading payload fields.
+#define WMM_KIND_COMPUTE 0
+#define WMM_KIND_COPY 1
+#define WMM_KIND_FILL 2
+
+typedef struct {
+    void *pso;           // compute: pipeline state
+    void **buffers;      // compute: flattened per-record buffer handles
+    void *src;           // blit copy: source buffer
+    void *dst;           // blit copy/fill: destination buffer
+    uint64_t src_off;    // blit copy: source byte offset
+    uint64_t dst_off;    // blit copy/fill: destination byte offset
+    uint64_t nbytes;     // blit: byte count (0 = encode nothing)
+    uint32_t n_buffers;  // compute: handle count
+    uint32_t threads_x;  // compute: grid threads
+    uint32_t tg_x;       // compute: threadgroup size (0 = auto)
+    uint8_t require_tg;  // compute: exact threadgroup size required (tiled)
+    uint8_t kind;        // WMM_KIND_*
+    uint8_t value;       // blit fill: 8-bit pattern (eligible fills: 0)
+} wmm_batch_record;
+
+uint64_t wmm_batch_record_stride(void) {
+    return sizeof(wmm_batch_record);
+}
+
 // Batched dispatch (M2.5 capture replay): one command queue and one command
-// buffer for a whole run of recorded kernels. Record r encodes one compute
-// section over buffer_handles[offset..offset+record_buffer_counts[r])
-// (offset = running sum of the counts) with threads_x[r] threads; Metal
-// executes the sections of a single command buffer in encode order, so
-// record i observes record i-1's writes exactly like the per-dispatch path.
-// Record sizes and threadgroup limits are pre-flighted before the first
-// encode, so those failures still name their record index. Once committed,
-// per-kernel attribution inside one command buffer is impossible — failures
-// report the batch size and record range and point at record-by-record
-// replay (WARP_METAL_BATCH=0 on the Python side) for isolation. One watchdog
-// wait bounds the whole batch; after it returns, shared-storage host reads
-// are exact.
-int wmm_dispatch_batch(void **pso_handles, void **buffer_handles,
-                       uint32_t *record_buffer_counts, uint32_t *threads_x,
-                       uint32_t *tg_x, uint8_t *require_tg, uint32_t n_records) {
+// buffer for a whole run of recorded ops — kernel launches as compute
+// sections, eligible array copies and zero-fills as blit sections
+// (copyFromBuffer / fillBuffer on MTLBlitCommandEncoder). Records execute in
+// array order; Metal runs the encoders of a single command buffer strictly
+// sequentially, so record i observes record i-1's writes exactly like the
+// per-dispatch path, and at most one encoder is open at any time (compute
+// sections merge into one compute encoder, blits into one blit encoder;
+// switching kinds ends the open encoder before the new one starts).
+// Compute record sizes/threadgroup limits and blit handle/bounds/overlap
+// are pre-flighted before the first encode, so those failures still name
+// their record index. Once committed, per-record attribution inside one
+// command buffer is impossible — failures report the batch size and record
+// range and point at record-by-record replay (WARP_METAL_BATCH=0 on the
+// Python side) for isolation. One watchdog wait bounds the whole batch;
+// after it returns, shared-storage host reads are exact.
+int wmm_dispatch_batch(const wmm_batch_record *records, uint32_t n_records) {
     if (n_records == 0) return 0;
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) {
@@ -371,20 +407,66 @@ int wmm_dispatch_batch(void **pso_handles, void **buffer_handles,
     // pre-flight every record: a bad record fails here, attributed to its
     // index, before anything encodes or executes
     for (uint32_t r = 0; r < n_records; r++) {
-        id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pso_handles[r];
-        if (!pso) {
+        const wmm_batch_record *rec = &records[r];
+        if (rec->kind == WMM_KIND_COMPUTE) {
+            id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)rec->pso;
+            if (!pso) {
+                _set_error([NSString stringWithFormat:
+                            @"dispatch_batch: record %u/%u: missing pso", r, n_records]);
+                return -1;
+            }
+            if (rec->tg_x > pso.maxTotalThreadsPerThreadgroup ||
+                (rec->require_tg && rec->tg_x == 0)) {
+                _set_error([NSString stringWithFormat:
+                            @"dispatch_batch: record %u/%u: block_dim %u exceeds the PSO "
+                            @"threadgroup limit %lu%s",
+                            r, n_records, rec->tg_x,
+                            (unsigned long)pso.maxTotalThreadsPerThreadgroup,
+                            rec->require_tg ? "" : " (threadgroup sizes above the limit are invalid)"]);
+                return -3;
+            }
+        } else if (rec->kind == WMM_KIND_COPY || rec->kind == WMM_KIND_FILL) {
+            id<MTLBuffer> src = (__bridge id<MTLBuffer>)rec->src;
+            id<MTLBuffer> dst = (__bridge id<MTLBuffer>)rec->dst;
+            if (!dst || (rec->kind == WMM_KIND_COPY && !src)) {
+                _set_error([NSString stringWithFormat:
+                            @"dispatch_batch: record %u/%u: missing blit buffer", r, n_records]);
+                return -1;
+            }
+            if (rec->dst_off + rec->nbytes > dst.length ||
+                (rec->kind == WMM_KIND_COPY && rec->src_off + rec->nbytes > src.length)) {
+                const BOOL src_over = rec->kind == WMM_KIND_COPY &&
+                                      rec->src_off + rec->nbytes > src.length;
+                _set_error([NSString stringWithFormat:
+                            @"dispatch_batch: record %u/%u: blit %s range (%llu bytes at "
+                            @"offset %llu) exceeds the %s buffer length (%llu)",
+                            r, n_records, src_over ? "source" : "destination",
+                            (unsigned long long)rec->nbytes,
+                            (unsigned long long)(src_over ? rec->src_off : rec->dst_off),
+                            src_over ? "source" : "destination",
+                            (unsigned long long)(src_over ? src.length : dst.length)]);
+                return -3;
+            }
+            if (rec->kind == WMM_KIND_COPY && src == dst &&
+                rec->src_off < rec->dst_off + rec->nbytes &&
+                rec->dst_off < rec->src_off + rec->nbytes) {
+                // overlapping ranges in one buffer have undefined blit
+                // semantics — the Python replay segments these to the host
+                // copy; reaching here means that check was bypassed
+                _set_error([NSString stringWithFormat:
+                            @"dispatch_batch: record %u/%u: overlapping src/dst ranges "
+                            "(%llu..%llu vs %llu..%llu) in one buffer — must replay on the "
+                            "host path",
+                            r, n_records, (unsigned long long)rec->src_off,
+                            (unsigned long long)(rec->src_off + rec->nbytes),
+                            (unsigned long long)rec->dst_off,
+                            (unsigned long long)(rec->dst_off + rec->nbytes)]);
+                return -3;
+            }
+        } else {
             _set_error([NSString stringWithFormat:
-                        @"dispatch_batch: record %u/%u: missing pso", r, n_records]);
+                        @"dispatch_batch: record %u/%u: unknown kind %u", r, n_records, rec->kind]);
             return -1;
-        }
-        if (tg_x[r] > pso.maxTotalThreadsPerThreadgroup || (require_tg[r] && tg_x[r] == 0)) {
-            _set_error([NSString stringWithFormat:
-                        @"dispatch_batch: record %u/%u: block_dim %u exceeds the PSO "
-                        @"threadgroup limit %lu%s",
-                        r, n_records, tg_x[r],
-                        (unsigned long)pso.maxTotalThreadsPerThreadgroup,
-                        require_tg[r] ? "" : " (threadgroup sizes above the limit are invalid)"]);
-            return -3;
         }
     }
 
@@ -404,15 +486,44 @@ int wmm_dispatch_batch(void **pso_handles, void **buffer_handles,
     }
 
     _residency_use(cb);
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    uint64_t offset = 0;
+    // Exactly one encoder open at a time (Metal requires sequential encoders
+    // on one command buffer). Consecutive same-kind records share one
+    // encoder; a kind switch ends the open one before the next starts.
+    id<MTLComputeCommandEncoder> comp = nil;
+    id<MTLBlitCommandEncoder> blit = nil;
+    int open = 0;  // 0 none, 1 compute, 2 blit
     for (uint32_t r = 0; r < n_records; r++) {
-        id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)pso_handles[r];
-        _encode_section(enc, pso, buffer_handles + offset, record_buffer_counts[r],
-                        threads_x[r], tg_x[r]);
-        offset += record_buffer_counts[r];
+        const wmm_batch_record *rec = &records[r];
+        if (rec->kind == WMM_KIND_COMPUTE) {
+            if (open != 1) {
+                if (open == 2) [blit endEncoding];
+                comp = [cb computeCommandEncoder];
+                open = 1;
+            }
+            id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)rec->pso;
+            _encode_section(comp, pso, rec->buffers, rec->n_buffers,
+                            rec->threads_x, rec->tg_x);
+        } else if (rec->nbytes > 0) {  // zero-size blit: encode nothing
+            if (open != 2) {
+                if (open == 1) [comp endEncoding];
+                blit = [cb blitCommandEncoder];
+                open = 2;
+            }
+            if (rec->kind == WMM_KIND_COPY) {
+                [blit copyFromBuffer:(__bridge id<MTLBuffer>)rec->src
+                       sourceOffset:(NSUInteger)rec->src_off
+                           toBuffer:(__bridge id<MTLBuffer>)rec->dst
+                  destinationOffset:(NSUInteger)rec->dst_off
+                               size:(NSUInteger)rec->nbytes];
+            } else {
+                [blit fillBuffer:(__bridge id<MTLBuffer>)rec->dst
+                           range:NSMakeRange((NSUInteger)rec->dst_off, (NSUInteger)rec->nbytes)
+                           value:rec->value];
+            }
+        }
     }
-    [enc endEncoding];
+    if (open == 1) [comp endEncoding];
+    else if (open == 2) [blit endEncoding];
 
     [cb commit];
     if (done != nil) {

@@ -13,6 +13,7 @@ so the vendored Adjoint can extract source.
 import ctypes
 import os
 import unittest
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -323,10 +324,37 @@ class TestCapturePassthrough(unittest.TestCase):
 
 class TestCaptureReplay(unittest.TestCase):
     """M2.5 batched replay: a recorded graph replays equivalent to eager
-    execution, ordering preserved across mixed kernel/fill/copy records, and
-    WARP_METAL_BATCH=0 (record-by-record) agrees with the batched path."""
+    execution, ordering preserved across mixed kernel/copy/fill records
+    (eligible copies and zero fills encode as blit sections on the batch's
+    command buffer), and WARP_METAL_BATCH=0 (record-by-record) agrees with
+    the batched path."""
 
     N = 6
+
+    @staticmethod
+    @contextmanager
+    def _spied_batch():
+        """Replace the native batch wrapper with a recorder and pin batching
+        mode for the wrapped block (the spy tests pin batch-composition
+        semantics, so they must not inherit the ambient WARP_METAL_BATCH
+        escape-hatch setting). Yields the call list; each call is recorded as
+        the list of payload records it dispatched (tuples whose [0] is the
+        kind string)."""
+        from warp_metal import native as mm
+
+        calls = []
+        real = mm.dispatch_batch
+        old = os.environ.get("WARP_METAL_BATCH")
+        os.environ["WARP_METAL_BATCH"] = "1"
+        mm.dispatch_batch = lambda records: calls.append(list(records))
+        try:
+            yield calls
+        finally:
+            if old is None:
+                os.environ.pop("WARP_METAL_BATCH", None)
+            else:
+                os.environ["WARP_METAL_BATCH"] = old
+            mm.dispatch_batch = real
 
     def test_dependency_chain_replay_matches_eager(self):
         # k1 -> k2 -> k3 (k3 consumes both intermediates): the replay must
@@ -428,6 +456,188 @@ class TestCaptureReplay(unittest.TestCase):
             2.0 * (x_np + 1.0),
             np.array([1.0, 2.0], dtype=np.float32),
             3.0 * x_np + 3.0,
+        )
+        for got, want in zip(batched, expected):
+            np.testing.assert_allclose(got, want, rtol=0, atol=1e-6)
+        for b, u in zip(batched, unbatched):
+            np.testing.assert_array_equal(b, u)
+
+    def test_blit_batch_single_native_call(self):
+        # launch + copy + zero_ + launch: the copy and the zero fill are
+        # blit-eligible, so the whole graph replays through ONE native batch
+        # call (compute | copy | fill | compute sections on one command
+        # buffer) instead of the pre-blit two-batch segmentation
+        r_np = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)
+        r = wp.from_numpy(r_np.copy(), device="metal")
+        mid = wp.zeros(5, dtype=wp.float32, device="metal")
+        dst = wp.zeros(5, dtype=wp.float32, device="metal")
+        out = wp.zeros(5, dtype=wp.float32, device="metal")
+        with wp.ScopedCapture() as c:
+            wp.launch(_chain_mul2, 5, inputs=[r, mid], device="metal")  # mid = 2r
+            wp.copy(dst, mid)  # dst = 2r (blit copy at replay)
+            mid.zero_()  # mid = 0 (blit fill at replay)
+            wp.launch(_chain_add1, 5, inputs=[mid, out], device="metal")  # out = 1s
+        with self._spied_batch() as calls:
+            wp.capture_launch(c.graph)  # spied: payload recorded, not executed
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual([r[0] for r in calls[0]], ["compute", "copy", "fill", "compute"])
+        # the fill payload covers the whole mid buffer: 5 float32 = 20 bytes
+        # at buffer offset 0, value 0
+        fill_payload = next(r for r in calls[0] if r[0] == "fill")
+        self.assertEqual(fill_payload[3], 20)
+        self.assertEqual(fill_payload[2], 0)
+        self.assertEqual(fill_payload[4], 0)
+        # spied run did not execute: copy/fill effects must be absent
+        np.testing.assert_array_equal(dst.numpy_view(), np.zeros(5, dtype=np.float32))
+        # real replay (idempotent): now the values land
+        wp.capture_launch(c.graph)
+        np.testing.assert_allclose(dst.numpy_view(), 2.0 * r_np, rtol=0, atol=1e-6)
+        np.testing.assert_allclose(mid.numpy_view(), np.zeros(5, dtype=np.float32), rtol=0, atol=0)
+        np.testing.assert_allclose(out.numpy_view(), np.ones(5, dtype=np.float32), rtol=0, atol=1e-6)
+
+    def test_copy_offsets_blit_matches_eager(self):
+        # slices/views: offset_elems folds into the blit byte offsets on both
+        # sides (plus explicit element offsets and a fill on a slice view).
+        # The destination is poisoned so a dropped copy or fill is caught.
+        src_np = np.arange(10, dtype=np.float32)
+        esrc = wp.from_numpy(src_np.copy(), device="metal")
+        edst = wp.zeros(10, dtype=wp.float32, device="metal")
+        edst.numpy[...] = 9.0
+        wp.copy(edst[3:9], esrc[2:8], dest_offset=1, src_offset=2, count=3)  # dst[4:7] = [4,5,6]
+        ef = edst[7:10]
+        ef.zero_()  # buffer bytes [28:40)
+        efill = wp.zeros(3, dtype=wp.float32, device="metal")
+        efill.numpy[:] = [7.0, 7.0, 7.0]
+        wp.copy(edst[0:3], efill)  # head = [7,7,7]
+
+        csrc = wp.from_numpy(src_np.copy(), device="metal")
+        cdst = wp.zeros(10, dtype=wp.float32, device="metal")
+        cdst.numpy[...] = 9.0
+        cfill = wp.zeros(3, dtype=wp.float32, device="metal")
+        cfill.numpy[:] = [7.0, 7.0, 7.0]
+        with wp.ScopedCapture() as c:
+            wp.copy(cdst[3:9], csrc[2:8], dest_offset=1, src_offset=2, count=3)
+            cf = cdst[7:10]
+            cf.zero_()
+            wp.copy(cdst[0:3], cfill)
+        with self._spied_batch() as calls:
+            wp.capture_launch(c.graph)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual([r[0] for r in calls[0]], ["copy", "fill", "copy"])
+        wp.capture_launch(c.graph)  # real replay (the spied run executed nothing)
+        np.testing.assert_array_equal(cdst.numpy_view(), edst.numpy_view())
+        np.testing.assert_array_equal(
+            cdst.numpy_view(), [7.0, 7.0, 7.0, 9.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0]
+        )
+
+    def test_nonzero_fill_segments_and_replays(self):
+        # fillBuffer is an 8-bit pattern: a non-zero fill is not
+        # batch-eligible — it segments the batch (two native calls, each
+        # compute-only) and applies on the host between them
+        r_np = np.arange(1.0, 5.0, dtype=np.float32)
+        r = wp.from_numpy(r_np.copy(), device="metal")
+        mid = wp.zeros(4, dtype=wp.float32, device="metal")
+        out = wp.zeros(4, dtype=wp.float32, device="metal")
+        with wp.ScopedCapture() as c:
+            wp.launch(_chain_mul2, 4, inputs=[r, mid], device="metal")  # mid = 2r
+            mid.fill_(2.5)  # mid = 2.5 (host op, splits the batch)
+            wp.launch(_chain_add1, 4, inputs=[mid, out], device="metal")  # out = 3.5
+        with self._spied_batch() as calls:
+            wp.capture_launch(c.graph)  # spied: batch recorded, not executed
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual([[r[0] for r in c] for c in calls], [["compute"], ["compute"]])
+        wp.capture_launch(c.graph)  # real replay (idempotent)
+        np.testing.assert_allclose(mid.numpy_view(), np.full(4, 2.5, dtype=np.float32), rtol=0, atol=1e-6)
+        np.testing.assert_allclose(out.numpy_view(), np.full(4, 3.5, dtype=np.float32), rtol=0, atol=1e-6)
+
+    def test_composite_copy_blit_matches_eager(self):
+        # composite dtypes (vec3 / quat arrays): same dtype means the same
+        # byte-identical dense element layout, so the byte-range blit copy
+        # is exact — encoded GPU-side (one batch, 'copy' section)
+        v_np = np.arange(9, dtype=np.float32).reshape(3, 3)
+        q_np = np.array([[0.0, 0.0, 0.0, 1.0], [0.5, 0.5, 0.5, 0.5]], dtype=np.float32)
+        ev = wp.from_numpy(v_np.copy(), dtype=wp.vec3, device="metal")
+        ev_dst = wp.zeros(3, dtype=wp.vec3, device="metal")
+        eq = wp.from_numpy(q_np.copy(), dtype=wp.quat, device="metal")
+        eq_dst = wp.zeros(2, dtype=wp.quat, device="metal")
+        wp.copy(ev_dst, ev)
+        wp.copy(eq_dst, eq)
+
+        cv = wp.from_numpy(v_np.copy(), dtype=wp.vec3, device="metal")
+        cv_dst = wp.zeros(3, dtype=wp.vec3, device="metal")
+        cq = wp.from_numpy(q_np.copy(), dtype=wp.quat, device="metal")
+        cq_dst = wp.zeros(2, dtype=wp.quat, device="metal")
+        with wp.ScopedCapture() as c:
+            wp.copy(cv_dst, cv)
+            wp.copy(cq_dst, cq)
+        with self._spied_batch() as calls:
+            wp.capture_launch(c.graph)
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual([r[0] for r in calls[0]], ["copy", "copy"])
+        wp.capture_launch(c.graph)  # real replay (the spied run executed nothing)
+        np.testing.assert_allclose(cv_dst.numpy_view(), ev_dst.numpy_view(), rtol=0, atol=0)
+        np.testing.assert_allclose(cq_dst.numpy_view(), eq_dst.numpy_view(), rtol=0, atol=0)
+
+    def test_overlapping_copy_segments_to_host(self):
+        # overlapping src/dst ranges in one buffer have undefined blit
+        # semantics: the copy segments to the host numpy copy (no 'copy'
+        # section reaches the batch) and still replays correctly
+        base_np = np.arange(8, dtype=np.float32)
+        ebase = wp.from_numpy(base_np.copy(), device="metal")
+        wp.copy(ebase[2:8], ebase[0:6])  # shifts elements 0..5 up by 2
+        cbase = wp.from_numpy(base_np.copy(), device="metal")
+        filler = wp.zeros(2, dtype=wp.float32, device="metal")
+        with wp.ScopedCapture() as c:
+            wp.launch(_chain_mul2, 2, inputs=[filler, filler], device="metal")  # opens a batch
+            wp.copy(cbase[2:8], cbase[0:6])  # overlapping: host path at replay
+            wp.launch(_chain_mul2, 2, inputs=[filler, filler], device="metal")
+        with self._spied_batch() as calls:
+            wp.capture_launch(c.graph)  # host copy applies between the spied batches
+        self.assertEqual(len(calls), 2, calls)
+        self.assertEqual([[r[0] for r in c] for c in calls], [["compute"], ["compute"]])
+        np.testing.assert_array_equal(cbase.numpy_view(), ebase.numpy_view())
+
+    def test_batched_vs_unbatched_mixed_graph(self):
+        # mixed kernel/copy/zero_ graph: the batched path (blit sections in
+        # one command buffer) and WARP_METAL_BATCH=0 (record-by-record, host
+        # copy/fill) must produce identical buffers
+        def run(env_value):
+            old = os.environ.get("WARP_METAL_BATCH")
+            os.environ["WARP_METAL_BATCH"] = env_value
+            try:
+                x = wp.from_numpy(np.arange(1, self.N + 1, dtype=np.float32), device="metal")
+                t1 = wp.zeros(self.N, dtype=wp.float32, device="metal")
+                t2 = wp.zeros(self.N, dtype=wp.float32, device="metal")
+                dst = wp.zeros(self.N, dtype=wp.float32, device="metal")
+                out = wp.zeros(self.N, dtype=wp.float32, device="metal")
+                with wp.ScopedCapture() as c:
+                    wp.launch(_chain_add1, self.N, inputs=[x, t1], device="metal")  # t1 = x+1
+                    wp.copy(dst, t1)  # dst = x+1
+                    t2.zero_()  # t2 = 0 before the next kernel
+                    wp.launch(_chain_mul2, self.N, inputs=[t1, t2], device="metal")  # t2 = 2(x+1)
+                    wp.launch(_chain_add2, self.N, inputs=[dst, t2, out], device="metal")  # 3(x+1)
+                self.assertEqual(c.graph.n_ops, 5)
+                wp.capture_launch(c.graph)
+                return (
+                    t1.numpy.copy(),
+                    t2.numpy.copy(),
+                    dst.numpy.copy(),
+                    out.numpy.copy(),
+                )
+            finally:
+                if old is None:
+                    os.environ.pop("WARP_METAL_BATCH", None)
+                else:
+                    os.environ["WARP_METAL_BATCH"] = old
+
+        batched = run("1")
+        unbatched = run("0")
+        x_np = np.arange(1, self.N + 1, dtype=np.float32)
+        expected = (
+            x_np + 1.0,
+            2.0 * (x_np + 1.0),
+            x_np + 1.0,
+            3.0 * (x_np + 1.0),
         )
         for got, want in zip(batched, expected):
             np.testing.assert_allclose(got, want, rtol=0, atol=1e-6)

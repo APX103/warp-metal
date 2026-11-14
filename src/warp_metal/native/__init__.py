@@ -20,6 +20,31 @@ from .build_native import DYLIB
 _LIB = None
 _LOCK = threading.Lock()
 
+# wmm_batch_record kind tags (warp_metal.mm); Python payload tuples use the
+# readable strings, marshalled here
+_KIND = {"compute": 0, "copy": 1, "fill": 2}
+
+
+class _BatchRecord(ctypes.Structure):
+    """ctypes mirror of the native ``wmm_batch_record`` (one replay-batch
+    record: a compute dispatch section or a blit copy / zero-fill)."""
+
+    _fields_ = [
+        ("pso", ctypes.c_void_p),        # compute: pipeline state
+        ("buffers", ctypes.POINTER(ctypes.c_void_p)),  # compute: handle array
+        ("src", ctypes.c_void_p),        # blit copy: source buffer
+        ("dst", ctypes.c_void_p),        # blit copy/fill: destination buffer
+        ("src_off", ctypes.c_uint64),    # blit copy: source byte offset
+        ("dst_off", ctypes.c_uint64),    # blit copy/fill: destination byte offset
+        ("nbytes", ctypes.c_uint64),     # blit: byte count (0 = encode nothing)
+        ("n_buffers", ctypes.c_uint32),  # compute: handle count
+        ("threads_x", ctypes.c_uint32),  # compute: grid threads
+        ("tg_x", ctypes.c_uint32),       # compute: threadgroup size (0 = auto)
+        ("require_tg", ctypes.c_uint8),  # compute: exact-tg flag (tiled)
+        ("kind", ctypes.c_uint8),        # _KIND_*
+        ("value", ctypes.c_uint8),       # blit fill: 8-bit pattern (0)
+    ]
+
 
 def _load() -> ctypes.CDLL:
     global _LIB
@@ -77,14 +102,19 @@ def _load() -> ctypes.CDLL:
                 ]
                 lib.wmm_dispatch_batch.restype = ctypes.c_int
                 lib.wmm_dispatch_batch.argtypes = [
-                    ctypes.POINTER(ctypes.c_void_p),  # per-record PSO handles
-                    ctypes.POINTER(ctypes.c_void_p),  # flattened buffer handles
-                    ctypes.POINTER(ctypes.c_uint32),  # per-record buffer counts
-                    ctypes.POINTER(ctypes.c_uint32),  # per-record thread counts
-                    ctypes.POINTER(ctypes.c_uint32),  # per-record threadgroup sizes (0 = auto)
-                    ctypes.POINTER(ctypes.c_uint8),   # per-record exact-tg-required flags (tiled)
-                    ctypes.c_uint32,                  # record count
+                    ctypes.POINTER(_BatchRecord),  # per-record payloads (kind-tagged)
+                    ctypes.c_uint32,               # record count
                 ]
+                lib.wmm_batch_record_stride.restype = ctypes.c_uint64
+                lib.wmm_batch_record_stride.argtypes = []
+                # ABI guard: a stride mismatch would silently misread every
+                # record payload — fail loud at load instead
+                native_stride = int(lib.wmm_batch_record_stride())
+                if native_stride != ctypes.sizeof(_BatchRecord):
+                    raise RuntimeError(
+                        f"wmm_batch_record ABI mismatch: native stride {native_stride}, "
+                        f"ctypes mirror {ctypes.sizeof(_BatchRecord)} — rebuild the dylib"
+                    )
                 lib.wmm_synchronize.restype = None
                 lib.wmm_synchronize.argtypes = []
                 _LIB = lib
@@ -184,29 +214,64 @@ def dispatch_tiled(pso_handle, buffer_handles, threads_x: int, tg_x: int) -> Non
 
 def dispatch_batch(records) -> None:
     """Batched dispatch: one command queue + one command buffer for a whole
-    run of ``(pso_handle, buffer_handles, threads_x, tg_x, require_tg)``
-    records (capture replay).
+    run of kind-tagged records (capture replay):
 
-    Records encode as consecutive compute sections and complete under a
-    single commit + watchdog wait (WARP_METAL_DISPATCH_TIMEOUT_S, default
-    scaled by the record count; 0 disables). Sections execute in list order,
-    so record i observes record i-1's writes exactly like per-record
-    dispatch. Per-record attribution inside one command buffer is impossible
-    — a failure names the batch; replay with ``WARP_METAL_BATCH=0``
-    (host-runtime escape hatch) to isolate the faulting record.
+      - ``("compute", pso, buffer_handles, threads_x, tg_x, require_tg)``
+        — a kernel launch, encoded as a compute section;
+      - ``("copy", src_handle, dst_handle, src_off_b, dst_off_b, nbytes)``
+        — an array-to-array copy, encoded on a blit encoder (byte
+        offsets/size, offset_elems already folded in by the caller);
+      - ``("fill", dst_handle, off_b, nbytes, 0)`` — a zero fill on a blit
+        encoder (``fillBuffer`` takes an 8-bit pattern, so only zero fills
+        are batch-eligible; the caller segments anything else).
+
+    Records encode in list order (compute sections merge into one compute
+    encoder, blits into one blit encoder; never two open at once) and
+    complete under a single commit + watchdog wait
+    (WARP_METAL_DISPATCH_TIMEOUT_S, default scaled by the record count; 0
+    disables). Sections execute sequentially, so record i observes record
+    i-1's writes exactly like per-record dispatch. Per-record attribution
+    inside one command buffer is impossible — a failure names the batch;
+    replay with ``WARP_METAL_BATCH=0`` (host-runtime escape hatch) to
+    isolate the faulting record.
     """
     if not records:
         return
     n = len(records)
-    pso_arr = (ctypes.c_void_p * n)(*(r[0] for r in records))
-    flat = (ctypes.c_void_p * sum(len(r[1]) for r in records))(
-        *(h for r in records for h in r[1])
-    )
-    counts = (ctypes.c_uint32 * n)(*(len(r[1]) for r in records))
-    threads = (ctypes.c_uint32 * n)(*(r[2] for r in records))
-    tgs = (ctypes.c_uint32 * n)(*(r[3] for r in records))
-    reqs = (ctypes.c_uint8 * n)(*(r[4] for r in records))
-    rc = _load().wmm_dispatch_batch(pso_arr, flat, counts, threads, tgs, reqs, n)
+    payload = (_BatchRecord * n)()
+    handle_arrays = []  # keep per-compute-record handle arrays alive for the call
+    for i, rec in enumerate(records):
+        kind = rec[0]
+        entry = payload[i]
+        if kind == "compute":
+            _, pso, handles, threads_x, tg_x, require_tg = rec
+            harr = (ctypes.c_void_p * len(handles))(*handles)
+            handle_arrays.append(harr)
+            entry.pso = pso
+            entry.buffers = ctypes.cast(harr, ctypes.POINTER(ctypes.c_void_p))
+            entry.n_buffers = len(handles)
+            entry.threads_x = threads_x
+            entry.tg_x = tg_x
+            entry.require_tg = require_tg
+            entry.kind = _KIND["compute"]
+        elif kind == "copy":
+            _, src, dst, src_off, dst_off, nbytes = rec
+            entry.src = src
+            entry.dst = dst
+            entry.src_off = src_off
+            entry.dst_off = dst_off
+            entry.nbytes = nbytes
+            entry.kind = _KIND["copy"]
+        elif kind == "fill":
+            _, dst, off, nbytes, value = rec
+            entry.dst = dst
+            entry.dst_off = off
+            entry.nbytes = nbytes
+            entry.value = value
+            entry.kind = _KIND["fill"]
+        else:
+            raise ValueError(f"dispatch_batch: unknown record kind {kind!r}")
+    rc = _load().wmm_dispatch_batch(payload, n)
     if rc != 0:
         raise MetalError(_load().wmm_last_error().decode())
 

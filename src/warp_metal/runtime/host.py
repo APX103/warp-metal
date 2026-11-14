@@ -13,8 +13,9 @@ Built on the M0.4 prototype:
   - ``launch`` with the upstream signature (adjoint kwargs fail loudly)
   - graph capture (``capture_begin``/``capture_end``/``capture_launch``):
     launches inside a capture are recorded, not executed; ``capture_launch``
-    replays the records in order, batching consecutive kernel records into
-    one Metal command buffer per run
+    replays the records in order, batching consecutive kernel records plus
+    eligible copies / zero fills into one Metal command buffer per run
+    (kernels as compute sections, copies/zero-fills as blit sections)
   - ``init``/``synchronize``/device module
 
 Arrays live in unified memory regardless of the allocating device, so a
@@ -1636,8 +1637,9 @@ def launch(
 # ---------------------------------------------------------------------------
 # graph capture (record/replay): ops inside capture_begin..capture_end are
 # appended to a record list instead of executing; capture_launch re-executes
-# the records in order, batching consecutive kernel records into one command
-# buffer per run
+# the records in order, batching consecutive eligible records (kernels,
+# array copies, zero fills) into one command buffer per run — compute
+# sections plus blit sections, one commit + one watchdog wait per batch
 # ---------------------------------------------------------------------------
 
 
@@ -1739,11 +1741,14 @@ class ScopedCapture:
     launches, ``zero_``/``fill_``, ``wp.copy``/``clone`` and CPU-fallback
     launches inside the block are appended to ``c.graph`` in order and are
     NOT executed here (deferred until replay, like a CUDA capture).
-    ``wp.capture_launch(c.graph)`` executes the records: consecutive kernel
-    records replay through one Metal command buffer (single commit + watchdog
-    wait per run); fill/copy/fallback records are host ops that split the
-    batch. One documented divergence from upstream: a fill also writes its
-    array immediately at record time (shared storage makes that harmless, and
+    ``wp.capture_launch(c.graph)`` executes the records: consecutive
+    batch-eligible records replay through one Metal command buffer (single
+    commit + watchdog wait per run) — kernels as compute sections, eligible
+    copies and zero fills as blit sections on the same command buffer.
+    Non-zero fills, copies that fail blit eligibility (overlapping ranges,
+    cross-device) and fallback ports are host ops that split the batch.
+    One documented divergence from upstream: a fill also writes its array
+    immediately at record time (shared storage makes that harmless, and
     replay re-runs it in order).
     """
 
@@ -1809,16 +1814,73 @@ def capture_end(device=None, stream=None) -> Graph:
 def _batching_enabled() -> bool:
     """``WARP_METAL_BATCH=0`` replays record-by-record (one commit+wait per
     dispatch, the pre-batching path) for fault triage; any other value — or
-    unset — batches consecutive kernel records into one command buffer."""
+    unset — batches consecutive records into one command buffer."""
     return os.environ.get("WARP_METAL_BATCH", "") != "0"
 
 
+def _blit_payload(record):
+    """GPU-side blit payload for a ``"copy"``/``"fill"`` graph record, or
+    None when the record must stay on the host replay path (splitting the
+    batch). Element offsets/sizes become buffer byte offsets/sizes —
+    ``offset_elems`` (sliced/row views share the base buffer) folds in on
+    both sides.
+
+    Eligibility (commit-2 brief; anything else segments to the host path,
+    preserving the pre-batching behavior):
+    - fill: value must be an exact zero (``fillBuffer`` takes an 8-bit
+      pattern; a non-zero or ``-0.0`` float pattern is not representable —
+      Newton's captured fills are zero re-zeroings). Zero-size ranges are
+      eligible but encode nothing.
+    - copy: same device (single-device runtime — checked anyway), same
+      dtype/element size (``wp.copy`` enforces equal dtypes at record time,
+      and runtime arrays are dense row-major, so equal dtype means
+      byte-identical element layout and the byte range copy is exact), and
+      no overlapping src/dst byte ranges within one buffer (blit aliasing
+      is undefined — those go back to the host numpy copy).
+    """
+    kind = record[0]
+    if kind == "fill":
+        _, arr, value = record
+        if isinstance(value, (bool, np.bool_)):
+            zero = not value
+        elif isinstance(value, (int, np.integer)):
+            zero = value == 0
+        elif isinstance(value, (float, np.floating)):
+            # -0.0 compares equal to zero but its float bit pattern is not
+            # 0x00 — a blit fill would corrupt it; host path
+            zero = value == 0.0 and not np.signbit(value)
+        else:
+            zero = False
+        if not zero:
+            return None
+        return ("fill", arr.buffer, arr.offset_elems * arr.item_bytes,
+                arr.n * arr.item_bytes, 0)
+    if kind == "copy":
+        _, dest, src, dest_offset, src_offset, count = record
+        if dest.device != src.device:
+            return None
+        if dest.dtype != src.dtype or dest.item_bytes != src.item_bytes:
+            return None
+        n = src.n - src_offset if count is None else int(count)
+        if n < 0:
+            return None  # unreachable (wp.copy validates); host path anyway
+        src_off = (src.offset_elems + src_offset) * src.item_bytes
+        dst_off = (dest.offset_elems + dest_offset) * dest.item_bytes
+        nbytes = n * dest.item_bytes
+        if src.buffer == dest.buffer and (
+            src_off < dst_off + nbytes and dst_off < src_off + nbytes
+        ):
+            return None  # overlapping ranges in one buffer: host copy
+        return ("copy", src.buffer, dest.buffer, src_off, dst_off, nbytes)
+    return None
+
+
 def _replay_batch(batch, base_index: int, total: int) -> None:
-    """Replay one run of consecutive kernel records through a single command
-    buffer (``wmm_dispatch_batch``). On native failure, extend the error with
-    the graph-record range the run covered (the native message already
-    reports the batch size and points at record-by-record replay for
-    isolation)."""
+    """Replay one run of consecutive batch-eligible records (compute
+    sections + blit copy/zero-fill) through a single command buffer
+    (``wmm_dispatch_batch``). On native failure, extend the error with the
+    graph-record range the run covered (the native message already reports
+    the batch size and points at record-by-record replay for isolation)."""
     try:
         _mm.dispatch_batch(batch)
     except _mm.MetalError as e:
@@ -1831,11 +1893,14 @@ def _replay_batch(batch, base_index: int, total: int) -> None:
 def capture_launch(graph, stream=None):
     """Replay a captured graph: execute every recorded operation in order.
 
-    Consecutive ``"metal"`` records replay through one command buffer (single
-    commit + watchdog wait per run — this is what gives a captured Newton
-    step its one-commit replay). ``fill``/``copy``/``fallback`` records are
-    host operations: they split the batch, applying their host side effects
-    between batch waits so record order is preserved exactly.
+    Consecutive batch-eligible records replay through one command buffer
+    (single commit + watchdog wait per run — this is what gives a captured
+    Newton steel step its one-commit replay): kernel records encode as
+    compute sections, eligible copies and zero fills as blit sections on
+    the same command buffer (``_blit_payload`` decides; ineligible copies /
+    non-zero fills / fallback ports are host operations that split the
+    batch, applying their host side effects between batch waits so record
+    order is preserved exactly).
     ``WARP_METAL_BATCH=0`` replays record-by-record (one commit+wait per
     dispatch, the pre-batching path) for fault triage.
     """
@@ -1845,13 +1910,20 @@ def capture_launch(graph, stream=None):
         batch_base = 0
         for index, record in enumerate(records):
             kind = record[0]
-            if kind == "metal" and _batching_enabled():
-                _, pso, handles, threads, block_dim, _owned, _refs, tiled = record
-                # native record: (pso, handles, threads, tg, require_tg) —
-                # plain launches keep the auto threadgroup size (tg 0), tiled
-                # launches pin block_dim and require it exactly
-                batch.append((pso, handles, threads, block_dim if tiled else 0, 1 if tiled else 0))
-                continue
+            if _batching_enabled():
+                if kind == "metal":
+                    _, pso, handles, threads, block_dim, _owned, _refs, tiled = record
+                    # compute record: (pso, handles, threads, tg, require_tg) —
+                    # plain launches keep the auto threadgroup size (tg 0), tiled
+                    # launches pin block_dim and require it exactly
+                    batch.append(("compute", pso, handles, threads,
+                                  block_dim if tiled else 0, 1 if tiled else 0))
+                    continue
+                if kind in ("copy", "fill"):
+                    blit = _blit_payload(record)
+                    if blit is not None:
+                        batch.append(blit)
+                        continue
             if batch:
                 _replay_batch(batch, batch_base, len(records))
                 batch = []
