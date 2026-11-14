@@ -514,6 +514,40 @@ class TestTileModelPins(unittest.TestCase):
             self._translate(k_uniform, BD)
         self.assertIn("non-uniform control flow", str(ctx.exception))
 
+    def test_uniformity_compile_time_condition_exempt(self):
+        # steel hinv_jt's `if COMPUTE_DIAG != 0:` — wp.constant folds to a
+        # compile-time test (`const var = 1;` then `test = (var != 0)` in the
+        # SSA), so every lane of the block reaches the same branch decision
+        # and the cooperative op's barriers cannot diverge. The branch stays
+        # in the emission (the fold exempts the checkpoint, it never rewrites
+        # the SSA); runtime-variable conditions keep the fail-loud rejection.
+        COMPUTE_DIAG = wp.constant(1)
+        WRITE_GROUP = wp.constant(0)
+
+        @wp.kernel
+        def k_const_if(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            t = wp.tile_load(a, shape=(BD,), storage="shared")
+            if COMPUTE_DIAG != 0:
+                wp.tile_store(out, wp.tile_sum(t))
+            if WRITE_GROUP != 0:
+                wp.tile_store(out, t)
+
+        u = self._translate(k_const_if, BD)
+        src = u.source()
+        # both branches survive emission, still guarded by their test vars
+        self.assertIn("if (", src)
+        self.assertIn("threadgroup_barrier", src)
+
+        @wp.kernel
+        def k_runtime_if(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            t = wp.tile_load(a, shape=(BD,), storage="shared")
+            if wp.tid() == 0:
+                wp.tile_store(out, wp.tile_sum(t))
+
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._translate(k_runtime_if, BD)
+        self.assertIn("non-uniform control flow", str(ctx.exception))
+
     def test_plain_launch_routes_to_scalar(self):
         # plain launch without block_dim: per-thread degenerate lowering (the
         # Newton non-CUDA block_dim=1 convention, the semantics every

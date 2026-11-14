@@ -1100,12 +1100,17 @@ class _BodyTranslator:
         # stores emit `int _wp_s{N}` OUTSIDE any loop scope — two stores in
         # one kernel must not redeclare the same name)
         self._store_uid = 0
-        # lexically open braces, ["if" | "loop", ...]: cooperative tile ops
-        # (barrier emitters) must sit in uniform control flow — a reduce /
-        # scatter / shared-fill site lexically inside an `if` fails loud
-        # (upstream relies on documentation discipline; KEP-0001 M2.4 adds
-        # the translation-time checkpoint)
+        # lexically open braces, ["if" | "if-const" | "loop", ...]: cooperative
+        # tile ops (barrier emitters) must sit in uniform control flow — a
+        # reduce / scatter / shared-fill site lexically inside an `if` fails
+        # loud unless the branch condition folds to a compile-time constant
+        # (block-uniform by construction; see _check_uniform). Upstream relies
+        # on documentation discipline; KEP-0001 M2.4 adds the translation-time
+        # checkpoint.
         self._block_stack: list[str] = []
+        # compile-time folds of SSA vars (wp.constant materialization chain):
+        # name -> folded value, fed by _const_note, read by _const_eval
+        self._const_vars: dict[str, object] = {}
         # SSA vars holding a loaded wp_mesh points stub (dead mesh branch —
         # see _alias / the wp::load branch)
         self.mesh_stub_vars: set[str] = set()
@@ -1176,14 +1181,127 @@ class _BodyTranslator:
             )
         return self.unit.block_dim
 
+    # -- compile-time constant folding (uniformity-checkpoint exemption) -----
+
+    _CONST_BINOPS: tuple[tuple[str, object], ...] = (
+        ("!=", lambda a, b: a != b),
+        ("==", lambda a, b: a == b),
+        (">=", lambda a, b: a >= b),
+        ("<=", lambda a, b: a <= b),
+        ("&&", lambda a, b: bool(a) and bool(b)),
+        ("||", lambda a, b: bool(a) or bool(b)),
+        (">", lambda a, b: a > b),
+        ("<", lambda a, b: a < b),
+        ("+", lambda a, b: a + b),
+        ("-", lambda a, b: a - b),
+        ("*", lambda a, b: a * b),
+    )
+
+    @staticmethod
+    def _split_top_op(expr: str, op: str) -> list[str]:
+        """Split expr at top-level occurrences of op (outside parens and
+        brackets); returns the operand segments (len 1 when absent)."""
+        segs: list[str] = []
+        cur: list[str] = []
+        depth = 0
+        i = 0
+        while i < len(expr):
+            ch = expr[i]
+            if ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth -= 1
+            if depth == 0 and expr.startswith(op, i):
+                segs.append("".join(cur))
+                cur = []
+                i += len(op)
+                continue
+            cur.append(ch)
+            i += 1
+        segs.append("".join(cur))
+        return segs
+
+    @staticmethod
+    def _paren_atom(expr: str) -> bool:
+        """True when expr is one paren group: the first `(`'s matching `)` is
+        the final char (`(a != b)` yes, `(int)(x)` no)."""
+        depth = 0
+        for i, ch in enumerate(expr):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i == len(expr) - 1
+        return False
+
+    def _const_eval(self, expr: str):
+        """Fold an SSA expression to a compile-time constant, or None.
+
+        wp.constant(N) materializes as ``const t var = N;`` and derived tests
+        as ``var = (const != const);`` — every leaf resolves, so the value is
+        block-uniform. Any runtime leaf (array load, wp.tid, SSA var without
+        a tracked fold) makes the whole expression None: the fold must never
+        claim constancy it cannot prove."""
+        e = expr.strip()
+        if e in self._const_vars:
+            return self._const_vars[e]
+        if re.fullmatch(r"-?\d+", e):
+            return int(e)
+        if re.fullmatch(r"-?\d*\.\d+f?", e):
+            return float(e.rstrip("f"))
+        if e == "true":
+            return True
+        if e == "false":
+            return False
+        if e.startswith("(") and e.endswith(")") and self._paren_atom(e):
+            return self._const_eval(e[1:-1])
+        if e.startswith("!"):
+            v = self._const_eval(e[1:])
+            return None if v is None else not v
+        for op, fn in self._CONST_BINOPS:
+            segs = self._split_top_op(e, op)
+            if len(segs) > 1:
+                vals = [self._const_eval(s) for s in segs]
+                if any(v is None for v in vals):
+                    return None
+                out = vals[0]
+                for v in vals[1:]:
+                    out = fn(out, v)
+                return out
+        return None
+
+    def _const_note(self, stripped: str) -> None:
+        """Track SSA vars whose value folds at compile time (the wp.constant
+        materialization chain: const literal decls, literal folds of tracked
+        vars, and plain copies of tracked vars)."""
+        m = re.match(r"^const [\w:]+ (\w+) = (.*?);?$", stripped)
+        if m is None:
+            m = re.match(r"^(?:bool|int|float)\w* (\w+) = (.*?);?$", stripped)
+        if m is None:
+            m = re.match(r"^(\w+) = (.*?);?$", stripped)
+        if m is None:
+            return
+        name, rhs = m.group(1), m.group(2)
+        value = self._const_eval(rhs)
+        if value is None or (name in self._const_vars and self._const_vars[name] != value):
+            # not foldable, or an SSA reassignment that changes the value:
+            # the var must not be trusted as constant
+            self._const_vars.pop(name, None)
+            return
+        self._const_vars[name] = value
+
     def _check_uniform(self, what: str) -> None:
         """Barrier-uniformity checkpoint: cooperative tile ops emit
         threadgroup barriers, which diverge if any lane takes a different
         control-flow path. Upstream documents the discipline; this rejects
-        the lexically-nested case at translation time. Single-lane
-        threadgroups (Newton's non-CUDA block_dim=1 convention) cannot
-        diverge — their barriers are vacuous — so the checkpoint does not
-        apply there."""
+        the lexically-nested case at translation time — except branches
+        whose condition folds to a compile-time constant (wp.constant
+        derives, e.g. steel's ``if COMPUTE_DIAG != 0:``): every lane folds
+        the same value, so the branch is taken or skipped block-wide and
+        cannot diverge. Single-lane threadgroups (Newton's non-CUDA
+        block_dim=1 convention) cannot diverge — their barriers are vacuous
+        — so the checkpoint does not apply there either."""
         if self.unit.block_dim == 1:
             return
         if "if" in self._block_stack:
@@ -2823,6 +2941,7 @@ class _BodyTranslator:
         stripped = line.strip()
         if not stripped or stripped.startswith("//"):
             return []
+        self._const_note(stripped)
 
         # control flow: label/goto → while(true)/break/continue
         if m := _RE_LABEL.match(line):
@@ -2841,7 +2960,12 @@ class _BodyTranslator:
             return [_RE_ITER.sub(lambda mo: f"wp_{mo.group(1)}(", out)]
         if m := _RE_IF_OPEN.match(line):
             cond = m.group(1).strip()
-            self._block_stack.append("if")
+            # a compile-time-constant condition (the wp.constant fold — e.g.
+            # steel's `if COMPUTE_DIAG != 0:`) reaches every lane of the block
+            # with the same value: the branch is taken or skipped block-wide,
+            # so barriers inside it cannot diverge. Only runtime-variable
+            # conditions mark the enclosing scope non-uniform.
+            self._block_stack.append("if-const" if self._const_eval(cond) is not None else "if")
             # array truthiness (`if arr:` — upstream emits `if (array_var)`
             # via array_t's non-null data check; warp-metal binds a real
             # buffer even for None args, so truthiness reads the meta's
