@@ -20,8 +20,13 @@ Built on the M0.4 prototype:
 
 Arrays live in unified memory regardless of the allocating device, so a
 ``"cpu"`` array is directly usable by Metal kernels — the foundation for
-per-builtin CPU fallback routing (M1.3). Whole-kernel CPU execution (LLVM
-path) is not wired yet; launching on "cpu" fails loudly.
+per-builtin CPU fallback routing (M1.3). Explicit ``"cpu"`` launches run
+the same pipeline: kernels with a verified CPU port (``host_fallback``)
+execute their port; everything else lowers to MSL with the per-thread
+scalar tile semantics upstream's CPU path forces (``block_dim`` resolves
+to 1, ``context.py _resolve_launch_block_dim``). Whole-kernel CPU
+execution (LLVM path) stays unwired — a cpu launch is not a separate
+executor, it is the metal pipeline over shared storage.
 """
 
 from __future__ import annotations
@@ -57,6 +62,7 @@ from ..frontend.types import (
     vec2i,
     vec3i,
     vec4i,
+    type_repr,
 )
 from .. import native as _mm
 from ..msl.emitter import MSLEmitter
@@ -249,6 +255,15 @@ class WarpArray:
                 "(adjoint codegen is a KEP-0001 Non-Goal)"
             )
         self.device = get_device(device).name
+        # canonicalize dtype (upstream array.__init__ canonicalize block,
+        # warp/_src/types.py:3559-3565: the Python builtins map to their
+        # 32-bit warp types, e.g. Newton's `wp.full(..., dtype=float)`)
+        if dtype is int:
+            dtype = int32
+        elif dtype is float:
+            dtype = float32
+        elif dtype is bool:
+            dtype = warp_bool
         self.dtype = dtype
         self.shape = _normalize_shape(shape) if shape is not None else _normalize_shape(n)
         self.n = 1
@@ -552,9 +567,24 @@ def clone(src, device=None, requires_grad=False, pinned=False, retain_grad=False
 
 
 def copy(dest, src, dest_offset=0, src_offset=0, count=None, stream=None):
-    """Copy ``count`` elements (all when None) from ``src`` into ``dest``."""
-    if dest.dtype != src.dtype:
-        raise TypeError(f"copy dtype mismatch: dest {dest.dtype} vs src {src.dtype}")
+    """Copy ``count`` elements (all when None) from ``src`` into ``dest``.
+
+    Upstream contract (context.py ``copy``): both sides must be arrays, and
+    the copy is a raw memcpy valid whenever the element sizes match in bytes
+    — dtype identity is not required (float32 ↔ float canonicalize to the
+    same 4-byte element upstream; int32 ↔ float32 same-size copies are
+    equally legal there).
+    """
+    if not isinstance(src, WarpArray) or not isinstance(dest, WarpArray):
+        # upstream: "Copy source and destination must be arrays" (context.py:15197)
+        raise RuntimeError("Copy source and destination must be arrays")
+    if src.item_bytes != dest.item_bytes:
+        # upstream element-size check + message verbatim (context.py:15294-15299)
+        raise RuntimeError(
+            "Incompatible array data types: "
+            f"destination dtype={type_repr(dest.dtype)}, "
+            f"source dtype={type_repr(src.dtype)}"
+        )
     n = src.n - src_offset if count is None else int(count)
     if n < 0 or dest_offset + n > dest.n or src_offset + n > src.n:
         raise ValueError(f"copy out of bounds: count={n}, dest_offset={dest_offset}, src_offset={src_offset}")
@@ -1221,8 +1251,19 @@ def _unit_for(kernel, block_dim: int | None = None):
         if cached is not None:
             return cached
         opts = {"block_dim": block_dim} if block_dim is not None else None
-        unit = translate_kernel(kernel, opts)
-        source = unit.source()
+        try:
+            unit = translate_kernel(kernel, opts)
+            source = unit.source()
+        except Exception as e:
+            # fail loud naming the kernel: the translation error itself names
+            # only the offending construct (e.g. an fp64 declaration with no
+            # MSL mapping); annotate it with the kernel identity without
+            # changing the exception type (tests match on both)
+            key = getattr(kernel, "key", getattr(kernel, "__name__", "<kernel>"))
+            module = getattr(getattr(kernel, "func", None), "__module__", "<spike>")
+            if e.args:
+                e.args = (f"{e.args[0]}\ntranslating kernel '{key}' ({module})", *e.args[1:])
+            raise
         dump_dir = os.environ.get("WARP_METAL_DUMP_MSL")
         if dump_dir:
             # debugging aid: the Metal diagnostics buffer clips long error
@@ -1312,13 +1353,21 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None, tiled: bool =
                 f"launch_tiled: kernel '{kernel.key}' has a CPU fallback registered but tiled "
                 "ports are not supported (fallback ports take a flat thread count)"
             )
+        # ports take a flat thread count; a grid tuple flattens row-major
+        # (cpu launch_tiled routes here as a plain launch with block_dim=1,
+        # so prod(dims) is exactly its one-thread-per-block count)
+        flat_dim = dim
+        if isinstance(dim, (tuple, list)):
+            flat_dim = 1
+            for d in dim:
+                flat_dim *= int(d)
         if _CAPTURE_RECORDS is not None:
             # record the host port: replay re-runs it on the same buffers
-            _CAPTURE_RECORDS.append(("fallback", kernel, dim, list(merged), fb))
+            _CAPTURE_RECORDS.append(("fallback", kernel, flat_dim, list(merged), fb))
             return
         # closure-external kernel with an explicit verified CPU fallback
         # (unified memory: same shared-storage buffers the device sees)
-        fb(kernel, dim, merged)
+        fb(kernel, flat_dim, merged)
         return
 
     # launch bounds: for a tiled launch block_dim joins as the trailing dim
@@ -1526,7 +1575,8 @@ def launch_tiled(
         raise RuntimeError(
             "warp-metal does not support adjoint launches (adjoint codegen is a KEP-0001 Non-Goal)"
         )
-    if device is not None and get_device(device).name != "metal":
+    dev_name = get_device(device).name if device is not None else "metal"
+    if dev_name not in ("metal", "cpu"):
         raise RuntimeError(
             f"launch_tiled device={device!r} is not available: the Metal backend dispatches on 'metal'"
         )
@@ -1537,12 +1587,6 @@ def launch_tiled(
     if dim is None:
         raise TypeError("launch_tiled() missing required argument 'dim'")
 
-    if block_dim is None:
-        block_dim = 256  # upstream default (warp.config block dim)
-    block_dim = int(block_dim)
-    if block_dim & (block_dim - 1):
-        raise ValueError(f"launch_tiled block_dim must be a power of two, got {block_dim}")
-
     if isinstance(dim, (tuple, list)):
         dims = tuple(int(d) for d in dim)
         if not 1 <= len(dims) <= 3:
@@ -1550,6 +1594,42 @@ def launch_tiled(
             raise ValueError(f"launch_tiled dim must be an int or a 1-3 dim grid, got {dim!r}")
     else:
         dims = (int(dim),)
+
+    if dev_name == "cpu":
+        # CPU-golden semantics: upstream resolves every CPU block_dim request
+        # to 1 (context.py _resolve_launch_block_dim — values >1 are opt-in
+        # behind wp.config.enable_cpu_blocks, and launch_tiled appends the
+        # resolved value as the trailing launch dim), so a tiled launch on
+        # cpu is prod(dims) one-lane blocks. That is definitionally the
+        # per-thread scalar tile lowering plain launches use (same module:
+        # _launch_ssa), and every array lives in shared storage, so the
+        # port routing + MSL pipeline inside _launch_ssa apply unchanged —
+        # kernels with a verified CPU port (host_fallback) run their port,
+        # everything else dispatches through the per-thread-scalar MSL.
+        # Upstream only bounds the CPU request: "block_dim must be at most
+        # 1024 on CPU" (_resolve_launch_block_dim).
+        block_dim = int(block_dim) if block_dim is not None else 1
+        if block_dim > 1024:
+            raise ValueError(f"block_dim must be at most 1024 on CPU, got {block_dim}")
+        if block_dim > 1:
+            from ..frontend.config import enable_cpu_blocks
+
+            if enable_cpu_blocks:
+                # upstream would run cooperative CPU fibers here; warp-metal has
+                # no fiber execution, so fail loud instead of silently forcing 1
+                raise NotImplementedError(
+                    "wp.config.enable_cpu_blocks CPU fibers are not supported by the Metal backend; "
+                    "cpu launches run one-lane blocks (upstream's default resolution)"
+                )
+        merged = list(inputs or []) + list(outputs or [])
+        _launch_ssa(kernel, dims, merged, block_dim=1, tiled=False)
+        return
+
+    if block_dim is None:
+        block_dim = 256  # upstream default (warp.config block dim)
+    block_dim = int(block_dim)
+    if block_dim & (block_dim - 1):
+        raise ValueError(f"launch_tiled block_dim must be a power of two, got {block_dim}")
 
     merged = list(inputs or []) + list(outputs or [])
     _launch_ssa(kernel, dims, merged, block_dim=block_dim, tiled=True)
@@ -1588,12 +1668,16 @@ def launch(
             "use enable_backward=False / forward-only launches"
         )
 
-    if device is not None and get_device(device).name != "metal":
-        # Whole-kernel CPU execution (LLVM path) is not wired (see module docstring).
+    if device is not None and get_device(device).name not in ("metal", "cpu"):
         raise RuntimeError(
-            f"launch device={device!r} is not available yet: the Metal backend dispatches on 'metal'; "
-            "'cpu' execution arrives with the CPU fallback routing"
+            f"launch device={device!r} is not available: the Metal backend dispatches on 'metal'"
         )
+    # An explicit "cpu" device runs on the same shared-storage buffers the
+    # device dispatches on: upstream CPU launches resolve block_dim to 1
+    # (context.py _resolve_launch_block_dim), so the per-thread scalar tile
+    # lowering below IS the CPU-golden execution. _launch_ssa routes kernels
+    # with a verified CPU port (host_fallback) to their port; everything else
+    # lowers to MSL over the unified-memory arrays.
 
     if dim is None:
         raise TypeError("launch() missing required argument 'dim'")

@@ -322,6 +322,131 @@ class TestTiledLaunchTid(unittest.TestCase):
             wp.launch_tiled(k, dim=(1, 1, 1, 1), inputs=[out], block_dim=32, device="metal")
 
 
+class TestCpuDeviceRouting(unittest.TestCase):
+    """Explicit ``device="cpu"`` launches (launch / launch_tiled).
+
+    Upstream CPU semantics: ``block_dim`` resolves to 1 (context.py
+    ``_resolve_launch_block_dim``), so a tiled launch on cpu is prod(dims)
+    one-lane blocks — the per-thread scalar tile lowering plain launches
+    use. Arrays are shared-storage, so the same pipeline executes: kernels
+    with a verified CPU port (``host_fallback``) run the port, everything
+    else dispatches through the MSL path; a kernel that cannot translate
+    fails loud naming the kernel.
+    """
+
+    def setUp(self):
+        if _SKIP:
+            raise unittest.SkipTest(_SKIP_MSG)
+
+    def test_plain_launch_cpu(self):
+        @wp.kernel
+        def k(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            i = wp.tid()
+            out[i] = a[i] + 1.0
+
+        n = 9
+        src = wp.full(n, 1.0, dtype=wp.float32, device="cpu")
+        out = wp.zeros(n, dtype=wp.float32, device="cpu")
+        wp.launch(k, dim=n, inputs=[src, out], device="cpu")
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy_view(), np.full(n, 2.0, dtype=np.float32))
+
+    def test_tiled_cpu_matches_numpy_reference(self):
+        # tile ops under launch_tiled(device='cpu') execute per-thread scalar
+        # (one-lane blocks): tile_sum over the single element the thread owns
+        @wp.kernel
+        def k(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            i = wp.tid()
+            t = wp.tile_load(a, shape=(1,), offset=(i,))
+            out[i] = wp.tile_sum(t)[0]
+
+        n = 7
+        src = wp.from_numpy(np.arange(n, dtype=np.float32), device="cpu")
+        out = wp.zeros(n, dtype=wp.float32, device="cpu")
+        wp.launch_tiled(k, dim=n, inputs=[src, out], block_dim=256, device="cpu")
+        wp.synchronize()
+        np.testing.assert_array_equal(out.numpy_view(), np.arange(n, dtype=np.float32))
+
+    def test_tiled_cpu_ignores_requested_block_dim(self):
+        # upstream resolves every CPU block_dim request to 1, so the result
+        # must not depend on the request (no lane splitting, no per-block
+        # shared semantics on cpu)
+        @wp.kernel
+        def k(out: wp.array(dtype=wp.float32)):
+            i = wp.tid()
+            out[i] = wp.float(i) * 2.0
+
+        n = 11
+        for requested in (1, 32, 256):
+            out = wp.full(n, -1.0, dtype=wp.float32, device="cpu")
+            wp.launch_tiled(k, dim=n, inputs=[out], block_dim=requested, device="cpu")
+            wp.synchronize()
+            np.testing.assert_array_equal(
+                out.numpy_view(), np.arange(n, dtype=np.float32) * 2.0, err_msg=f"block_dim={requested}"
+            )
+
+    def test_tiled_cpu_oversize_block_dim_rejected(self):
+        # upstream _resolve_launch_block_dim: "block_dim must be at most 1024 on CPU"
+        @wp.kernel
+        def k(out: wp.array(dtype=wp.float32)):
+            i = wp.tid()
+            out[i] = wp.float(i)
+
+        out = wp.zeros(4, dtype=wp.float32, device="cpu")
+        with self.assertRaises(ValueError):
+            wp.launch_tiled(k, dim=1, inputs=[out], block_dim=2048, device="cpu")
+
+    def test_tiled_cpu_port_kernel_runs_the_port(self):
+        # a kernel with a verified CPU port runs the port under launch_tiled
+        # on cpu (flat one-thread-per-block count), observable as a "fallback"
+        # capture record; the port output matches the numpy reference
+        import warp_metal.host_fallback as host_fallback  # noqa: PLC0415 — registry keyed on kernel identity
+
+        @wp.kernel
+        def k_port(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            i = wp.tid()
+            out[i] = a[i] * 3.0
+
+        host_fallback.register(k_port.func.__module__, k_port.key)(_port_mul3)
+
+        n = 5
+        src = wp.from_numpy(np.arange(n, dtype=np.float32), device="cpu")
+        out = wp.zeros(n, dtype=wp.float32, device="cpu")
+        wp.launch_tiled(k_port, dim=n, inputs=[src, out], block_dim=64, device="cpu")
+        np.testing.assert_array_equal(out.numpy_view(), np.arange(n, dtype=np.float32) * 3.0)
+
+        # the port ran, not the MSL dispatch: the capture record is "fallback"
+        wp.capture_begin()
+        wp.launch_tiled(k_port, dim=n, inputs=[src, out], block_dim=64, device="cpu")
+        g = wp.capture_end()
+        kinds = [rec[0] for rec in g._records]
+        self.assertIn("fallback", kinds)
+        wp.capture_launch(g)  # replay re-runs the port on the same buffers
+        np.testing.assert_array_equal(out.numpy_view(), np.arange(n, dtype=np.float32) * 3.0)
+
+    def test_cpu_kernel_without_port_fails_loud_naming_the_kernel(self):
+        # an fp64-intermediate kernel has no CPU port and no MSL mapping:
+        # the launch fails loud and the message names the kernel
+        @wp.kernel
+        def k_fp64_local(out: wp.array(dtype=wp.float32)):
+            i = wp.tid()
+            x = wp.float64(2.0)
+            out[i] = wp.float32(x * wp.float64(i))
+
+        out = wp.zeros(4, dtype=wp.float32, device="cpu")
+        with self.assertRaises(Exception) as ctx:
+            wp.launch_tiled(k_fp64_local, dim=4, inputs=[out], block_dim=32, device="cpu")
+        self.assertIn("k_fp64_local", str(ctx.exception))
+
+
+def _port_mul3(kernel, dim, merged):
+    """Verified CPU port for TestCpuDeviceRouting.test_tiled_cpu_port_kernel
+    (out[i] = a[i] * 3 over the flat one-thread-per-block count)."""
+    a, out = merged
+    for i in range(dim):
+        out.numpy[i] = a.numpy[i] * np.float32(3.0)
+
+
 class TestDispatchWatchdog(unittest.TestCase):
     """WARP_METAL_DISPATCH_TIMEOUT_S bounds the dispatch completion wait.
 

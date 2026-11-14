@@ -203,8 +203,10 @@ def transform_expand(t) -> _transform_type:
 
 # Vendored upstream math helpers (warp 1.19 warp/_src/math.py verbatim).
 # Upstream attaches these @wp.func definitions to the wp namespace at import
-# time; imported last so every attribute their bodies reference exists, then
-# re-exported so kernels resolve wp.quat_to_euler & co. as user functions.
+# time (warp/__init__.py:602 "from warp._src.math import *"); imported last
+# so every attribute their bodies reference exists, then re-exported so
+# kernels resolve wp.quat_to_euler & co. as user functions — and host code
+# calls them (Newton import_usd.py: wp.transform_compose(p, q, s)).
 from .frontend.math_funcs import (  # noqa: E402
     norm_huber,
     norm_l1,
@@ -217,6 +219,10 @@ from .frontend.math_funcs import (  # noqa: E402
     quat_twist_angle,
     quat_twist_angle_signed,
     smooth_normalize,
+    transform_compose,
+    transform_decompose,
+    transform_from_matrix,
+    transform_to_matrix,
     transform_twist,
     transform_wrench,
     velocity_at_point,
@@ -310,6 +316,10 @@ __all__ = [
     "init",
     "device_name",
     "transform_expand",
+    "transform_compose",
+    "transform_decompose",
+    "transform_from_matrix",
+    "transform_to_matrix",
     "config",
     "utils",
 ]
