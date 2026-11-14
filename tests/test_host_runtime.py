@@ -220,6 +220,37 @@ class TestArrayConstructors(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             wp.clone(a, requires_grad=True)
 
+    def test_dtype_builtin_aliases_canonicalize(self):
+        # upstream array.__init__ canonicalize block (types.py:3559-3565):
+        # Python builtins map to their 32-bit warp types at construction, so
+        # Newton's wp.full(n, 0.8, dtype=float) yields a float32 array
+        for ctor, kwargs in (
+            (wp.zeros, {"dtype": float}),
+            (wp.full, {"value": 0.8, "dtype": float}),
+            (wp.empty, {"dtype": float}),
+        ):
+            a = ctor(4, device="cpu", **kwargs)
+            self.assertIs(a.dtype, wp.float32, f"{ctor.__name__}: {a.dtype}")
+        self.assertIs(wp.zeros(4, dtype=int, device="cpu").dtype, wp.int32)
+        self.assertIs(wp.zeros(4, dtype=bool, device="cpu").dtype, wp.bool)
+        # data flows through the canonical dtype
+        f = wp.full(3, 0.5, dtype=float, device="cpu")
+        self.assertTrue(np.all(f.numpy == np.float32(0.5)))
+
+    def test_copy_element_size_contract(self):
+        # upstream wp.copy (context.py:15158): both sides must be arrays and
+        # the copy is legal whenever element sizes match in bytes — dtype
+        # identity is not required
+        i = wp.from_numpy(np.array([1, 2], dtype=np.int32), device="cpu")
+        f = wp.zeros(2, dtype=wp.float32, device="cpu")
+        wp.copy(f, i)  # same 4-byte element: raw memcpy, upstream-legal
+        self.assertEqual(f.numpy.tolist(), [1.0, 2.0])  # int32 bits reinterpreted
+        with self.assertRaises(RuntimeError):
+            wp.copy(f, object())
+        v = wp.zeros(2, dtype=wp.vec3f, device="cpu")
+        with self.assertRaisesRegex(RuntimeError, "Incompatible array data types"):
+            wp.copy(f, v)  # 12-byte vs 4-byte elements
+
     def test_from_numpy(self):
         n = wp.from_numpy(np.array([7.0, 8.0], dtype=np.float32))
         self.assertEqual(n.numpy.tolist(), [7.0, 8.0])
@@ -786,6 +817,33 @@ class TestHostTransformBuiltins(unittest.TestCase):
         self.core.wp_builtin_transform_vector_transformf_vec3f(t, v, ctypes.byref(out))
         np.testing.assert_allclose(np.asarray(out), [0, 1, 0], atol=1e-5)
 
+    def test_transform_compose_host_call(self):
+        # Newton import_usd.py:687: wp.transform_compose(p, q, s) from host
+        # Python. Upstream contract (math.py create_transform_compose_func):
+        # M = [[sx*R00, sy*R01, sz*R02, px], [sx*R10, ...], ..., [0,0,0,1]]
+        # with R = quat_to_matrix(rotation). 90-degree z rotation:
+        # R = [[0,-1,0],[1,0,0],[0,0,1]]; p=(1,2,3), s=(2,3,4) ->
+        # [[0,-3,0,1],[2,0,0,2],[0,0,4,3],[0,0,0,1]]
+        q = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), np.pi / 2)
+        m = wp.transform_compose(wp.vec3(1.0, 2.0, 3.0), q, wp.vec3(2.0, 3.0, 4.0))
+        expected = np.array(
+            [
+                [0.0, -3.0, 0.0, 1.0],
+                [2.0, 0.0, 0.0, 2.0],
+                [0.0, 0.0, 4.0, 3.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(np.asarray(m).reshape(4, 4), expected, atol=1e-5)
+        # identity rotation/scale reduces to the pure translation matrix
+        m2 = wp.transform_compose(wp.vec3(4.0, 5.0, 6.0), wp.quat_identity(), wp.vec3(1.0, 1.0, 1.0))
+        np.testing.assert_allclose(
+            np.asarray(m2).reshape(4, 4),
+            np.array([[1, 0, 0, 4], [0, 1, 0, 5], [0, 0, 1, 6], [0, 0, 0, 1]], dtype=np.float32),
+            atol=1e-6,
+        )
+
 
 class TestMiscHostApi(unittest.TestCase):
     def test_init_idempotent(self):
@@ -798,9 +856,13 @@ class TestMiscHostApi(unittest.TestCase):
         with self.assertRaises(ValueError):
             wp.transform_expand([1, 2, 3])
 
-    def test_utils_stub_fails_loud(self):
+    def test_utils_sorts_implemented_stubs_fail_loud(self):
+        # steel-closure round: the segmented/radix sort pairs are real now;
+        # out-of-closure consumers (implicit_mpm/VBD) still fail loud
+        self.assertTrue(callable(wp.utils.segmented_sort_pairs))
+        self.assertTrue(callable(wp.utils.radix_sort_pairs))
         with self.assertRaises(NotImplementedError):
-            wp.utils.segmented_sort_pairs
+            wp.utils.runlength_encode
 
     def test_constants(self):
         self.assertEqual(wp.LOG_DEBUG, 10)
