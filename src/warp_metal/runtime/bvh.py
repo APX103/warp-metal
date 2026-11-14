@@ -432,6 +432,23 @@ class HostBVH:
         self._buf_item_groups = self.groups_arr.buffer if self.groups_arr is not None else 0
         self._upload_nodes()
 
+        ctx = self.embedded_context(mm)
+        self._buf_ctx = mm.buffer_create(_CTX_BYTES)
+        self._write_buffer(self._buf_ctx, ctx)
+        self.id = mm.buffer_gpu_address(self._buf_ctx)
+
+    def embedded_context(self, mm=None) -> np.ndarray:
+        """The 112-byte wp_bvh_t device-struct image.
+
+        ``_upload`` writes this into its own context buffer; the mesh table
+        (runtime/host.py) embeds the same image INSIDE the 304-byte wp_mesh
+        entry (upstream Mesh embeds the BVH by value — mesh_get_bvh addresses
+        the member). Node-buffer addresses are stable across refits, so the
+        image only changes when node buffers are reallocated (never after
+        build; refit uploads in place).
+        """
+        if mm is None:
+            mm = self._mm
         ctx = np.zeros(_CTX_BYTES, dtype=np.uint8)
         u64 = ctx.view("<u8")
         i32 = ctx.view("<i4")
@@ -454,9 +471,22 @@ class HostBVH:
         i32[22] = self.num_items    # byte 88
         i32[23] = self.leaf_size    # byte 92
         i32[24] = self.constructor_type  # byte 96
-        self._buf_ctx = mm.buffer_create(_CTX_BYTES)
-        self._write_buffer(self._buf_ctx, ctx)
-        self.id = mm.buffer_gpu_address(self._buf_ctx)
+        return ctx
+
+    def destroy(self) -> None:
+        """Release every Metal buffer this tree owns (residency set removal
+        happens in the native buffer_release). The caller's item arrays are
+        NOT owned here."""
+        for handle in (
+            self._buf_node_lowers,
+            self._buf_node_uppers,
+            self._buf_parents,
+            self._buf_prims,
+            self._buf_root,
+            getattr(self, "_buf_ctx", None),
+        ):
+            if handle:
+                self._mm.buffer_release(handle)
 
     def _upload_nodes(self) -> None:
         self._write_buffer(self._buf_node_lowers, self.node_lowers)

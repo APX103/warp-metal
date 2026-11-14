@@ -148,12 +148,22 @@ class _CoreShim:
     # -- host mesh bookkeeping (wp.Mesh) ----------------------------------
     #
     # warp-metal keeps every buffer in shared storage, so the cpu/device core
-    # split collapses to one host path. The handle is bookkeeping only on the
-    # M1 closure: device-side mesh queries (mesh_query_point_*) arrive with
-    # the M2.1 query family and fail loud at kernel translation until then.
+    # split collapses to one host path (the *_device core hooks below alias
+    # the same implementations). M2.2: each mesh record carries its durable
+    # query assets — per-triangle bounds buffers + the embedded-layout BVH
+    # (runtime/bvh.py HostBVH over the bounds, upstream mesh.cpp port) —
+    # built at creation and only refit/released later; the per-launch device
+    # table (runtime/host.py _mesh_table_upload) just embeds their addresses.
 
     _HOST_MESHES: dict = {}
     _HOST_MESH_SEQ = [0]
+
+    @staticmethod
+    def _runtime_array(arr):
+        """The array object when it is a runtime WarpArray (carrying a real
+        Metal buffer), else None. wp.Mesh passes ``array().__ctype__()`` for
+        absent velocities — a ctypes view with no GPU-address meaning."""
+        return arr if hasattr(arr, "buffer") else None
 
     @classmethod
     def wp_mesh_create_host(
@@ -163,15 +173,22 @@ class _CoreShim:
         mid = cls._HOST_MESH_SEQ[0]
         cls._HOST_MESHES[mid] = {
             "points": points,
-            "velocities": velocities,
+            "velocities": cls._runtime_array(velocities),
             "indices": indices,
             "num_points": int(num_points),
             "num_tris": int(num_tris),
             "support_winding_number": int(support_winding_number),
             "bvh_constructor": bvh_constructor,
-            "groups": groups,
+            "groups": cls._runtime_array(groups),
             "bvh_leaf_size": bvh_leaf_size,
+            "face_lowers": None,
+            "face_uppers": None,
+            "bvh": None,
+            "average_edge_length": 0.0,
         }
+        from ..runtime import host as _rt_host
+
+        _rt_host._mesh_assets_build(cls._HOST_MESHES[mid])
         cls._sync_mesh_table()
         return mid
 
@@ -184,27 +201,58 @@ class _CoreShim:
 
     @classmethod
     def wp_mesh_destroy_host(cls, mid) -> None:
-        cls._HOST_MESHES.pop(int(mid), None)
+        rec = cls._HOST_MESHES.pop(int(mid), None)
+        if rec is not None:
+            from ..runtime import host as _rt_host
+
+            _rt_host._mesh_assets_release(rec)
         cls._sync_mesh_table()
 
     @classmethod
     def wp_mesh_refit_host(cls, mid) -> None:
-        # no cached host BVH to refit yet (query family is M2.1)
-        if int(mid) not in cls._HOST_MESHES:
+        rec = cls._HOST_MESHES.get(int(mid))
+        if rec is None:
             raise RuntimeError(f"wp_mesh_refit_host: unknown mesh id {mid}")
+        from ..runtime import host as _rt_host
+
+        _rt_host._mesh_assets_refit(rec)
 
     @classmethod
     def wp_mesh_set_points_host(cls, mid, points) -> None:
         if int(mid) not in cls._HOST_MESHES:
             raise RuntimeError(f"wp_mesh_set_points_host: unknown mesh id {mid}")
         cls._HOST_MESHES[mid]["points"] = points
+        # upstream set_points refits over the new vertices
+        cls.wp_mesh_refit_host(mid)
         cls._sync_mesh_table()
 
     @classmethod
     def wp_mesh_set_velocities_host(cls, mid, velocities) -> None:
         if int(mid) not in cls._HOST_MESHES:
             raise RuntimeError(f"wp_mesh_set_velocities_host: unknown mesh id {mid}")
-        cls._HOST_MESHES[mid]["velocities"] = velocities
+        cls._HOST_MESHES[mid]["velocities"] = cls._runtime_array(velocities)
+        cls._sync_mesh_table()
+
+    # shared storage collapses the cpu/device core split: the device-named
+    # hooks Mesh.refit()/points/velocities setters/__del__ reach on a metal
+    # device are the same host implementations
+    @classmethod
+    def wp_mesh_destroy_device(cls, mid) -> None:
+        cls.wp_mesh_destroy_host(mid)
+
+    @classmethod
+    def wp_mesh_refit_device(cls, mid) -> int:
+        cls.wp_mesh_refit_host(mid)
+        return 1
+
+    @classmethod
+    def wp_mesh_set_points_device(cls, mid, points) -> int:
+        cls.wp_mesh_set_points_host(mid, points)
+        return 1
+
+    @classmethod
+    def wp_mesh_set_velocities_device(cls, mid, velocities) -> None:
+        cls.wp_mesh_set_velocities_host(mid, velocities)
 
     # -- host transform builtins (ctypes float-array conventions) ----------
 

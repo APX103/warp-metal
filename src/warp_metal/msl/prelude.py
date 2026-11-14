@@ -81,12 +81,14 @@ struct wp_arr_meta {
     int strides[4];
 };
 
-// wp.Mesh: real device data (points/indices) fetched from a per-launch mesh
-// table (`device wp_mesh* _wp_mesh_table`, host-built; see runtime/host.py).
-// Entry 0 is the null mesh; ids index the table directly.
+// wp.Mesh member array payloads (wp::array_t<vec3> / wp::array_t<int>
+// lowered to {device data ptr, meta}; the wp_mesh struct itself is defined
+// after the BVH ops in _MESH_QUERY_OPS — it embeds wp_bvh_t). Device reads
+// go through the per-launch mesh table (`device wp_mesh* _wp_mesh_table`,
+// host-built; see runtime/host.py). Entry 0 is the null mesh; ids index
+// the table directly.
 struct wp_mesh_array { device vec3f* data; wp_arr_meta m; };
 struct wp_mesh_array_i { device int* data; wp_arr_meta m; };
-struct wp_mesh { wp_mesh_array points; wp_mesh_array_i indices; };
 
 // tiled mesh AABB query (Newton tile_mesh_query_aabb): Phase-1 stub — the
 // query returns state=0 so the `while wp.tile_query_valid(query)` loop never
@@ -1694,6 +1696,833 @@ static inline bool wp_bvh_query_next(thread wp_bvh_query_t& query, thread int& i
 }
 """
 
+# KEP-0001 M2.2: Mesh query family, ported semantically verbatim from
+# upstream warp/native/mesh.h (warp 1.19): struct Mesh (three array_t
+# members + per-triangle bounds + the EMBEDDED BVH — the same wp_bvh_t the
+# M2.1 query family reads), mesh_query_point_no_sign (BVH best-fit
+# traversal + closest_point_to_triangle), mesh_query_aabb/sphere + the
+# templated traversal skeleton instantiated per kind, mesh_query_ray
+# (packed-node closest hit) with the intersect.h woop ray-triangle test,
+# and the mesh_eval_*/mesh_get_* accessors. Upstream variants that need
+# sign resolution (solid-angle / parity / tracing machinery) are ported
+# fail-loud: the translator rejects them before any MSL exists.
+#
+# The tree itself is built host-side over the per-triangle bounds
+# (runtime/bvh.py HostBVH at wp.Mesh construction); runtime/host.py
+# _MeshEntry is the byte-exact host mirror of wp_mesh (asserted there).
+# Upstream functions take the mesh id and deref it (mesh_get); here the
+# translator routes every wp::mesh_* call's id through the per-launch
+# table (`_wp_mesh_table[id]` — see translate.py) so the functions below
+# take the wp_mesh VALUE. mesh_get_bvh / mesh_get_group_root keep id
+# semantics (an address into the bound table buffer).
+_MESH_QUERY_OPS = """
+// ---- struct Mesh (mesh.h verbatim layout; host.py _MeshEntry mirrors it) --
+
+struct wp_mesh {
+    wp_mesh_array points;             // 0    {device vec3f*, wp_arr_meta} = 48 bytes
+    wp_mesh_array velocities;         // 48
+    wp_mesh_array_i indices;          // 96
+    device vec3f* lowers;             // 144  per-triangle bounds (also the BVH item arrays)
+    device vec3f* uppers;             // 152
+    device uchar* solid_angle_props;  // 160  winding-number family is fail-loud; always null here
+    int num_points;                   // 168
+    int num_tris;                     // 172
+    wp_bvh_t bvh;                     // 176  embedded BVH (mesh_get_bvh = address of this member)
+    uint64_t context;                 // 288
+    float average_edge_length;        // 296
+    int _pad0;                        // 300
+};                                    // 304 bytes total
+
+// array_t operator[] equivalents (array.h byte-stride indexing)
+static inline vec3f wp_mesh_point(const thread wp_mesh& mesh, int i) {
+    return *(device vec3f*)((device char*)mesh.points.data + (size_t)mesh.points.m.offset + (size_t)i * (size_t)mesh.points.m.strides[0]);
+}
+static inline vec3f wp_mesh_velocity(const thread wp_mesh& mesh, int i) {
+    return *(device vec3f*)((device char*)mesh.velocities.data + (size_t)mesh.velocities.m.offset + (size_t)i * (size_t)mesh.velocities.m.strides[0]);
+}
+static inline int wp_mesh_tri(const thread wp_mesh& mesh, int i) {
+    return *(device int*)((device char*)mesh.indices.data + (size_t)mesh.indices.m.offset + (size_t)i * (size_t)mesh.indices.m.strides[0]);
+}
+
+// ---- mesh.h distance_to_aabb_sq / furthest_distance_to_aabb_sq (verbatim) --
+
+static inline float wp_distance_to_aabb_sq(vec3f p, vec3f lower, vec3f upper) {
+    const float dx = fmin(upper.x, fmax(lower.x, p.x)) - p.x;
+    const float dy = fmin(upper.y, fmax(lower.y, p.y)) - p.y;
+    const float dz = fmin(upper.z, fmax(lower.z, p.z)) - p.z;
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// ---- intersect.h closest_point_to_triangle (verbatim) ----------------------
+
+static inline vec2f wp_closest_point_to_triangle(vec3f a, vec3f b, vec3f c, vec3f p) {
+    vec3f ab = b - a;
+    vec3f ac = c - a;
+    vec3f ap = p - a;
+
+    float u, v, w;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) {
+        v = 0.0f;
+        w = 0.0f;
+        u = 1.0f - v - w;
+        return make_vec2f(u, v);
+    }
+
+    vec3f bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) {
+        v = 1.0f;
+        w = 0.0f;
+        u = 1.0f - v - w;
+        return make_vec2f(u, v);
+    }
+
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        v = d1 / (d1 - d3);
+        w = 0.0f;
+        u = 1.0f - v - w;
+        return make_vec2f(u, v);
+    }
+
+    vec3f cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) {
+        v = 0.0f;
+        w = 1.0f;
+        u = 1.0f - v - w;
+        return make_vec2f(u, v);
+    }
+
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        v = 0.0f;
+        w = d2 / (d2 - d6);
+        u = 1.0f - v - w;
+        return make_vec2f(u, v);
+    }
+
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        v = 1.0f - w;
+        u = 1.0f - v - w;
+        return make_vec2f(u, v);
+    }
+
+    float denom = 1.0f / (va + vb + vc);
+    v = vb * denom;
+    w = vc * denom;
+    u = 1.0f - v - w;
+    return make_vec2f(u, v);
+}
+
+// ---- intersect.h woop ray-triangle (verbatim; vec subscripting explicit) ---
+
+// longest_axis(vec.h): strict > scan, first max wins
+static inline int wp_mesh_max_dim(vec3f a) {
+    float lmax = fabs(a.x);
+    int ret = 0;
+    const float y = fabs(a.y);
+    if (y > lmax) { ret = 1; lmax = y; }
+    const float z = fabs(a.z);
+    if (z > lmax) { ret = 2; lmax = z; }
+    return ret;
+}
+static inline float wp_mesh_v3_at(vec3f v, int i) { return i == 0 ? v.x : (i == 1 ? v.y : v.z); }
+static inline float wp_xorf(float x, int y) { return as_type<float>(as_type<int>(x) ^ y); }  // intersect.h xorf
+static inline int wp_sign_mask(float x) { return as_type<int>(x) & 0x80000000; }            // intersect.h sign_mask
+static inline float wp_diff_product(float a, float b, float c, float d) {
+    float cd = c * d;
+    float diff = fma(a, b, -cd);
+    float error = fma(-c, d, cd);
+    return diff + error;
+}
+
+// http://jcgt.org/published/0002/01/05/
+static inline bool wp_intersect_ray_tri_woop(
+    vec3f p, vec3f dir, vec3f a, vec3f b, vec3f c,
+    thread float& t, thread float& u, thread float& v, thread float& sign, thread vec3f& normal
+) {
+    int kz = wp_mesh_max_dim(dir);
+    int kx = kz + 1;
+    if (kx == 3)
+        kx = 0;
+    int ky = kx + 1;
+    if (ky == 3)
+        ky = 0;
+
+    if (wp_mesh_v3_at(dir, kz) < 0.0f) {
+        int tmp = kx;
+        kx = ky;
+        ky = tmp;
+    }
+
+    float Sx = wp_mesh_v3_at(dir, kx) / wp_mesh_v3_at(dir, kz);
+    float Sy = wp_mesh_v3_at(dir, ky) / wp_mesh_v3_at(dir, kz);
+    float Sz = 1.0f / wp_mesh_v3_at(dir, kz);
+
+    const vec3f A = a - p;
+    const vec3f B = b - p;
+    const vec3f C = c - p;
+
+    const float Ax = wp_mesh_v3_at(A, kx) - Sx * wp_mesh_v3_at(A, kz);
+    const float Ay = wp_mesh_v3_at(A, ky) - Sy * wp_mesh_v3_at(A, kz);
+    const float Bx = wp_mesh_v3_at(B, kx) - Sx * wp_mesh_v3_at(B, kz);
+    const float By = wp_mesh_v3_at(B, ky) - Sy * wp_mesh_v3_at(B, kz);
+    const float Cx = wp_mesh_v3_at(C, kx) - Sx * wp_mesh_v3_at(C, kz);
+    const float Cy = wp_mesh_v3_at(C, ky) - Sy * wp_mesh_v3_at(C, kz);
+
+    float U = wp_diff_product(Cx, By, Cy, Bx);
+    float V = wp_diff_product(Ax, Cy, Ay, Cx);
+    float W = wp_diff_product(Bx, Ay, By, Ax);
+
+    if (U == 0.0f || V == 0.0f || W == 0.0f) {
+        // upstream recomputes the fallback in fp64; Metal has no fp64 — degrade
+        // to plain fp32 products (same values wp_diff_product already yields).
+        U = Cx * By - Cy * Bx;
+        V = Ax * Cy - Ay * Cx;
+        W = Bx * Ay - By * Ax;
+    }
+
+    if ((U < 0.0f || V < 0.0f || W < 0.0f) && (U > 0.0f || V > 0.0f || W > 0.0f)) {
+        return false;
+    }
+
+    float det = U + V + W;
+
+    if (det == 0.0f) {
+        return false;
+    }
+
+    const float Az = Sz * wp_mesh_v3_at(A, kz);
+    const float Bz = Sz * wp_mesh_v3_at(B, kz);
+    const float Cz = Sz * wp_mesh_v3_at(C, kz);
+    const float T = U * Az + V * Bz + W * Cz;
+
+    int det_sign = wp_sign_mask(det);
+    if (wp_xorf(T, det_sign) < 0.0f) {
+        return false;
+    }
+
+    const float rcpDet = 1.0f / det;
+    u = U * rcpDet;
+    v = V * rcpDet;
+    t = T * rcpDet;
+    sign = det;
+
+    const vec3f ab = b - a;
+    const vec3f ac = c - a;
+    normal = cross(ab, ac);
+
+    return true;
+}
+
+// mesh.h mesh_query_ray_intersect_aabb (verbatim fast/robust dispatch)
+static inline bool wp_mesh_ray_intersect_aabb(
+    vec3f start, vec3f dir, vec3f rcp_dir, bool fast_aabb, vec3f lower, vec3f upper, thread float& t
+) {
+    if (fast_aabb)
+        return wp_intersect_ray_aabb(start, rcp_dir, lower, upper, t);
+    else
+        return wp_intersect_ray_aabb_robust(start, dir, rcp_dir, lower, upper, t);
+}
+
+static inline vec3f wp_mesh_query_ray_safe_dir(vec3f dir) {
+    vec3f ray_dir = dir;
+    if (ray_dir.x == 0.0f)
+        ray_dir.x = 1.0e-20f;
+    if (ray_dir.y == 0.0f)
+        ray_dir.y = 1.0e-20f;
+    if (ray_dir.z == 0.0f)
+        ray_dir.z = 1.0e-20f;
+    return ray_dir;
+}
+
+static inline bool wp_mesh_query_ray_use_fast_aabb(vec3f dir) {
+    return dir.x != 0.0f && dir.y != 0.0f && dir.z != 0.0f;
+}
+
+// ---- mesh_query_point_no_sign (mesh.h verbatim traversal) ------------------
+
+// returns true if there is a point (strictly) < distance max_dist
+static inline bool wp_mesh_query_point_no_sign(
+    wp_mesh mesh, vec3f point, float max_dist, thread int& face, thread float& u, thread float& v
+) {
+    int stack[64];  // BVH_QUERY_STACK_SIZE
+    stack[0] = *mesh.bvh.root;
+
+    int count = 1;
+
+    float min_dist_sq = max_dist * max_dist;
+    int min_face = 0;
+    float min_v = 0.0f;
+    float min_w = 0.0f;
+
+    while (count) {
+        const int nodeIndex = stack[--count];
+
+        wp_node_half_t lower = mesh.bvh.node_lowers[nodeIndex];
+        wp_node_half_t upper = mesh.bvh.node_uppers[nodeIndex];
+        vec3f nl, nu;
+        nl.x = lower.x; nl.y = lower.y; nl.z = lower.z;
+        nu.x = upper.x; nu.y = upper.y; nu.z = upper.z;
+
+        // re-test distance
+        float node_dist_sq = wp_distance_to_aabb_sq(point, nl, nu);
+        if (node_dist_sq > min_dist_sq) {
+            continue;
+        }
+
+        const int left_index = (int)(lower.u & 0x7fffffffu);
+        const int right_index = (int)(upper.u & 0x7fffffffu);
+
+        if ((lower.u >> 31u) & 1u) {
+            const int start = left_index;
+            const int end = right_index;
+            // loops through primitives in the leaf
+            for (int primitive_counter = start; primitive_counter < end; primitive_counter++) {
+                int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
+                int i = wp_mesh_tri(mesh, primitive_index * 3 + 0);
+                int j = wp_mesh_tri(mesh, primitive_index * 3 + 1);
+                int k = wp_mesh_tri(mesh, primitive_index * 3 + 2);
+
+                vec3f p = wp_mesh_point(mesh, i);
+                vec3f q = wp_mesh_point(mesh, j);
+                vec3f r = wp_mesh_point(mesh, k);
+                vec3f e0 = q - p;
+                vec3f e1 = r - p;
+                vec3f e2 = r - q;
+                vec3f normal = cross(e0, e1);
+
+                // sliver detection
+                if (length(normal) / (dot(e0, e0) + dot(e1, e1) + dot(e2, e2)) < 1.e-6f)
+                    continue;
+
+                vec2f barycentric = wp_closest_point_to_triangle(p, q, r, point);
+                float bu = barycentric.x;
+                float bv = barycentric.y;
+                float w = 1.f - bu - bv;
+                vec3f c = bu * p + bv * q + w * r;
+
+                float dist_sq = length_sq(c - point);
+
+                if (dist_sq < min_dist_sq) {
+                    min_dist_sq = dist_sq;
+                    min_v = bv;
+                    min_w = w;
+                    min_face = primitive_index;
+                }
+            }
+        } else {
+            wp_node_half_t left_lower = mesh.bvh.node_lowers[left_index];
+            wp_node_half_t left_upper = mesh.bvh.node_uppers[left_index];
+
+            wp_node_half_t right_lower = mesh.bvh.node_lowers[right_index];
+            wp_node_half_t right_upper = mesh.bvh.node_uppers[right_index];
+
+            vec3f ll, lu, rl, ru;
+            ll.x = left_lower.x; ll.y = left_lower.y; ll.z = left_lower.z;
+            lu.x = left_upper.x; lu.y = left_upper.y; lu.z = left_upper.z;
+            rl.x = right_lower.x; rl.y = right_lower.y; rl.z = right_lower.z;
+            ru.x = right_upper.x; ru.y = right_upper.y; ru.z = right_upper.z;
+
+            float left_dist_sq = wp_distance_to_aabb_sq(point, ll, lu);
+            float right_dist_sq = wp_distance_to_aabb_sq(point, rl, ru);
+
+            vec2i child_indices;
+            vec2f child_dist;
+            if (left_dist_sq < right_dist_sq) {
+                child_indices = make_vec2i(right_index, left_index);
+                child_dist = make_vec2f(right_dist_sq, left_dist_sq);
+            } else {
+                child_indices = make_vec2i(left_index, right_index);
+                child_dist = make_vec2f(left_dist_sq, right_dist_sq);
+            }
+
+            if (child_dist.x < min_dist_sq)
+                stack[count++] = child_indices.x;
+
+            if (child_dist.y < min_dist_sq)
+                stack[count++] = child_indices.y;
+        }
+    }
+
+    // check if we found a point, and write outputs
+    if (min_dist_sq < max_dist * max_dist) {
+        u = 1.0f - min_v - min_w;
+        v = min_v;
+        face = min_face;
+
+        return true;
+    } else {
+        return false;
+    }
+}
+
+// struct-return wrapper (mesh.h mesh_query_point_no_sign 3-arg form)
+struct wp_mesh_query_point_t {
+    bool result;
+    float sign;
+    int face;
+    float u;
+    float v;
+};
+
+static inline wp_mesh_query_point_t wp_mesh_query_point_no_sign(wp_mesh mesh, vec3f point, float max_dist) {
+    wp_mesh_query_point_t query;
+    query.result = false;
+    query.face = 0;
+    query.u = 0.0f;
+    query.v = 0.0f;
+    query.sign = 0.0f;
+    query.result = wp_mesh_query_point_no_sign(mesh, point, max_dist, query.face, query.u, query.v);
+    return query;
+}
+
+// ---- mesh_query_ray (mesh.h verbatim closest-hit traversal) ----------------
+
+// bvh.h packed-node helpers (both halves folded into one uint64)
+static inline uint64_t wp_mesh_node_pack(wp_node_half_t lower, wp_node_half_t upper) {
+    return ((uint64_t)(lower.u >> 31u) << 62) | ((uint64_t)(upper.u & 0x7fffffffu) << 31) | (uint64_t)(lower.u & 0x7fffffffu);
+}
+static inline bool wp_mesh_node_is_leaf(uint64_t node) { return (node >> 62) != 0; }
+static inline int wp_mesh_node_lower_payload(uint64_t node) { return (int)(node & 0x7fffffffu); }
+static inline int wp_mesh_node_upper_payload(uint64_t node) { return (int)((node >> 31) & 0x7fffffffu); }
+
+static inline bool wp_mesh_query_ray(
+    wp_mesh mesh, vec3f start, vec3f dir, float max_t,
+    thread float& t, thread float& u, thread float& v, thread float& sign, thread vec3f& normal, thread int& face, int root
+) {
+    uint64_t stack[64];  // BVH_QUERY_STACK_SIZE
+    int stack_size = 0;
+    wp_node_half_t rl = mesh.bvh.node_lowers[(root == -1) ? *mesh.bvh.root : root];
+    wp_node_half_t ru = mesh.bvh.node_uppers[(root == -1) ? *mesh.bvh.root : root];
+    uint64_t cur_node = wp_mesh_node_pack(rl, ru);
+
+    vec3f ray_dir = wp_mesh_query_ray_safe_dir(dir);
+    vec3f rcp_dir = make_vec3f(1.0f / ray_dir.x, 1.0f / ray_dir.y, 1.0f / ray_dir.z);
+    const bool fast_aabb = wp_mesh_query_ray_use_fast_aabb(dir);
+
+    float min_t = max_t;
+    int min_face = 0;
+    float min_u = 0.0f;
+    float min_v = 0.0f;
+    float min_sign = 1.0f;
+    vec3f min_normal = make_vec3f();
+    bool hit = false;
+
+    while (true) {
+        if (wp_mesh_node_is_leaf(cur_node)) {
+            const int primitive_begin = wp_mesh_node_lower_payload(cur_node);
+            const int primitive_end = wp_mesh_node_upper_payload(cur_node);
+            // Leaf: test all primitives in the leaf.
+            for (int pc = primitive_begin; pc < primitive_end; ++pc) {
+                int primitive_index = mesh.bvh.primitive_indices[pc];
+                int i = wp_mesh_tri(mesh, primitive_index * 3 + 0);
+                int j = wp_mesh_tri(mesh, primitive_index * 3 + 1);
+                int k = wp_mesh_tri(mesh, primitive_index * 3 + 2);
+
+                vec3f p = wp_mesh_point(mesh, i);
+                vec3f q = wp_mesh_point(mesh, j);
+                vec3f r = wp_mesh_point(mesh, k);
+
+                float tri_t, tri_u, tri_v, tri_sign;
+                vec3f n;
+
+                if (wp_intersect_ray_tri_woop(start, dir, p, q, r, tri_t, tri_u, tri_v, tri_sign, n)) {
+                    if (tri_t < min_t && tri_t >= 0.0f) {
+                        min_t = tri_t;
+                        min_face = primitive_index;
+                        min_u = tri_u;
+                        min_v = tri_v;
+                        min_sign = tri_sign;
+                        min_normal = n;
+                        hit = true;
+                    }
+                }
+            }
+            if (stack_size == 0)
+                break;
+            cur_node = stack[--stack_size];
+            continue;
+        }
+
+        // Inner node: load both children so we can sort by entry distance.
+        const int left_index = wp_mesh_node_lower_payload(cur_node);
+        const int right_index = wp_mesh_node_upper_payload(cur_node);
+
+        wp_node_half_t left_lower = mesh.bvh.node_lowers[left_index];
+        wp_node_half_t left_upper = mesh.bvh.node_uppers[left_index];
+        wp_node_half_t right_lower = mesh.bvh.node_lowers[right_index];
+        wp_node_half_t right_upper = mesh.bvh.node_uppers[right_index];
+
+        vec3f ll, lu, rl2, ru2;
+        ll.x = left_lower.x; ll.y = left_lower.y; ll.z = left_lower.z;
+        lu.x = left_upper.x; lu.y = left_upper.y; lu.z = left_upper.z;
+        rl2.x = right_lower.x; rl2.y = right_lower.y; rl2.z = right_lower.z;
+        ru2.x = right_upper.x; ru2.y = right_upper.y; ru2.z = right_upper.z;
+
+        float t0 = WP_FLT_MAX;
+        float t1 = WP_FLT_MAX;
+        const bool h0 = wp_mesh_ray_intersect_aabb(start, dir, rcp_dir, fast_aabb, ll, lu, t0) && t0 < min_t;
+        const bool h1 = wp_mesh_ray_intersect_aabb(start, dir, rcp_dir, fast_aabb, rl2, ru2, t1) && t1 < min_t;
+
+        if (h0 && h1) {
+            const bool near_left = (t0 < t1);
+            if (stack_size >= 64)
+                break;
+            const uint64_t left_node = wp_mesh_node_pack(left_lower, left_upper);
+            const uint64_t right_node = wp_mesh_node_pack(right_lower, right_upper);
+            stack[stack_size++] = near_left ? right_node : left_node;
+            cur_node = near_left ? left_node : right_node;
+        } else if (h0) {
+            cur_node = wp_mesh_node_pack(left_lower, left_upper);
+        } else if (h1) {
+            cur_node = wp_mesh_node_pack(right_lower, right_upper);
+        } else {
+            // Neither child reachable; pop.
+            if (stack_size == 0)
+                break;
+            cur_node = stack[--stack_size];
+        }
+    }
+
+    if (hit) {
+        // write outputs
+        u = min_u;
+        v = min_v;
+        sign = min_sign;
+        t = min_t;
+        normal = normalize(min_normal);
+        face = min_face;
+
+        return true;
+    } else {
+        return false;
+    }
+}
+
+// struct-return wrapper (mesh.h mesh_query_ray 5-arg form)
+struct wp_mesh_query_ray_t {
+    float sign;
+    int face;
+    float t;
+    float u;
+    float v;
+    vec3f normal;
+    bool result;
+};
+
+static inline wp_mesh_query_ray_t wp_mesh_query_ray(wp_mesh mesh, vec3f start, vec3f dir, float max_t, int root) {
+    wp_mesh_query_ray_t query;
+    query.sign = 0.0f;
+    query.face = 0;
+    query.t = 0.0f;
+    query.u = 0.0f;
+    query.v = 0.0f;
+    query.normal = make_vec3f();
+    query.result = false;
+    query.result = wp_mesh_query_ray(mesh, start, dir, max_t, query.t, query.u, query.v, query.sign, query.normal, query.face, root);
+    return query;
+}
+
+// ---- mesh_query_aabb / sphere iterators (mesh.h verbatim skeleton) ---------
+
+// MeshQueryKind: AABB=0, SPHERE=1 (upstream enum class; the concrete kinds
+// select their iterator at warp codegen time — kind is read only on the
+// kind-erased / iter-protocol paths)
+struct wp_mesh_query_aabb_t {
+    wp_mesh mesh;
+    int stack[64];  // BVH_QUERY_STACK_SIZE
+    int count;
+    vec3f input_lower;
+    vec3f input_upper;
+    int prim_cur;
+    int prim_end;
+    int face;
+    bool last_query_valid;
+    int kind;
+    float radius_sq;
+};
+
+// mesh.h mesh_query_impl<IsSphere> shared factory
+static inline wp_mesh_query_aabb_t wp_mesh_query_impl(wp_mesh mesh, vec3f a, vec3f b, float radius, bool is_sphere) {
+    wp_mesh_query_aabb_t query;
+    query.mesh = mesh;
+    query.count = 0;
+    query.prim_cur = 0;
+    query.prim_end = 0;
+    query.last_query_valid = true;
+    query.kind = is_sphere ? 1 : 0;
+    const float r = fmax(radius, 0.0f);
+    query.radius_sq = r * r;
+
+    query.stack[0] = *mesh.bvh.root;
+    query.count = 1;
+    query.input_lower = a;
+    query.input_upper = b;
+
+    return query;
+}
+
+static inline wp_mesh_query_aabb_t wp_mesh_query_aabb(wp_mesh mesh, vec3f lower, vec3f upper) {
+    return wp_mesh_query_impl(mesh, lower, upper, 0.0f, false);
+}
+
+static inline wp_mesh_query_aabb_t wp_mesh_query_sphere(wp_mesh mesh, vec3f center, float radius) {
+    return wp_mesh_query_impl(mesh, center, center, radius, true);
+}
+
+// mesh.h mesh_query_prim_test: broad-phase sphere test against the cached
+// triangle AABB, then an exact closest-point narrow phase (with the
+// degenerate-face longest-edge fallback)
+static inline bool wp_mesh_query_prim_test(const thread wp_mesh_query_aabb_t& query, const thread wp_mesh& mesh, int primitive_index) {
+    if (!wp_intersect_sphere_aabb(query.input_lower, query.radius_sq, mesh.lowers[primitive_index], mesh.uppers[primitive_index]))
+        return false;
+
+    int i = wp_mesh_tri(mesh, primitive_index * 3 + 0);
+    int j = wp_mesh_tri(mesh, primitive_index * 3 + 1);
+    int k = wp_mesh_tri(mesh, primitive_index * 3 + 2);
+    vec3f a = wp_mesh_point(mesh, i);
+    vec3f b = wp_mesh_point(mesh, j);
+    vec3f c = wp_mesh_point(mesh, k);
+
+    const vec3f center = query.input_lower;
+    vec3f cp;
+    // Guard against degenerate (zero-area) faces to avoid NaN from closest_point_to_triangle.
+    vec3f ab = b - a, ac = c - a;
+    vec3f crn = cross(ab, ac);
+    if (dot(crn, crn) == 0.0f) {
+        // Degenerate: collapse to segment or point. Find the longest edge.
+        vec3f bc = c - b;
+        float lab2 = dot(ab, ab), lac2 = dot(ac, ac), lbc2 = dot(bc, bc);
+        vec3f p0, q0;
+        float len2;
+        if (lab2 >= lac2 && lab2 >= lbc2) {
+            p0 = a;
+            q0 = b;
+            len2 = lab2;
+        } else if (lac2 >= lbc2) {
+            p0 = a;
+            q0 = c;
+            len2 = lac2;
+        } else {
+            p0 = b;
+            q0 = c;
+            len2 = lbc2;
+        }
+        vec3f pq = q0 - p0;
+        float t = (len2 > 0.0f) ? clamp(dot(center - p0, pq) / len2, 0.0f, 1.0f) : 0.0f;
+        cp = p0 + t * pq;
+    } else {
+        vec2f uv = wp_closest_point_to_triangle(a, b, c, center);
+        cp = a * uv.x + b * uv.y + c * (1.0f - uv.x - uv.y);
+    }
+    vec3f d = cp - center;
+    return dot(d, d) <= query.radius_sq;
+}
+
+// mesh.h mesh_query_next_impl<AabbNodeTest, AabbPrimitiveTest, false>: the
+// broad-phase AABB iterator (singleton leaves pass on the node test alone —
+// the leaf AABB equals the cached primitive bounds)
+static inline bool wp_mesh_query_aabb_next(thread wp_mesh_query_aabb_t& query, thread int& index) {
+    wp_mesh mesh = query.mesh;
+
+    for (;;) {
+        if (query.prim_cur < query.prim_end) {
+            const int primitive_index = mesh.bvh.primitive_indices[query.prim_cur++];
+
+            const vec3f face_lower = mesh.lowers[primitive_index];
+            const vec3f face_upper = mesh.uppers[primitive_index];
+            if (!wp_intersect_aabb_aabb(query.input_lower, query.input_upper, face_lower, face_upper))
+                continue;
+
+            index = primitive_index;
+            query.face = primitive_index;
+            return true;
+        }
+
+        if (!query.count)
+            return false;
+
+        const int node_index = query.stack[--query.count];
+        wp_node_half_t node_lower = mesh.bvh.node_lowers[node_index];
+        wp_node_half_t node_upper = mesh.bvh.node_uppers[node_index];
+        vec3f nl, nu;
+        nl.x = node_lower.x; nl.y = node_lower.y; nl.z = node_lower.z;
+        nu.x = node_upper.x; nu.y = node_upper.y; nu.z = node_upper.z;
+
+        if (!wp_intersect_aabb_aabb(query.input_lower, query.input_upper, nl, nu))
+            continue;
+
+        const int left_index = (int)(node_lower.u & 0x7fffffffu);
+        const int right_index = (int)(node_upper.u & 0x7fffffffu);
+
+        if ((node_lower.u >> 31u) & 1u) {
+            const int start = left_index;
+            const int end = right_index;
+
+            // Fast path when the leaf contains exactly one primitive (its AABB
+            // is the leaf node's AABB, which just passed the node test)
+            if (end - start == 1) {
+                int primitive_index = mesh.bvh.primitive_indices[start];
+                index = primitive_index;
+                query.face = primitive_index;
+                return true;
+            }
+
+            query.prim_cur = start;
+            query.prim_end = end;
+        } else {
+            query.stack[query.count++] = left_index;
+            query.stack[query.count++] = right_index;
+        }
+    }
+}
+
+// mesh.h mesh_query_next_impl<SphereNodeTest, SpherePrimitiveTest, true>
+static inline bool wp_mesh_query_sphere_next(thread wp_mesh_query_aabb_t& query, thread int& index) {
+    wp_mesh mesh = query.mesh;
+
+    for (;;) {
+        if (query.prim_cur < query.prim_end) {
+            const int primitive_index = mesh.bvh.primitive_indices[query.prim_cur++];
+
+            if (!wp_mesh_query_prim_test(query, mesh, primitive_index))
+                continue;
+
+            index = primitive_index;
+            query.face = primitive_index;
+            return true;
+        }
+
+        if (!query.count)
+            return false;
+
+        const int node_index = query.stack[--query.count];
+        wp_node_half_t node_lower = mesh.bvh.node_lowers[node_index];
+        wp_node_half_t node_upper = mesh.bvh.node_uppers[node_index];
+        vec3f nl, nu;
+        nl.x = node_lower.x; nl.y = node_lower.y; nl.z = node_lower.z;
+        nu.x = node_upper.x; nu.y = node_upper.y; nu.z = node_upper.z;
+
+        if (!wp_intersect_sphere_aabb(query.input_lower, query.radius_sq, nl, nu))
+            continue;
+
+        const int left_index = (int)(node_lower.u & 0x7fffffffu);
+        const int right_index = (int)(node_upper.u & 0x7fffffffu);
+
+        if ((node_lower.u >> 31u) & 1u) {
+            const int start = left_index;
+            const int end = right_index;
+
+            if (end - start == 1) {
+                int primitive_index = mesh.bvh.primitive_indices[start];
+                if (!wp_mesh_query_prim_test(query, mesh, primitive_index))
+                    continue;
+                index = primitive_index;
+                query.face = primitive_index;
+                return true;
+            }
+
+            query.prim_cur = start;
+            query.prim_end = end;
+        } else {
+            query.stack[query.count++] = left_index;
+            query.stack[query.count++] = right_index;
+        }
+    }
+}
+
+// Kind-erased iterator (mesh.h mesh_query_next_dynamic)
+static inline bool wp_mesh_query_next_dynamic(thread wp_mesh_query_aabb_t& query, thread int& index) {
+    if (query.kind == 1)
+        return wp_mesh_query_sphere_next(query, index);
+    return wp_mesh_query_aabb_next(query, index);
+}
+
+// iter protocol overloads (mesh.h iter_next/iter_cmp)
+static inline int wp_iter_next(thread wp_mesh_query_aabb_t& query) { return query.face; }
+static inline bool wp_iter_cmp(thread wp_mesh_query_aabb_t& query) {
+    return wp_mesh_query_next_dynamic(query, query.face);
+}
+
+// ---- mesh_eval_* / mesh_get_* (mesh.h verbatim) ----------------------------
+
+static inline vec3f wp_mesh_eval_position(wp_mesh mesh, int tri, float u, float v) {
+    if (!mesh.points.data)
+        return make_vec3f();
+
+    int i = wp_mesh_tri(mesh, tri * 3 + 0);
+    int j = wp_mesh_tri(mesh, tri * 3 + 1);
+    int k = wp_mesh_tri(mesh, tri * 3 + 2);
+
+    vec3f p = wp_mesh_point(mesh, i);
+    vec3f q = wp_mesh_point(mesh, j);
+    vec3f r = wp_mesh_point(mesh, k);
+
+    return p * u + q * v + r * (1.0f - u - v);
+}
+
+static inline vec3f wp_mesh_eval_velocity(wp_mesh mesh, int tri, float u, float v) {
+    if (!mesh.velocities.data)
+        return make_vec3f();
+
+    int i = wp_mesh_tri(mesh, tri * 3 + 0);
+    int j = wp_mesh_tri(mesh, tri * 3 + 1);
+    int k = wp_mesh_tri(mesh, tri * 3 + 2);
+
+    vec3f vp = wp_mesh_velocity(mesh, i);
+    vec3f vq = wp_mesh_velocity(mesh, j);
+    vec3f vr = wp_mesh_velocity(mesh, k);
+
+    return vp * u + vq * v + vr * (1.0f - u - v);
+}
+
+static inline vec3f wp_mesh_eval_face_normal(wp_mesh mesh, int tri) {
+    if (!mesh.points.data)
+        return make_vec3f();
+
+    int i = wp_mesh_tri(mesh, tri * 3 + 0);
+    int j = wp_mesh_tri(mesh, tri * 3 + 1);
+    int k = wp_mesh_tri(mesh, tri * 3 + 2);
+
+    vec3f p = wp_mesh_point(mesh, i);
+    vec3f q = wp_mesh_point(mesh, j);
+    vec3f r = wp_mesh_point(mesh, k);
+
+    return normalize(cross(q - p, r - p));
+}
+
+static inline vec3f wp_mesh_get_point(wp_mesh mesh, int index) {
+    if (!mesh.points.data)
+        return make_vec3f();
+
+    int i = wp_mesh_tri(mesh, index);
+    return wp_mesh_point(mesh, i);
+}
+
+static inline vec3f wp_mesh_get_velocity(wp_mesh mesh, int index) {
+    if (!mesh.velocities.data)
+        return make_vec3f();
+
+    int i = wp_mesh_tri(mesh, index);
+    return wp_mesh_velocity(mesh, i);
+}
+
+static inline int wp_mesh_get_index(wp_mesh mesh, int face_vertex_index) {
+    if (!mesh.indices.data)
+        return -1;
+
+    return wp_mesh_tri(mesh, face_vertex_index);
+}
+"""
+
 _PRELUDE = (
     "#include <metal_stdlib>\n"
     "#include <metal_atomic>\n"
@@ -1714,6 +2543,8 @@ _PRELUDE = (
     + _BVH_OPS
     + "\n"
     + _BVH_QUERY_OPS
+    + "\n"
+    + _MESH_QUERY_OPS
 )
 
 

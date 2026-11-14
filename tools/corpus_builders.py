@@ -330,7 +330,7 @@ def b_compute_shape_aabbs(rng):
             ("body_q", "arr:transform", _xforms(rng, n)),
             ("shape_transform", "arr:transform", _xforms(rng, n)),
             ("shape_body", "arr:i32", np.arange(n, dtype=np.int32)),
-            ("shape_type", "arr:i32", np.full(n, 4, dtype=np.int32)),  # GEOM_SPHERE-like
+            ("shape_type", "arr:i32", np.full(n, 4, dtype=np.int32)),  # CAPSULE-like
             ("shape_scale", "arr:vec3", np.tile(np.float32([1.0, 1.0, 1.0]), (n, 1))),
             ("shape_collision_radius", "arr:f32", rng.uniform(0.1, 0.5, n).astype(np.float32)),
             ("shape_source_ptr", "arr:u64", np.zeros(n, dtype=np.uint64)),
@@ -349,8 +349,14 @@ def b_compute_shape_aabbs(rng):
             ("geom_data", "io:vec4", rng.standard_normal((n, 4)).astype(np.float32)),
             ("geom_xform", "io:transform", _xforms(rng, n)),
         ],
-        # support-point path calls wp.Mesh device queries — Phase 2 (KEP-0001 M2.x)
-        ["kernel body requires wp.Mesh device queries (SSA wp::Mesh) — Phase 2 (KEP-0001)"],
+        # M2.2: the SSA's wp::Mesh (collision_core.compute_tight_aabb_from_support,
+        # reached through the support-path @wp.func) now translates against the
+        # real wp_mesh struct + per-launch mesh table. The mesh branch stays
+        # runtime-dead here (CONVEX_MESH shapes take the has_local_aabb branch
+        # before the support path, so shape_data.shape_type can never be
+        # CONVEX_MESH there) — the fixture needs no wp.Mesh, and the mesh
+        # table binds empty.
+        [],
     )
 
 
@@ -381,18 +387,46 @@ def b_nxn_broadphase_precomputed_pairs(rng):
 
 
 def b_compute_mesh_plane_vert_counts(rng):
+    """compute_mesh_plane_vert_counts over real wp.Mesh entries (KEP-0001
+    M2.2: the "mesh" key builds wp.Mesh per conformance phase; shape_source
+    carries the ids via the mesh_ids packing). Mesh A is the warp-doc cube
+    (8 verts / 12 tris), mesh B a single triangle (3 verts / 1 tri); pairs
+    reference [A, B, null, A] so vert_counts = [8, 3, 0, 8] exercises the
+    live mesh read, the mesh_get on a second entry, and the id==0 guard."""
+    cube_points = np.array(
+        [
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [0.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    cube_indices = np.array(
+        [0, 3, 2, 0, 2, 1, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4, 2, 3, 7, 2, 7, 6, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5],
+        dtype=np.int32,
+    )
+    tri_points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+    tri_indices = np.array([0, 1, 2], dtype=np.int32)
+
     n = 4
     return (
         [
-            ("shape_pairs_mesh_plane", "arr:vec2i", np.stack([np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.int32)], axis=1)),
+            ("mesh_a", "mesh", {"name": "mesh_a", "points": cube_points, "indices": cube_indices}),
+            ("mesh_b", "mesh", {"name": "mesh_b", "points": tri_points, "indices": tri_indices}),
+            (
+                "shape_pairs_mesh_plane",
+                "arr:vec2i",
+                np.stack(
+                    [np.arange(n, dtype=np.int32), np.zeros(n, dtype=np.int32)],
+                    axis=1,
+                ),
+            ),
             ("shape_pairs_mesh_plane_count", "arr:i32", np.full(1, n, dtype=np.int32)),
-            ("shape_source", "arr:u64", np.zeros(n, dtype=np.uint64)),
+            ("shape_source", "arr:u64", {"mesh_ids": ["mesh_a", "mesh_b", None, "mesh_a"]}),
             ("vert_counts", "out:i32", n),
             ("total_vert_count", "out:i32", 1),
             ("total_num_threads", "scalar:i32", n),
         ],
-        # mesh-geometry vertex layout comes from wp.Mesh device data — Phase 2
-        ["kernel body requires wp.Mesh device queries (SSA wp::Mesh) — Phase 2 (KEP-0001)"],
+        [],
     )
 
 

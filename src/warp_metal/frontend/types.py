@@ -6360,9 +6360,11 @@ class Mesh:
 
         # warp-metal: keep the ORIGINAL array objects (runtime WarpArrays with
         # real device buffers) — the host shim records them for the device
-        # mesh table (runtime/host.py _mesh_table_upload). Upstream passes
-        # __ctype__() views here; their .data field has no GPU address
-        # meaning on Metal.
+        # mesh table (runtime/host.py _mesh_table_upload) and, since M2.2,
+        # builds the per-triangle bounds + embedded BVH from them at creation.
+        # Upstream passes __ctype__() views here; their .data field has no GPU
+        # address meaning on Metal. groups likewise passes as the array object
+        # (upstream core takes int*; the shim reads the values host-side).
         self.id = self.runtime.core.wp_mesh_create_host(
             points,
             velocities if velocities else array().__ctype__(),
@@ -6371,7 +6373,7 @@ class Mesh:
             int(indices.size // 3),
             int(support_winding_number),
             bvh_constructor,
-            ctypes.c_void_p(groups.ptr) if groups else ctypes.c_void_p(0),
+            groups,
             bvh_leaf_size,
         )
 
@@ -6433,9 +6435,9 @@ class Mesh:
 
         self._points = points_new
         if self.device.is_cpu:
-            self.runtime.core.wp_mesh_set_points_host(self.id, points_new.__ctype__())
+            self.runtime.core.wp_mesh_set_points_host(self.id, points_new)
         else:
-            if not self.runtime.core.wp_mesh_set_points_device(self.id, points_new.__ctype__()):
+            if not self.runtime.core.wp_mesh_set_points_device(self.id, points_new):
                 raise RuntimeError(f"Failed to set mesh points: {self.runtime.get_error_string()}")
             self.runtime.verify_cuda_device(self.device)
 
@@ -6464,9 +6466,9 @@ class Mesh:
 
         self._velocities = velocities_new
         if self.device.is_cpu:
-            self.runtime.core.wp_mesh_set_velocities_host(self.id, velocities_new.__ctype__())
+            self.runtime.core.wp_mesh_set_velocities_host(self.id, velocities_new)
         else:
-            self.runtime.core.wp_mesh_set_velocities_device(self.id, velocities_new.__ctype__())
+            self.runtime.core.wp_mesh_set_velocities_device(self.id, velocities_new)
             self.runtime.verify_cuda_device(self.device)
 
 

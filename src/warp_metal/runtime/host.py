@@ -775,9 +775,12 @@ class _ArrMeta(_ctypes.Structure):
     ]
 
 
-# wp_mesh mirrors the MSL struct (msl/prelude.py): {device vec3f* data;
-# wp_arr_meta m} for points + the int32 form for indices. Natural alignment
-# matches the MSL layout (ptr @0/48, meta @8/56; total 96 bytes).
+# wp_mesh mirrors the MSL struct (msl/prelude.py _MESH_QUERY_OPS — the
+# upstream mesh.h struct Mesh port): three {device data ptr; wp_arr_meta}
+# array payloads (48 bytes each), per-triangle bounds pointers, counts, the
+# EMBEDDED BVH (112-byte wp_bvh_t image written in place — upstream embeds
+# the BVH by value and mesh_get_bvh addresses the member), context and
+# average_edge_length. 304 bytes total, natural alignment.
 class _MeshArrayF(_ctypes.Structure):
     _fields_ = [
         ("data", _ctypes.c_uint64),
@@ -792,26 +795,94 @@ class _MeshArrayI(_ctypes.Structure):
     ]
 
 
-class _MeshEntry(_ctypes.Structure):
+class _MeshBVH(_ctypes.Structure):
     _fields_ = [
-        ("points", _MeshArrayF),
-        ("indices", _MeshArrayI),
+        ("node_lowers", _ctypes.c_uint64),
+        ("node_uppers", _ctypes.c_uint64),
+        ("node_parents", _ctypes.c_uint64),
+        ("node_counts", _ctypes.c_uint64),
+        ("primitive_indices", _ctypes.c_uint64),
+        ("root", _ctypes.c_uint64),
+        ("item_lowers", _ctypes.c_uint64),
+        ("item_uppers", _ctypes.c_uint64),
+        ("item_groups", _ctypes.c_uint64),
+        ("max_depth", _ctypes.c_int32),
+        ("max_nodes", _ctypes.c_int32),
+        ("num_nodes", _ctypes.c_int32),
+        ("num_leaf_nodes", _ctypes.c_int32),
+        ("num_items", _ctypes.c_int32),
+        ("leaf_size", _ctypes.c_int32),
+        ("constructor_type", _ctypes.c_int32),
+        ("_pad0", _ctypes.c_int32),
+        ("context", _ctypes.c_uint64),
     ]
 
 
-assert _ctypes.sizeof(_MeshEntry) == 96, _ctypes.sizeof(_MeshEntry)
+assert _ctypes.sizeof(_MeshBVH) == 112, _ctypes.sizeof(_MeshBVH)
+
+
+class _MeshEntry(_ctypes.Structure):
+    _fields_ = [
+        ("points", _MeshArrayF),
+        ("velocities", _MeshArrayF),
+        ("indices", _MeshArrayI),
+        ("lowers", _ctypes.c_uint64),
+        ("uppers", _ctypes.c_uint64),
+        ("solid_angle_props", _ctypes.c_uint64),
+        ("num_points", _ctypes.c_int32),
+        ("num_tris", _ctypes.c_int32),
+        ("bvh", _MeshBVH),
+        ("context", _ctypes.c_uint64),
+        ("average_edge_length", _ctypes.c_float),
+        ("_pad0", _ctypes.c_int32),
+    ]
+
+
+assert _ctypes.sizeof(_MeshEntry) == 304, _ctypes.sizeof(_MeshEntry)
+
+# MSL layout contract (prelude _MESH_QUERY_OPS struct wp_mesh): the embedded
+# BVH starts at byte 176 — mesh_get_bvh routes ids to &entry.bvh via exactly
+# this offset.
+_MESH_BVH_OFF = getattr(_MeshEntry, "bvh").offset
+assert _MESH_BVH_OFF == 176, _MESH_BVH_OFF
 
 
 # the device-side mesh table: one _MeshEntry per registered wp.Mesh (index ==
-# mesh id; entry 0 is the null mesh). Kernels reaching wp.mesh_get bind it as
-# `device wp_mesh* _wp_mesh_table`. Rebuilt (re-uploaded) whenever a mesh is
-# created or its points are replaced — build-time-only work.
+# mesh id; entry 0 is the null mesh). Kernels reaching wp.mesh_get / the mesh
+# query family bind it as `device wp_mesh* _wp_mesh_table`. Rebuilt
+# (re-uploaded) whenever a mesh is created or destroyed — build-time-only work.
 _MESH_TABLE: dict = {"handle": None, "size": 0}
+
+
+class _FaceBounds:
+    """numpy master + shared-storage Metal buffer pair for the per-triangle
+    bounds arrays (the mesh's lowers/uppers — also the embedded BVH's item
+    arrays, matching upstream mesh.cpp which builds the BVH directly over
+    m->lowers/m->uppers). Implements the .numpy()/.buffer surface HostBVH
+    expects from a caller array."""
+
+    def __init__(self, mm, data: np.ndarray):
+        self._mm = mm
+        self._data = np.ascontiguousarray(data, dtype=np.float32)
+        self.buffer = mm.buffer_create(max(self._data.nbytes, 16))
+        self.flush()
+
+    def numpy(self) -> np.ndarray:
+        return self._data
+
+    def flush(self) -> None:
+        dst = (_ctypes.c_char * self._data.nbytes).from_address(self._mm.buffer_ptr(self.buffer))
+        _ctypes.memmove(dst, self._data.view(np.uint8).reshape(-1).tobytes(), self._data.nbytes)
+
+    def release(self) -> None:
+        if self.buffer:
+            self._mm.buffer_release(self.buffer)
+            self.buffer = 0
 
 
 def _mesh_meta(arr) -> _ArrMeta:
     """Meta for a WarpArray or a vendored frontend ``array_t`` (mesh data)."""
-    if hasattr(arr, "buffer"):  # runtime WarpArray
+    if hasattr(arr, "buffer"):  # runtime WarpArray (incl. _FaceBounds)
         return _arr_meta(arr)
     # vendored array_t ctypes struct: data = GPU address, byte strides
     meta = _ArrMeta()
@@ -830,6 +901,97 @@ def _mesh_data_addr(arr) -> int:
     return int(arr.data)
 
 
+def _mesh_array_payload(arr):
+    """(gpu address, meta) for a mesh record array; None arrays stay null."""
+    if arr is None:
+        return 0, None
+    return _mesh_data_addr(arr), _mesh_meta(arr)
+
+
+def _mesh_assets_build(rec: dict) -> None:
+    """Per-triangle bounds + embedded-layout BVH for a mesh record (upstream
+    mesh.cpp mesh_create_host port): triangle bounds from the points/indices,
+    HostBVH over those bounds (constructor/groups/leaf_size verbatim), and
+    average_edge_length = total edge length / (num_tris * 3)."""
+    from .bvh import HostBVH
+
+    points, indices = rec["points"], rec["indices"]
+    num_tris = rec["num_tris"]
+    num_points = rec["num_points"]
+    pts = points.numpy().reshape(-1, 3)[:num_points]
+    idx = indices.numpy().ravel()[: num_tris * 3].astype(np.int64)
+    tri = pts[idx.reshape(num_tris, 3)] if num_tris else np.zeros((0, 3, 3), dtype=np.float32)
+
+    lowers = np.ascontiguousarray(tri.min(axis=1), dtype=np.float32)
+    uppers = np.ascontiguousarray(tri.max(axis=1), dtype=np.float32)
+    lb = _FaceBounds(_mm, lowers)
+    ub = _FaceBounds(_mm, uppers)
+    bvh = HostBVH(lb, ub, rec.get("groups"), rec["bvh_constructor"], rec["bvh_leaf_size"], _mm)
+
+    # edge-length sum (mesh.cpp verbatim: per-triangle 3 edges, summed, then
+    # divided once); 0 tris mirrors the C++ 0.0f/0.0f NaN
+    if num_tris:
+        p0, p1, p2 = tri[:, 0], tri[:, 1], tri[:, 2]
+        el = np.sqrt(((p0 - p1) ** 2).sum(axis=1)) + np.sqrt(((p0 - p2) ** 2).sum(axis=1)) + np.sqrt(((p2 - p1) ** 2).sum(axis=1))
+        avg = np.float32(el.sum() / np.float32(num_tris * 3))
+    else:
+        avg = np.float32("nan")
+
+    rec["face_lowers"] = lb
+    rec["face_uppers"] = ub
+    rec["bvh"] = bvh
+    rec["average_edge_length"] = float(avg)
+
+
+def _mesh_assets_refit(rec: dict) -> None:
+    """mesh.cpp mesh_refit_host port: recompute the per-triangle bounds from
+    the CURRENT points, then refit the tree over them (node buffers re-uploaded
+    in place; the embedded context is address-stable, no table rebuild)."""
+    points, indices = rec["points"], rec["indices"]
+    num_tris, num_points = rec["num_tris"], rec["num_points"]
+    pts = points.numpy().reshape(-1, 3)[:num_points]
+    idx = indices.numpy().ravel()[: num_tris * 3].astype(np.int64)
+    tri = pts[idx.reshape(num_tris, 3)] if num_tris else np.zeros((0, 3, 3), dtype=np.float32)
+
+    lb: _FaceBounds = rec["face_lowers"]
+    ub: _FaceBounds = rec["face_uppers"]
+    lb.numpy()[:] = tri.min(axis=1)
+    ub.numpy()[:] = tri.max(axis=1)
+    lb.flush()
+    ub.flush()
+    rec["bvh"].refit()
+
+
+def _mesh_assets_release(rec: dict) -> None:
+    """Release the record's face-bounds buffers and BVH node buffers (each
+    leaves the residency set in native buffer_release)."""
+    if rec.get("face_lowers") is not None:
+        rec["face_lowers"].release()
+        rec["face_uppers"].release()
+        rec["bvh"].destroy()
+    rec["face_lowers"] = rec["face_uppers"] = rec["bvh"] = None
+
+
+def _fill_mesh_entry(entry: _MeshEntry, rec: dict) -> None:
+    for field in ("points", "velocities", "indices"):
+        addr, meta = _mesh_array_payload(rec.get(field))
+        slot = getattr(entry, field)
+        slot.data = addr
+        if meta is not None:
+            slot.m = meta
+    entry.lowers = _mm.buffer_gpu_address(rec["face_lowers"].buffer)
+    entry.uppers = _mm.buffer_gpu_address(rec["face_uppers"].buffer)
+    entry.solid_angle_props = 0  # winding-number family is fail-loud (M2.2)
+    entry.num_points = rec["num_points"]
+    entry.num_tris = rec["num_tris"]
+    entry.context = 0
+    entry.average_edge_length = rec["average_edge_length"]
+    # embedded wp_bvh_t image (upstream Mesh embeds the BVH by value)
+    ctx = rec["bvh"].embedded_context(_mm).view(np.uint8).reshape(-1).tobytes()
+    dst = (_ctypes.c_char * 112).from_address(_ctypes.addressof(entry) + _MESH_BVH_OFF)
+    _ctypes.memmove(dst, ctx, 112)
+
+
 def _mesh_table_upload() -> int:
     """(Re)build the device mesh table; returns the buffer handle."""
     from ..frontend.registry import _CoreShim
@@ -838,15 +1000,7 @@ def _mesh_table_upload() -> int:
     n = _CoreShim._HOST_MESH_SEQ[0] + 1
     entries = (_MeshEntry * n)()
     for mid, rec in meshes.items():
-        entry = entries[mid]
-        points = rec["points"]
-        indices = rec["indices"]
-        if points is not None:
-            entry.points.data = _mesh_data_addr(points)
-            entry.points.m = _mesh_meta(points)
-        if indices is not None:
-            entry.indices.data = _mesh_data_addr(indices)
-            entry.indices.m = _mesh_meta(indices)
+        _fill_mesh_entry(entries[mid], rec)
     handle = _mm.buffer_create(_ctypes.sizeof(_MeshEntry) * n)
     dst = (_ctypes.c_char * (_ctypes.sizeof(_MeshEntry) * n)).from_address(_mm.buffer_ptr(handle))
     _ctypes.memmove(dst, _ctypes.byref(entries), _ctypes.sizeof(_MeshEntry) * n)

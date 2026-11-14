@@ -471,6 +471,7 @@ def _alloc_array(pkg, key, val, device="cpu"):
 
 
 _PACKED_CONTEXTS: list = []
+_PACKED_MESHES: dict = {}
 
 
 def _pack_args(pkg, args, device="cpu", mod=None):
@@ -488,6 +489,7 @@ def _pack_args(pkg, args, device="cpu", mod=None):
     """
     import numpy as np
 
+    _PACKED_MESHES.clear()
     launch_args, out_arrays, out_names = [], [], []
     dim = _corpus_launch_dim(args)
     for name, key, val in args:
@@ -511,6 +513,17 @@ def _pack_args(pkg, args, device="cpu", mod=None):
                         out_arrays.append(farr)
                         out_names.append(f"{name}.{fname}")
             launch_args.append(inst)
+        elif key.startswith("arr:u64") and isinstance(val, dict):
+            # KEP-0001 M2.2: a u64 array whose content is wp.Mesh ids packed
+            # earlier in the SAME arg list ("mesh" key) — Newton passes mesh
+            # ids to kernels through shape_source-style arrays. None entries
+            # stay 0 (the null mesh the kernels' `id != 0` guards select).
+            ids = val["mesh_ids"]
+            arr = pkg.zeros(len(ids), dtype=pkg.uint64, device=device)
+            view = _arr_view(arr)
+            for i, ref in enumerate(ids):
+                view[i] = 0 if ref is None else _PACKED_MESHES[ref]
+            launch_args.append(arr)
         elif key.startswith("arr:") or key.startswith("io:") or key.startswith(("arr2:", "out2:", "out:")):
             arr = _alloc_array(pkg, key, val, device)
             launch_args.append(arr)
@@ -546,6 +559,21 @@ def _pack_args(pkg, args, device="cpu", mod=None):
             # a freed handle (bus error on the golden side)
             _PACKED_CONTEXTS.append(bvh)
             launch_args.append(int(bvh.id))
+        elif key == "mesh":
+            # KEP-0001 M2.2: build the wp.Mesh per conformance phase (golden:
+            # real warp CPU mesh with its CPU BVH; compare: warp-metal mesh
+            # with the host SAH tree). Only the uint64 id escapes this scope —
+            # keepalive holds the Mesh (compare side releases its buffers in
+            # __del__; golden side frees its CPU tree).
+            points = np.asarray(val["points"], dtype=np.float32)
+            indices = np.asarray(val["indices"], dtype=np.int32)
+            pa = pkg.zeros(len(points), dtype=pkg.vec3, device=device)
+            _arr_view(pa)[:] = points
+            ia = pkg.zeros(len(indices), dtype=pkg.int32, device=device)
+            _arr_view(ia)[:] = indices
+            mesh = pkg.Mesh(points=pa, indices=ia)
+            _PACKED_CONTEXTS.append(mesh)
+            _PACKED_MESHES[val["name"]] = int(mesh.id)
         else:
             raise ValueError(f"bad corpus dtype key {key!r}")
     return launch_args, dim, out_arrays, out_names

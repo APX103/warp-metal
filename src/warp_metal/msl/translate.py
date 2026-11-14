@@ -209,9 +209,15 @@ def msl_type(ctype: str) -> str:
     if ctype == "wp::shape_t":
         return "int4"  # loaded shape vectors index via wp_extract(int4, i)
     if ctype == "wp::Mesh":
-        return "wp_mesh"  # Phase-1 stub (see prelude) — never executed
+        return "wp_mesh"  # full Mesh struct (M2.2; prelude _MESH_QUERY_OPS)
     if ctype == "wp::bvh_query_t":
         return "wp_bvh_query_t"  # M2.1 query family (prelude _BVH_QUERY_OPS)
+    if ctype == "wp::mesh_query_point_t":
+        return "wp_mesh_query_point_t"  # M2.2 struct-return query result
+    if ctype == "wp::mesh_query_ray_t":
+        return "wp_mesh_query_ray_t"  # M2.2 struct-return ray hit
+    if ctype == "wp::mesh_query_aabb_t":
+        return "wp_mesh_query_aabb_t"  # M2.2 aabb/sphere iterator (prelude)
     if ctype.startswith("wp::mesh_query"):
         return "wp_mesh_query_stub"  # tiled AABB query handle stub (prelude)
     if ctype == "wp::spatial_vector_t<wp::float32>":
@@ -357,6 +363,44 @@ _CALL_TABLE = {
     "bvh_query_capsule_next": "wp_bvh_query_next",
     "bvh_query_sphere_next": "wp_bvh_query_next",
     "bvh_query_next_dynamic": "wp_bvh_query_next",
+}
+
+# Mesh device query family (KEP-0001 M2.2; prelude _MESH_QUERY_OPS — upstream
+# mesh.h port). Routed through _call's wp::mesh_* hook: the SSA call's id
+# argument is expanded to `_wp_mesh_table[id]` (a wp_mesh VALUE read from the
+# per-launch mesh table) and the remaining args pass through. mesh.h variants
+# that need sign resolution machinery NOT in this slice raise TranslationError
+# here (fail-loud Non-Goals discipline) — everything upstream taking uint64 id
+# that isn't in this table is rejected.
+_MESH_CALL_TABLE = {
+    # struct-return + ref-out query forms share the MSL name (MSL overloads by
+    # parameter count, exactly like the upstream C++ overloads)
+    "mesh_query_point_no_sign": "wp_mesh_query_point_no_sign",
+    "mesh_query_ray": "wp_mesh_query_ray",
+    # aabb / sphere iterators: the SSA resolves wp.mesh_query_next to the
+    # per-kind native builtin by the query's static type
+    "mesh_query_aabb": "wp_mesh_query_aabb",
+    "mesh_query_sphere": "wp_mesh_query_sphere",
+    "mesh_query_aabb_next": "wp_mesh_query_aabb_next",
+    "mesh_query_sphere_next": "wp_mesh_query_sphere_next",
+    "mesh_query_next": "wp_mesh_query_next_dynamic",
+    "mesh_query_next_dynamic": "wp_mesh_query_next_dynamic",
+    # interpolation + accessors
+    "mesh_eval_position": "wp_mesh_eval_position",
+    "mesh_eval_velocity": "wp_mesh_eval_velocity",
+    "mesh_eval_face_normal": "wp_mesh_eval_face_normal",
+    "mesh_get_point": "wp_mesh_get_point",
+    "mesh_get_velocity": "wp_mesh_get_velocity",
+    "mesh_get_index": "wp_mesh_get_index",
+}
+
+# iterator family: query-first signatures (upstream mesh.h:2327-2346 take the
+# `mesh_query_aabb_t&` by reference — no id argument to expand to the table)
+_MESH_QUERY_FIRST_CALLS = {
+    "mesh_query_aabb_next",
+    "mesh_query_sphere_next",
+    "mesh_query_next",
+    "mesh_query_next_dynamic",
 }
 
 # scalar casts: wp::<scalar>(x) → ((T)(x))
@@ -992,6 +1036,38 @@ class _BodyTranslator:
             # unguarded the same way.
             self.used_mesh = True
             return f"_wp_mesh_table[{self.expr(args[0])}]"
+        if key in ("wp::mesh_get_bvh", "wp::mesh_get_group_root"):
+            # id-semantics mesh helpers (mesh.h mesh_get_bvh/mesh_get_group_root):
+            # both address the mesh's EMBEDDED BVH inside the bound table buffer,
+            # which the M2.1 bvh query family reads through wp_bvh_get directly.
+            if len(args) != (1 if key == "wp::mesh_get_bvh" else 2):
+                raise TranslationError(f"{key} with {len(args)} args")
+            bvh_addr = f"(uint64_t)(&_wp_mesh_table[{self.expr(args[0])}].bvh)"
+            self.used_mesh = True
+            if key == "wp::mesh_get_bvh":
+                return bvh_addr
+            return f"wp_bvh_get_group_root({bvh_addr}, {self.expr(args[1])})"
+        if key.startswith("wp::mesh_"):
+            # M2.2 query family: expand the id argument to the wp_mesh VALUE
+            # read from the per-launch table, then call the prelude port
+            # (upstream dereferences the id via mesh_get; the value copy the
+            # C++ performs happens at the table read here). Unported upstream
+            # variants (sign/winding/tracing machinery) fail loud below.
+            route = _MESH_CALL_TABLE.get(key[4:])
+            if route is None:
+                raise TranslationError(
+                    f"{key}: not in the KEP-0001 M2.2 MSL mesh-query closure "
+                    "(sign/winding-number/tracing variants are ported fail-loud; "
+                    "see prelude _MESH_QUERY_OPS)"
+                )
+            self.used_mesh = True
+            if key[4:] not in _MESH_QUERY_FIRST_CALLS:
+                # the aabb/sphere iterator family is query-first (mesh.h:2327-2346
+                # take `mesh_query_aabb_t& query, int& index` — the mesh rides
+                # inside the query by value), so arg0 passes through untouched.
+                args = list(args)
+                args[0] = f"_wp_mesh_table[{self.expr(args[0])}]"
+            return f"{route}({', '.join(self.expr(a) for a in args)})"
         if key == "wp::tile_extract":
             # extract [0] from a reduced shape-(1,) tile: the shared var the
             # reduction lowered to already holds element 0 for every thread.
@@ -1014,10 +1090,8 @@ class _BodyTranslator:
             # same device struct layout — see prelude); group-root traversal
             # is ported to MSL there
             return "wp_bvh_get_group_root(" + ", ".join(self.expr(a) for a in args) + ")"
-        if key in ("wp::hash_grid_query", "wp::mesh_query"):
-            raise TranslationError(
-                f"{key}: BVH/Mesh device builtins are Phase 2 (KEP-0001); not available in M1.4"
-            )
+        if key == "wp::hash_grid_query":
+            raise TranslationError(f"{key}: HashGrid device builtins are Phase 2 (KEP-0001); not available")
         if key == "wp::static":
             # wp.static(x): compile-time constant expression — emit the arg
             # (the `wp::Any` decl it feeds is deferred to the first assignment)
@@ -1467,12 +1541,16 @@ class _BodyTranslator:
         if spec is not None:
             self.array_args[var] = spec
             return
-        m_mesh = re.match(r"^(var_\w+)\.(points|indices)$", key)
+        m_mesh = re.match(r"^(var_\w+)\.(points|velocities|indices)$", key)
         if m_mesh and m_mesh.group(1) in self.mesh_vars:
             # real wp.Mesh member array (device pointers inside the mesh
-            # table entry — see prelude wp_mesh / runtime/host.py)
+            # struct — see prelude wp_mesh / runtime/host.py; velocities
+            # joined with M2.2's full Mesh struct)
             field = m_mesh.group(2)
-            elem_ctype = "wp::vec_t<3, wp::float32>" if field == "points" else "wp::int32"
+            if field == "indices":
+                elem_ctype = "wp::int32"
+            else:
+                elem_ctype = "wp::vec_t<3, wp::float32>"
             spec = ArgSpec(var, "array", f"wp::array_t<{elem_ctype}>")
             spec.mesh_member = (m_mesh.group(1), field)
             self.array_args[var] = spec
