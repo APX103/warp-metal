@@ -225,12 +225,61 @@ class TestPreludeAtomicSurface(unittest.TestCase):
             PRELUDE,
         )
 
+    def test_float_scalar_sub_cores(self):
+        # the 2-D float sub family delegates here; the pair was missing at
+        # M3.2 and failed every unit's Metal compile (the 22 -> 114 battery
+        # regression). Scalar float sub mirrors the float add cores
+        # (atomic_fetch_sub_explicit, relaxed order).
+        self.assertIn("static inline void wp_atomic_sub(device atomic_float* addr, float value) {", PRELUDE)
+        self.assertIn("static inline float wp_atomic_sub_ret(device atomic_float* addr, float value) {", PRELUDE)
+
     def test_spatial_component_inplace(self):
         self.assertIn("static inline void wp_assign_inplace(thread spatial_vectorf& s, int i, float x) {", PRELUDE)
         self.assertIn("static inline void wp_sub_inplace(thread spatial_vectorf& s, int i, float x) {", PRELUDE)
 
     def test_spatial_scalar_broadcast(self):
         self.assertIn("static inline spatial_vectorf make_spatial_vectorf(float s) {", PRELUDE)
+
+
+class TestPreludeSelfConsistency(unittest.TestCase):
+    """The prelude compiles into EVERY unit: its own internal call
+    delegation must resolve. This is the net that would have caught the
+    M3.2 regression (2-D float sub family delegating to a scalar float
+    wp_atomic_sub/wp_atomic_sub_ret pair that never existed)."""
+
+    BROKEN_SUB_FAMILY = """\
+static inline void wp_atomic_sub_at(device float* d, wp_arr_meta m, int i, int j, float v) {
+    wp_atomic_sub((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+static inline float wp_atomic_sub_ret_at(device float* d, wp_arr_meta m, int i, int j, float v) {
+    return wp_atomic_sub_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+"""
+
+    FIXED_SUB_FAMILY = BROKEN_SUB_FAMILY + """\
+static inline void wp_atomic_sub(device atomic_float* addr, float value) {
+    atomic_fetch_sub_explicit(addr, value, memory_order_relaxed);
+}
+static inline float wp_atomic_sub_ret(device atomic_float* addr, float value) {
+    return atomic_fetch_sub_explicit(addr, value, memory_order_relaxed);
+}
+"""
+
+    def test_stock_prelude_internal_calls_resolve(self):
+        findings = _checker.self_check_prelude()
+        errs = [f for f in findings if f.severity == "ERROR"]
+        self.assertEqual(errs, [], msg="\n".join(repr(e) for e in errs))
+
+    def test_broken_float_sub_family_is_caught(self):
+        findings = _checker.self_check_prelude(self.BROKEN_SUB_FAMILY)
+        errs = [f for f in findings if f.severity == "ERROR"]
+        self.assertEqual(len(errs), 2, msg="\n".join(repr(e) for e in errs))
+        self.assertTrue(all("wp_atomic_sub" in e.message for e in errs))
+
+    def test_fixed_float_sub_family_is_clean(self):
+        findings = _checker.self_check_prelude(self.FIXED_SUB_FAMILY)
+        errs = [f for f in findings if f.severity == "ERROR"]
+        self.assertEqual(errs, [], msg="\n".join(repr(e) for e in errs))
 
 
 class TestEmissionShapes(unittest.TestCase):

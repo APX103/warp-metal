@@ -120,41 +120,85 @@ def _split_params(blob: str) -> list[str]:
     return out
 
 
+class PreludeFn:
+    """Stub of an MSLFunction for check_function: one prelude definition."""
+
+    __slots__ = ("name", "params")
+
+    def __init__(self, name, params):
+        self.name = name
+        self.params = params  # [SimpleNamespace(kind, msl, name, array_fields)]
+
+
+def _parse_param(p: str, index: int):
+    """One prototype parameter -> (kind, msl type, param name)."""
+    p = p.strip()
+    if not p:
+        return None
+    # `device T*` binds a device pointer (devptr); `thread T&` binds a
+    # reference the caller passes by value syntax (value)
+    is_ptr = "*" in p
+    base = re.sub(r"^\s*(?:const\s+)?(?:device|thread|constant|threadgroup)\s+", "", p)
+    base = base.replace("*", "").replace("&", "").strip()
+    tokens = base.split()
+    # strip a trailing parameter *name*: "int i", "vec3f v",
+    # "wp_arr_meta m", "T data" — the last bare identifier is the name
+    # whenever the first token starts a known type vocabulary
+    pname = f"arg{index}"
+    if (
+        len(tokens) >= 2
+        and re.match(r"^[A-Za-z_]\w*$", tokens[-1])
+        and (
+            tokens[0] in _SCALAR_NAMES
+            or tokens[0] == "wp_arr_meta"
+            or "::" in tokens[0]
+            or re.match(r"^(vec\w*|mat\w*|quat\w*|spatial_\w*|transform\w*|atomic_\w*|wp\w*|int\w*|uint\w*|T)$", tokens[0])
+        )
+    ):
+        pname = tokens[-1]
+        base = " ".join(tokens[:-1])
+    base = normalize(base)
+    if base == "void":
+        base = "int"
+    return ("devptr" if is_ptr else "value", base, pname)
+
+
+def parse_functions(src: str) -> list:
+    """Split a prelude-like source into (PreludeFn, body_lines) pairs.
+
+    Uses the prototype regex to find each definition, then brace-balances
+    the body. The prototype parameter view and the DB view share this
+    parser, so they can never drift.
+    """
+    from types import SimpleNamespace
+
+    out = []
+    for m in _RE_PROTO.finditer(src):
+        params = []
+        for p in _split_params(m.group(3)):
+            parsed = _parse_param(p, len(params))
+            if parsed is not None:
+                params.append(SimpleNamespace(kind=parsed[0], msl=parsed[1], name=parsed[2], array_fields=[]))
+        # brace-balance the body from the end of the prototype match
+        i = m.end()
+        depth = 1
+        while depth and i < len(src):
+            if src[i] == "{":
+                depth += 1
+            elif src[i] == "}":
+                depth -= 1
+            i += 1
+        body = src[m.end() : i - 1].splitlines()
+        out.append((PreludeFn(m.group(2), params), body))
+    return out
+
+
 def parse_prototypes(src: str) -> dict[str, list[Proto]]:
     """Parse ``static inline`` definitions into (name -> [Proto])."""
     db: dict[str, list[Proto]] = {}
-    for m in _RE_PROTO.finditer(src):
-        name, blob = m.group(2), m.group(3)
-        params = []
-        for p in _split_params(blob):
-            p = p.strip()
-            if not p:
-                continue
-            # `device T*` binds a device pointer (ptr=True); `thread T&`
-            # binds a reference the caller passes by value syntax (ptr=False)
-            is_ptr = "*" in p
-            base = re.sub(r"^\s*(device|thread|constant|threadgroup)\s+", "", p)
-            base = base.replace("*", "").replace("&", "").strip()
-            tokens = base.split()
-            # strip a trailing parameter *name*: "int i", "vec3f v",
-            # "wp_arr_meta m", "T data" — the last bare identifier is the
-            # name whenever the first token starts a known type vocabulary
-            if (
-                len(tokens) >= 2
-                and re.match(r"^[A-Za-z_]\w*$", tokens[-1])
-                and (
-                    tokens[0] in _SCALAR_NAMES
-                    or tokens[0] == "wp_arr_meta"
-                    or "::" in tokens[0]
-                    or re.match(r"^(vec\w*|mat\w*|quat\w*|spatial_\w*|transform\w*|atomic_\w*|wp\w*|int\w*|uint\w*|T)$", tokens[0])
-                )
-            ):
-                base = " ".join(tokens[:-1])
-            base = normalize(base)
-            if base == "void":
-                base = "int"
-            params.append((base, is_ptr))
-        db.setdefault(name, []).append(Proto(name, params))
+    for fn, _body in parse_functions(src):
+        params = [(p.msl, p.kind == "devptr") for p in fn.params]
+        db.setdefault(fn.name, []).append(Proto(fn.name, params))
     return db
 
 
@@ -184,20 +228,46 @@ class Finding:
 
 
 def _extract_calls(lines):
-    """Yield (name, [arg strings], lineno) for every wp_*/make_* call."""
-    for ln_no, line in enumerate(lines, 1):
-        for m in _RE_CALL.finditer(line):
-            depth, end = 0, m.end()
-            for i in range(m.end() - 1, len(line)):
-                if line[i] == "(":
-                    depth += 1
-                elif line[i] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        end = i
-                        break
-            args = _split_params(line[m.end() : end])
-            yield m.group(1), args, ln_no
+    """Yield (name, [arg strings], lineno) for every wp_*/make_* call.
+
+    Operates on the JOINED body text so calls split across lines parse with
+    correct arity; lineno is the line of the call's opening name.
+    """
+    text = "\n".join(lines)
+    for m in _RE_CALL.finditer(text):
+        depth, end = 0, m.end()
+        for i in range(m.end() - 1, len(text)):
+            if text[i] == "(":
+                depth += 1
+            elif text[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        args = _split_params(text[m.end() : end])
+        lineno = text.count("\n", 0, m.start()) + 1
+        yield m.group(1), args, lineno
+
+
+def self_check_prelude(src=None):
+    """Check every prelude function's INTERNAL calls against the DB.
+
+    The kernel-side net scans kernel + @wp.func bodies; a missing overload
+    INSIDE the prelude itself (one family delegating to a scalar core that
+    was never defined) compiles into every unit and fails the whole
+    battery. This pass walks each prelude definition body instead.
+    """
+    from warp_metal.msl.prelude import PRELUDE as _PRELUDE
+
+    if src is None:
+        src = _PRELUDE
+    db = parse_prototypes(src)
+    findings = []
+    for fn, body in parse_functions(src):
+        if not any(_RE_CALL.search(line) for line in body):
+            continue
+        findings += UnitChecker(db).check_function(f"prelude:{fn.name}", fn, body)
+    return findings
 
 
 class UnitChecker:
@@ -224,6 +294,10 @@ class UnitChecker:
                 if kind == "array":
                     data_map[f"{name}_data"] = normalize(msl)
                     var_map[name] = ("arr", normalize(msl))
+                elif kind == "devptr":
+                    # bare device-pointer parameter (prelude function bodies
+                    # pass pointers under their plain param names)
+                    data_map[name] = normalize(msl)
                 elif kind == "struct":
                     for field, elem in fields:
                         data_map[f"{name}__{field}_data"] = normalize(elem)
@@ -233,10 +307,33 @@ class UnitChecker:
 
     def _classify(self, expr, data_map, var_map):
         e = expr.strip()
-        # unwrap one level of parentheses, then boolean expressions classify
-        # as bool (comparisons and logic feeds wp_where/branching conditions)
-        while e.startswith("(") and e.endswith(")"):
-            e = e[1:-1].strip()
+        # unwrap outer parentheses — only when they truly wrap the whole
+        # expression (the matching close of e[0] must be the last char),
+        # so cast-then-operand chains `(atomic_float*)(x + y)` survive
+        while e.startswith("("):
+            depth, end = 0, -1
+            for i, ch in enumerate(e):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = i
+                        break
+            if end == len(e) - 1:
+                e = e[1:-1].strip()
+            else:
+                break
+        # explicit casts decide the type: `(device atomic_float*)(...)` is
+        # pointer-to-atomic_float however the operand started; `(uint64_t)x`
+        # is a uint64_t value. This is how the prelude legally bridges plain
+        # element pointers to the atomic cores.
+        if m := re.match(r"^\(\s*(?:const\s+)?(?:(?:device|thread|constant|threadgroup)\s+)?([\w:]+)\s*\*\s*\)", e):
+            return ("ptr", normalize(m.group(1)))
+        if m := re.match(r"^\(\s*(?:const\s+)?([\w:]+)\s*\)\s*", e):
+            t = normalize(m.group(1))
+            if t in _SCALAR_NAMES:
+                return ("val", t)
         if re.search(r"(==|!=|<=|>=|<|>|&&|\|\|)", e) and "(" not in e and ")" not in e:
             return ("val", "bool")
         if e in data_map:
@@ -264,10 +361,20 @@ class UnitChecker:
             return ("unknown", e)
         if re.match(r"^\d+$", e):
             return ("lit_int", None)
+        # pointer arithmetic / address-cast chains preserve the base type:
+        # `c + 0`, `(device atomic_float*)((device char*)d + ...)`, `&v[i]` —
+        # if any identifier resolves to a known device pointer, the result
+        # is that pointer
+        for ident in re.findall(r"[A-Za-z_]\w*", e):
+            if ident in data_map:
+                return ("ptr", data_map[ident])
         return ("unknown", e)
 
     def check_function(self, unit_name, fn, lines, args=None):
         findings = []
+        # strip // comments first: they carry helper-name mentions that
+        # would otherwise register as phantom call sites
+        lines = [line.split("//", 1)[0] for line in lines]
         data_map, var_map = self._collect_maps(fn, args)
         # translator-generated kernel preamble locals (kernel_src emits them
         # outside fn.lines): scalar thread index, tile lane, fold guard
@@ -304,7 +411,9 @@ class UnitChecker:
                         # template <typename T> generic: any pointer/value
                         continue
                     if pbase == "wp_arr_meta":
-                        if kind == "meta":
+                        # kernel sites pass `..._m`; prelude sites pass the
+                        # wp_arr_meta parameter directly by name
+                        if kind == "meta" or (kind == "val" and val == "wp_arr_meta"):
                             continue
                         ok = False
                         break
@@ -665,8 +774,17 @@ def run_sweep_mode(module_names):
     from warp_metal.frontend.kernels import Kernel
     from warp_metal.msl.prelude import PRELUDE
 
+    # the prelude compiles into EVERY unit — its own internal delegation
+    # must be checked first (this is the net that catches a family calling
+    # a scalar core that was never defined)
+    self_findings = self_check_prelude()
+    self_errs = [f for f in self_findings if f.severity == "ERROR"]
+    for f in self_findings:
+        if f.severity == "ERROR":
+            print(f"ERROR [prelude-self] {f.message}")
+    total_err = len(self_errs)
+
     proto_db = parse_prototypes(PRELUDE)
-    total_err = 0
     ok = fail = skipped = 0
     for modname in module_names:
         try:
@@ -728,7 +846,19 @@ def main(argv=None):
         default=[],
         help="phase B: module sweep under the shim (module:attr specs or plain module names)",
     )
+    ap.add_argument(
+        "--prelude-self",
+        action="store_true",
+        help="check the prelude's own internal call delegation against its prototype DB",
+    )
     args = ap.parse_args(argv)
+    if args.prelude_self:
+        findings = self_check_prelude()
+        errs = [f for f in findings if f.severity == "ERROR"]
+        for f in findings:
+            print(f"{f.severity} {f.message}")
+        print(f"prelude self-check: {len(errs)} errors, {len(findings) - len(errs)} warnings")
+        return len(errs)
     if args.scenario:
         return _trace_scenario_closure(args.scenario)
     if args.sweep:
