@@ -68,6 +68,7 @@ _MAT_SIZES = {(2, 2): "mat22f", (3, 3): "mat33f", (4, 4): "mat44f"}
 _RE_VEC_T = re.compile(r"^wp::vec_t<(\d+),\s*wp::(float32|int32)>$")
 _RE_MAT_T = re.compile(r"^wp::mat_t<(\d+),\s*(\d+),\s*wp::(float32|int32)>$")
 _RE_GEN_MAT = re.compile(r"^mat(\d+)x(\d+)([fi])$")
+_RE_GEN_VEC = re.compile(r"^vec(\d+)([fi])$")
 _RE_QUAT_T = re.compile(r"^wp::quat_t<wp::float32>$")
 _RE_TRANSFORM_T = re.compile(r"^wp::transform_t<wp::float32>$")
 _RE_ARRAY_T = re.compile(r"^wp::array_t<(.+)>$")
@@ -145,6 +146,17 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
     # scalar element assign (warp assign_inplace(m, i, j, scalar))
     lines.append(
         f"static inline void wp_assign_inplace(thread {msl_t}& m, int i, int j, {elem} v) {{ m.c[i][j] = v; }}"
+    )
+    # scalar element add/sub (warp add/sub_inplace(m, i, j, scalar) — the
+    # codegen's `m[i,j] += x` compound-assign lowering for local mats;
+    # mat.h:841/1262 negative-index wrap, mutation through the thread ref)
+    lines.append(
+        f"static inline void wp_add_inplace(thread {msl_t}& m, int i, int j, {elem} v) {{ "
+        f"if (i < 0) i += {M}; if (j < 0) j += {N}; m.c[i][j] += v; }}"
+    )
+    lines.append(
+        f"static inline void wp_sub_inplace(thread {msl_t}& m, int i, int j, {elem} v) {{ "
+        f"if (i < 0) i += {M}; if (j < 0) j += {N}; m.c[i][j] -= v; }}"
     )
     lines.append(
         f"static inline {msl_t} wp_where(bool c, {msl_t} a, {msl_t} b) {{ return c ? a : b; }}"
@@ -232,6 +244,81 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
     unit.structs[msl_t] = "\n".join(lines)
 
 
+def ensure_vec_def(unit: KernelUnit, msl_t: str) -> None:
+    """Emit the struct def + accessors for a generic ``vecN<f|i>``.
+
+    Mirror of :func:`ensure_mat_def` on the vector side: sizes beyond the
+    fixed ``vec2f``-``vec5f``/``spatial_vectorf`` family (mujoco_warp's vec10
+    cinert/crb, Newton mujoco-glue vec12 eq_data) are generated per
+    translation unit on first use — same machine, sizes driven by what the
+    kernels use. The component layout is the packed ``c[N]`` array (the
+    prelude's named-component forms stop at 5); every helper carries
+    vec.h's negative-index wrap (`if (idx < 0) idx += Length`).
+
+    Componentwise arithmetic (operator+/dot/normalize...) has no live closure
+    and is deliberately NOT generated: a call fails loud at Metal compile
+    (implicit declaration) instead of silently mistranslating.
+    """
+    m = _RE_GEN_VEC.match(msl_t)
+    if m is None or msl_t in unit.structs:
+        return
+    n = int(m.group(1))
+    elem = "float" if m.group(2) == "f" else "int"
+    # the fixed prelude family keeps its named-component layout (vec2f-5f,
+    # vec2i-4i): their names match the generic pattern too, so exclude them
+    # explicitly — a per-unit def here would collide with the prelude struct
+    if n in (_VEC_SIZES if elem == "float" else _VECI_SIZES):
+        return
+    lines = [f"struct {msl_t} {{ {elem} c[{n}]; }};"]
+    # zero-arg (vec.h default ctor: aggregate zero)
+    lines.append(f"static inline {msl_t} make_{msl_t}() {{ {msl_t} v = {{}}; return v; }}")
+    # scalar fill (vec.h vec_t(Type s) broadcast)
+    lines.append(f"static inline {msl_t} make_{msl_t}({elem} s) {{")
+    lines.append(f"    {msl_t} v;")
+    lines.append(f"    for (int i = 0; i < {n}; ++i) v.c[i] = s;")
+    lines.append("    return v;")
+    lines.append("}")
+    # element ctor (wp.vector(...) linear)
+    ctor_args = ", ".join(f"{elem} a{i}" for i in range(n))
+    ctor_body = "\n".join(f"    v.c[{i}] = a{i};" for i in range(n))
+    lines.append(f"static inline {msl_t} make_{msl_t}({ctor_args}) {{")
+    lines.append(f"    {msl_t} v;")
+    lines.append(ctor_body)
+    lines.append("    return v;")
+    lines.append("}")
+    # copy ctor (C++ vec_t(vec_t) memberwise copy — see the prelude copy block)
+    lines.append(f"static inline {msl_t} make_{msl_t}({msl_t} v) {{ return v; }}")
+    # component read (vec.h extract + component_ref, negative wrap)
+    lines.append(
+        f"static inline {elem} wp_extract({msl_t} v, int i) {{ if (i < 0) i += {n}; return v.c[i]; }}"
+    )
+    # register-vector element store (wp::store(v, i, x))
+    lines.append(
+        f"static inline {msl_t} wp_vec_insert({msl_t} v, int i, {elem} x) {{ "
+        f"{msl_t} r = v; if (i < 0) i += {n}; r.c[i] = x; return r; }}"
+    )
+    # element assign/add/sub (vec.h assign/add/sub_inplace: mutation through
+    # the thread ref, negative wrap)
+    lines.append(
+        f"static inline void wp_assign_inplace(thread {msl_t}& v, int i, {elem} x) {{ "
+        f"if (i < 0) i += {n}; v.c[i] = x; }}"
+    )
+    lines.append(
+        f"static inline void wp_add_inplace(thread {msl_t}& v, int i, {elem} x) {{ "
+        f"if (i < 0) i += {n}; v.c[i] += x; }}"
+    )
+    lines.append(
+        f"static inline void wp_sub_inplace(thread {msl_t}& v, int i, {elem} x) {{ "
+        f"if (i < 0) i += {n}; v.c[i] -= x; }}"
+    )
+    # lvalue element access (wp::indexref `&v[i]`, matching wp_vec_ref)
+    lines.append(
+        f"static inline thread {elem}& wp_vec_ref(thread {msl_t}& v, int i) {{ "
+        f"if (i < 0) i += {n}; return v.c[i]; }}"
+    )
+    unit.structs[msl_t] = "\n".join(lines)
+
+
 def msl_type(ctype: str) -> str:
     """Map a warp-native C++ type string from the SSA text to an MSL type."""
     ctype = ctype.strip()
@@ -242,7 +329,9 @@ def msl_type(ctype: str) -> str:
         sizes = _VEC_SIZES if m.group(2) == "float32" else _VECI_SIZES
         if n in sizes:
             return sizes[n]
-        raise TranslationError(f"wp::vec_t<{n}> has no MSL mapping")
+        # generic size; def emitted per unit (ensure_vec_def — same machine
+        # as the generic mat flow below)
+        return f"vec{n}{'f' if m.group(2) == 'float32' else 'i'}"
     if m := _RE_MAT_T.match(ctype):
         key = (int(m.group(1)), int(m.group(2)))
         if m.group(3) == "float32" and key in _MAT_SIZES:
@@ -401,6 +490,12 @@ _CALL_TABLE = {
     "extract": "wp_extract",
     "where": "wp_where",
     "assign_inplace": "wp_assign_inplace",
+    # compound element assign on LOCAL aggregates (codegen subscript-augassign
+    # lowering: `v[i] += x` / `m[i,j] -= x`); fixed vec/quat/mat overloads in
+    # the prelude, generic mat/vec sizes generated per unit (see
+    # ensure_mat_def / ensure_vec_def) — KEP-0001 M3.2 package c
+    "add_inplace": "wp_add_inplace",
+    "sub_inplace": "wp_sub_inplace",
     # quat
     "quat_identity": "wp_quat_identity",
     "quat_inverse": "wp_quat_inverse",
@@ -3279,6 +3374,17 @@ class _BodyTranslator:
             msl_t = f"mat{m_ctor.group(1)}x{m_ctor.group(2)}{'f' if m_ctor.group(3) == 'float32' else 'i'}"
             ensure_mat_def(self.unit, msl_t)
             return f"make_{msl_t}({', '.join(self.expr(a) for a in args)})"
+        m_vctor = re.match(r"^wp::vec_t<(\d+), wp::(float32|int32)>$", key)
+        if m_vctor and int(m_vctor.group(1)) not in (
+            _VEC_SIZES if m_vctor.group(2) == "float32" else _VECI_SIZES
+        ):
+            # generic-size vector constructor (mujoco_warp vec10 cinert/crb
+            # locals `vec10()`, Newton mujoco-glue vec12 eq_data): zero-arg,
+            # scalar-fill and element forms all route through the generated
+            # make_ factory (KEP-0001 M3.2 package c)
+            msl_t = f"vec{m_vctor.group(1)}{'f' if m_vctor.group(2) == 'float32' else 'i'}"
+            ensure_vec_def(self.unit, msl_t)
+            return f"make_{msl_t}({', '.join(self.expr(a) for a in args)})"
         if key == "wp::copy":
             return self.expr(args[0])
         if key == "wp::trace":
@@ -3922,6 +4028,8 @@ class _BodyTranslator:
                 raise TranslationError(f"decl line {line!r}: {e}")
             if _RE_GEN_MAT.match(msl_t):
                 ensure_mat_def(self.unit, msl_t)
+            elif _RE_GEN_VEC.match(msl_t):
+                ensure_vec_def(self.unit, msl_t)
             # warp constant tables arrive as flattened brace initializers
             # (row-major linear, matching the struct's c[M][N] layout); MSL
             # wants per-row braces, so reshape flat → rows for generic mats

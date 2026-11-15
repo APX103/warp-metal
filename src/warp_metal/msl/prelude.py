@@ -394,6 +394,113 @@ static inline thread int& wp_vec_ref(thread vec3i& v, int i) { if (i < 0) i += 3
 static inline thread int& wp_vec_ref(thread vec4i& v, int i) { if (i < 0) i += 4; return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : v.w)); }
 static inline thread float& wp_vec_ref(thread quatf& q, int i) { if (i < 0) i += 4; return i == 0 ? q.x : (i == 1 ? q.y : (i == 2 ? q.z : q.w)); }
 
+// ---- add/sub_inplace (KEP-0001 M3.2 package c) ----
+// The vendored codegen lowers `v[i] += x` / `m[i,j] -= x` on LOCAL
+// vec/mat/quat variables to wp::add_inplace / wp::sub_inplace (codegen.py
+// subscript-augassign; a reference target falls back to load-op-store
+// upstream, so only locals reach here). Semantics mirrored verbatim from
+// upstream native: vec.h:628 add_inplace / sub_inplace (`if (idx < 0)
+// idx += Length; v[idx] += value`, mutation through the reference — the MSL
+// `thread T&` parameter binds the caller's lvalue exactly like
+// wp_assign_inplace above), mat.h:841/1262 element form (both indices wrap),
+// quat.h:504/587. Generated generic mat/vec sizes get the same helpers from
+// ensure_mat_def / ensure_vec_def; the 3-arg mat-row form (mat.h add_inplace
+// (m, row, vec)) stays fail-loud (no MSL overload — Metal compile error).
+static inline void wp_add_inplace(thread vec2f& v, int i, float x) {
+    if (i < 0) i += 2;
+    if (i == 0) { v.x += x; } else { v.y += x; }
+}
+static inline void wp_sub_inplace(thread vec2f& v, int i, float x) {
+    if (i < 0) i += 2;
+    if (i == 0) { v.x -= x; } else { v.y -= x; }
+}
+static inline void wp_add_inplace(thread vec3f& v, int i, float x) {
+    if (i < 0) i += 3;
+    if (i == 0) { v.x += x; } else if (i == 1) { v.y += x; } else { v.z += x; }
+}
+static inline void wp_sub_inplace(thread vec3f& v, int i, float x) {
+    if (i < 0) i += 3;
+    if (i == 0) { v.x -= x; } else if (i == 1) { v.y -= x; } else { v.z -= x; }
+}
+static inline void wp_add_inplace(thread vec4f& v, int i, float x) {
+    if (i < 0) i += 4;
+    if (i == 0) { v.x += x; } else if (i == 1) { v.y += x; } else if (i == 2) { v.z += x; } else { v.w += x; }
+}
+static inline void wp_sub_inplace(thread vec4f& v, int i, float x) {
+    if (i < 0) i += 4;
+    if (i == 0) { v.x -= x; } else if (i == 1) { v.y -= x; } else if (i == 2) { v.z -= x; } else { v.w -= x; }
+}
+static inline void wp_add_inplace(thread vec5f& v, int i, float x) {
+    if (i < 0) i += 5;
+    if (i == 0) v.x += x; else if (i == 1) v.y += x; else if (i == 2) v.z += x; else if (i == 3) v.w += x; else v.u += x;
+}
+static inline void wp_sub_inplace(thread vec5f& v, int i, float x) {
+    if (i < 0) i += 5;
+    if (i == 0) v.x -= x; else if (i == 1) v.y -= x; else if (i == 2) v.z -= x; else if (i == 3) v.w -= x; else v.u -= x;
+}
+static inline void wp_add_inplace(thread vec2i& v, int i, int x) {
+    if (i < 0) i += 2;
+    if (i == 0) { v.x += x; } else { v.y += x; }
+}
+static inline void wp_sub_inplace(thread vec2i& v, int i, int x) {
+    if (i < 0) i += 2;
+    if (i == 0) { v.x -= x; } else { v.y -= x; }
+}
+static inline void wp_add_inplace(thread vec3i& v, int i, int x) {
+    if (i < 0) i += 3;
+    if (i == 0) { v.x += x; } else if (i == 1) { v.y += x; } else { v.z += x; }
+}
+static inline void wp_sub_inplace(thread vec3i& v, int i, int x) {
+    if (i < 0) i += 3;
+    if (i == 0) { v.x -= x; } else if (i == 1) { v.y -= x; } else { v.z -= x; }
+}
+static inline void wp_add_inplace(thread vec4i& v, int i, int x) {
+    if (i < 0) i += 4;
+    if (i == 0) { v.x += x; } else if (i == 1) { v.y += x; } else if (i == 2) { v.z += x; } else { v.w += x; }
+}
+static inline void wp_sub_inplace(thread vec4i& v, int i, int x) {
+    if (i < 0) i += 4;
+    if (i == 0) { v.x -= x; } else if (i == 1) { v.y -= x; } else if (i == 2) { v.z -= x; } else { v.w -= x; }
+}
+static inline void wp_add_inplace(thread quatf& q, int i, float x) {
+    if (i < 0) i += 4;
+    if (i == 0) { q.x += x; } else if (i == 1) { q.y += x; } else if (i == 2) { q.z += x; } else { q.w += x; }
+}
+static inline void wp_sub_inplace(thread quatf& q, int i, float x) {
+    if (i < 0) i += 4;
+    if (i == 0) { q.x -= x; } else if (i == 1) { q.y -= x; } else if (i == 2) { q.z -= x; } else { q.w -= x; }
+}
+static inline void wp_add_inplace(thread mat22f& m, int i, int j, float x) {
+    if (i < 0) i += 2;
+    if (j < 0) j += 2;
+    m.c[i][j] += x;
+}
+static inline void wp_sub_inplace(thread mat22f& m, int i, int j, float x) {
+    if (i < 0) i += 2;
+    if (j < 0) j += 2;
+    m.c[i][j] -= x;
+}
+static inline void wp_add_inplace(thread mat33f& m, int i, int j, float x) {
+    if (i < 0) i += 3;
+    if (j < 0) j += 3;
+    m.c[i][j] += x;
+}
+static inline void wp_sub_inplace(thread mat33f& m, int i, int j, float x) {
+    if (i < 0) i += 3;
+    if (j < 0) j += 3;
+    m.c[i][j] -= x;
+}
+static inline void wp_add_inplace(thread mat44f& m, int i, int j, float x) {
+    if (i < 0) i += 4;
+    if (j < 0) j += 4;
+    m.c[i][j] += x;
+}
+static inline void wp_sub_inplace(thread mat44f& m, int i, int j, float x) {
+    if (i < 0) i += 4;
+    if (j < 0) j += 4;
+    m.c[i][j] -= x;
+}
+
 // ---- componentwise operators (vec.h operator overloads) ----
 static inline vec2f operator+(vec2f a, vec2f b) { return make_vec2f(a.x+b.x, a.y+b.y); }
 static inline vec2f operator-(vec2f a, vec2f b) { return make_vec2f(a.x-b.x, a.y-b.y); }
