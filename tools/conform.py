@@ -473,6 +473,36 @@ CORPUS_TABLE = [
     ),
     ("mujoco_warp._src.smooth", "_cinert", "cinert"),
     ("mujoco_warp._src.forward", "_implicit_free_body", "implicit_free_body"),
+    # KEP-0001 M3.2 package b: the mujoco_warp tile closure (recon B.4) —
+    # JTDAJ dense pair (scatter_add / arange / ones / broadcast / matmul
+    # chain, solver block_dim=128) and the block-cholesky pair
+    # (tile_load_indexed CSR gather with the io.py:1224 sentinel, smooth
+    # block_dim=32). TileSet factory args are built per side with the
+    # ambient wp package (only .size feeds the @cache_kernel specialization).
+    (
+        "mujoco_warp._src.solver",
+        "_update_gradient_JTDAJ_dense_tiled_compact",
+        "jtdaj_dense_compact",
+        ("_update_gradient_JTDAJ_dense_tiled_compact", [16, 16, 8]),
+    ),
+    (
+        "mujoco_warp._src.solver",
+        "_update_gradient_JTDAJ_dense_tiled",
+        "jtdaj_dense",
+        ("_update_gradient_JTDAJ_dense_tiled", [16, 16, 8, 12]),
+    ),
+    (
+        "mujoco_warp._src.smooth",
+        "_tile_cholesky_factorize_block",
+        "tile_cholesky_factorize_block",
+        ("_tile_cholesky_factorize_block", [("__tileset__", 4)]),
+    ),
+    (
+        "mujoco_warp._src.smooth",
+        "_tile_cholesky_factorize_solve_block",
+        "tile_cholesky_factorize_solve_block",
+        ("_tile_cholesky_factorize_solve_block", [("__tileset__", 4)]),
+    ),
 ]
 
 _GJK_SKIP = "GJK/MPR factory kernel calls @wp.func_native support functions (Metal translation: Phase 2)"
@@ -499,10 +529,31 @@ def _resolve_kernel(mod, qualname, factory):
         return getattr(mod, qualname)
     fname, fargs = factory
     fn = getattr(mod, fname)
-    args = [
-        getattr(mod, a) if isinstance(a, str) and hasattr(mod, a) else a
-        for a in fargs
-    ]
+    args = []
+    for a in fargs:
+        if isinstance(a, tuple) and a and a[0] == "__tileset__":
+            # KEP-0001 M3.2: TileSet factory arg (mjw block-cholesky pair).
+            # Built with the ambient wp package (real warp in the golden
+            # phase, the shim in the compare phase) — the @cache_kernel
+            # specialization reads only tile.size; the dummy arrays stand in
+            # for the dataclass fields (launch-time fixtures bind the real
+            # elemid/adr arrays as kernel args).
+            from mujoco_warp._src.types import TileSet
+
+            import warp as _wp
+
+            size = int(a[1])
+            args.append(
+                TileSet(
+                    adr=_wp.array([0], dtype=_wp.int32),
+                    size=size,
+                    elemid=_wp.array([0] * (size * size), dtype=_wp.int32),
+                )
+            )
+        elif isinstance(a, str) and hasattr(mod, a):
+            args.append(getattr(mod, a))
+        else:
+            args.append(a)
     return fn(*args)
 
 

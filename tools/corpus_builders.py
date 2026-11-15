@@ -1622,6 +1622,132 @@ def b_implicit_free_body(rng):
     return (args, [])
 
 
+# ---- KEP-0001 M3.2 package b: the mujoco_warp tile closure (recon B.4) ----
+# Launch discipline mirrors the real Newton-path call sites: the solver pair
+# runs launch_tiled dim=(nworld,) block_dim=128 (solver.py:3466-3486), the
+# smooth pair dim=(nworld, nblock) block_dim=32 (smooth.py:1388/3971). CPU
+# goldens resolve the same block_dim to the serial bd=1 scalar tier, so the
+# arithmetic order per element (k ascending matmul, unique-address scatter)
+# is identical on both sides and the rows are bit-comparable.
+
+_JTDAJ_NV_PAD = 16
+_JTDAJ_NJMAX = 8
+_JTDAJ_NWORLD = 2
+_JTDAJ_NCSR = 12  # nC: CSR entry count; sentinel value == nC reads as zero
+
+
+def b_jtdaj_dense_compact(rng):
+    """mujoco_warp solver._update_gradient_JTDAJ_dense_tiled_compact(16, 16, 8):
+    njmax=8 < tile_size=16 pins the in-kernel tile_size=8 branch. world0 has
+    nefc == njmax (every active-check lane taken), world1 nefc=5 (the
+    zero-branch lanes exercise _active_check's masking); efc_state mixes ±1
+    (the _state_check zero branch). All domains in-bounds."""
+    nefc = np.array([8, 5], dtype=np.int32)
+    m = (rng.standard_normal((_JTDAJ_NWORLD, _JTDAJ_NV_PAD, _JTDAJ_NV_PAD)) * 0.5).astype(np.float32)
+    jac = (rng.standard_normal((_JTDAJ_NWORLD, _JTDAJ_NJMAX, _JTDAJ_NV_PAD)) * 0.5).astype(np.float32)
+    diag = (rng.standard_normal((_JTDAJ_NWORLD, _JTDAJ_NJMAX)) * 0.25 + 1.0).astype(np.float32)
+    state = rng.integers(-1, 2, size=(_JTDAJ_NWORLD, _JTDAJ_NJMAX)).astype(np.int32)
+    args = [
+        ("nefc_in", "arr:i32", nefc),
+        ("M_in", "arr3:f32", m),
+        ("efc_J_in", "arr3:f32", jac),
+        ("efc_D_in", "arr2:f32", diag),
+        ("efc_state_in", "arr2:i32", state),
+        ("ctx_done_in", "arr:bool", np.zeros(_JTDAJ_NWORLD, dtype=bool)),
+        ("ctx_h_out", "out3:f32", (_JTDAJ_NWORLD, _JTDAJ_NV_PAD, _JTDAJ_NV_PAD)),
+        ("__dim__", "", (_JTDAJ_NWORLD,)),
+        ("__block_dim__", "", 128),
+    ]
+    return (args, [])
+
+
+def b_jtdaj_dense(rng):
+    """mujoco_warp solver._update_gradient_JTDAJ_dense_tiled(16, 16, 8, 12):
+    the CSR densify variant. Scatter addresses pos = colind*nv_pad + hinit
+    are pairwise unique and < nv_pad^2 (the Atomic=false tile_scatter_add
+    premise); 12 CSR entries over a 256-slot tile leaves the tile_zeros
+    remainder at zero (partial scatter). Same nefc mix as the compact row."""
+    pos = np.arange(2, 2 + _JTDAJ_NCSR * 10, 10, dtype=np.int32)  # 2..112, unique, < 256
+    colind = (pos // _JTDAJ_NV_PAD).astype(np.int32)
+    hinit = (pos % _JTDAJ_NV_PAD).astype(np.int32)
+    nefc = np.array([8, 5], dtype=np.int32)
+    csr = (rng.standard_normal((_JTDAJ_NWORLD, _JTDAJ_NCSR)) * 0.5).astype(np.float32)
+    jac = (rng.standard_normal((_JTDAJ_NWORLD, _JTDAJ_NJMAX, _JTDAJ_NV_PAD)) * 0.5).astype(np.float32)
+    diag = (rng.standard_normal((_JTDAJ_NWORLD, _JTDAJ_NJMAX)) * 0.25 + 1.0).astype(np.float32)
+    state = rng.integers(-1, 2, size=(_JTDAJ_NWORLD, _JTDAJ_NJMAX)).astype(np.int32)
+    args = [
+        ("M_colind", "arr:i32", colind),
+        ("M_hinit_i", "arr:i32", hinit),
+        ("nefc_in", "arr:i32", nefc),
+        ("M_in", "arr2:f32", csr),
+        ("efc_J_in", "arr3:f32", jac),
+        ("efc_D_in", "arr2:f32", diag),
+        ("efc_state_in", "arr2:i32", state),
+        ("ctx_done_in", "arr:bool", np.zeros(_JTDAJ_NWORLD, dtype=bool)),
+        ("ctx_h_out", "out3:f32", (_JTDAJ_NWORLD, _JTDAJ_NV_PAD, _JTDAJ_NV_PAD)),
+        ("__dim__", "", (_JTDAJ_NWORLD,)),
+        ("__block_dim__", "", 128),
+    ]
+    return (args, [])
+
+
+_TILE_BLOCK_NC = 16  # CSR length; sentinel value == nC marks absent pairs
+_TILE_BLOCK_ELEMID = np.array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 16, 16, 16, 16, 15], dtype=np.int32)
+
+
+def _tile_block_m(rng):
+    """CSR values for the gathered 4x4 upper block
+    [[2,.2,0,.1],[_,2,.2,0],[_,_,2,0],[_,_,_,2]] — diagonally dominant SPD
+    so tile_cholesky_inplace<upper> and its solve stay finite on both
+    sides; the sentinel slots (elemid == nC) read T{} zero through the
+    tile_load_indexed bounds check (io.py:1224 discipline)."""
+    del rng
+    m = np.zeros(_TILE_BLOCK_NC, dtype=np.float32)
+    for slot in (0, 5, 10, 15):
+        m[slot] = 2.0  # block diagonals
+    m[1] = 0.2
+    m[6] = 0.2
+    m[3] = 0.1
+    return m
+
+
+def b_tile_cholesky_factorize_block(rng):
+    """mujoco_warp smooth._tile_cholesky_factorize_block(TileSet(size=4)):
+    one (world, block) group; block_elemid carries real CSR indices plus
+    four sentinels == nC (the OOB-reads-zero discipline). Launch mirrors
+    smooth.py:1388 (dim=(nworld, tile.adr.size), block_dim=32)."""
+    args = [
+        ("qLD_block_adr", "arr:i32", np.array([0], dtype=np.int32)),
+        ("M_in", "arr2:f32", _tile_block_m(rng).reshape(1, _TILE_BLOCK_NC)),
+        ("block_elemid", "arr:i32", _TILE_BLOCK_ELEMID.copy()),
+        ("block_dof", "arr:i32", np.array([0], dtype=np.int32)),
+        ("L_out", "out2:f32", (1, _TILE_BLOCK_NC)),
+        ("__dim__", "", (1, 1)),
+        ("__block_dim__", "", 32),
+    ]
+    return (args, [])
+
+
+def b_tile_cholesky_factorize_solve_block(rng):
+    """mujoco_warp smooth._tile_cholesky_factorize_solve_block(TileSet(4)):
+    the fused factor+solve variant — same fixture plus a nonzero rhs y
+    (x = L-upper-solve result, finite by the SPD block)."""
+    y = np.zeros((1, _TILE_BLOCK_NC), dtype=np.float32)
+    y[0, :4] = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
+    args = [
+        ("qLD_block_adr", "arr:i32", np.array([0], dtype=np.int32)),
+        ("M_in", "arr2:f32", _tile_block_m(rng).reshape(1, _TILE_BLOCK_NC)),
+        ("block_elemid", "arr:i32", _TILE_BLOCK_ELEMID.copy()),
+        ("block_dof", "arr:i32", np.array([0], dtype=np.int32)),
+        ("y", "arr2:f32", y),
+        ("x", "out2:f32", (1, _TILE_BLOCK_NC)),
+        ("L_out", "out2:f32", (1, _TILE_BLOCK_NC)),
+        ("__dim__", "", (1, 1)),
+        ("__block_dim__", "", 32),
+    ]
+    return (args, [])
+
+
 BUILDERS = {
     name[2:]: fn  # strip leading "b_"
     for name, fn in list(globals().items())
