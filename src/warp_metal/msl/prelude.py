@@ -397,6 +397,21 @@ static inline thread int& wp_vec_ref(thread vec3i& v, int i) { if (i < 0) i += 3
 static inline thread int& wp_vec_ref(thread vec4i& v, int i) { if (i < 0) i += 4; return i == 0 ? v.x : (i == 1 ? v.y : (i == 2 ? v.z : v.w)); }
 static inline thread float& wp_vec_ref(thread quatf& q, int i) { if (i < 0) i += 4; return i == 0 ? q.x : (i == 1 ? q.y : (i == 2 ? q.z : q.w)); }
 
+// device-space overloads (KEP-0001 M3.2): the inline `&(wp::index(arr, ...)
+// .component_ref(k))` store target (chained subscript stores, e.g. mjw
+// _comvel_root / Newton update_axis_properties) lowers to
+// `wp_vec_ref(*wp_address(...), k) = v` — the element lives in device
+// memory, so the reference must carry the device qualifier (thread-space
+// overloads don't bind across address spaces). Same component map as the
+// extract family (spatial w/v dispatch; negative wrap).
+static inline device float& wp_vec_ref(device vec2f& v, int i) { if (i < 0) i += 2; return i == 0 ? v.x : v.y; }
+static inline device float& wp_vec_ref(device vec3f& v, int i) { if (i < 0) i += 3; return i == 0 ? v.x : (i == 1 ? v.y : v.z); }
+static inline device int& wp_vec_ref(device vec2i& v, int i) { if (i < 0) i += 2; return i == 0 ? v.x : v.y; }
+static inline device float& wp_vec_ref(device spatial_vectorf& v, int i) {
+    if (i < 0) i += 6;
+    return i < 3 ? wp_vec_ref(v.w, i) : wp_vec_ref(v.v, i - 3);
+}
+
 // ---- add/sub_inplace (KEP-0001 M3.2 package c) ----
 // The vendored codegen lowers `v[i] += x` / `m[i,j] -= x` on LOCAL
 // vec/mat/quat variables to wp::add_inplace / wp::sub_inplace (codegen.py

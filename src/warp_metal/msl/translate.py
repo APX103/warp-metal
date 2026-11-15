@@ -297,6 +297,14 @@ def ensure_vec_def(unit: KernelUnit, msl_t: str) -> None:
         f"static inline {msl_t} wp_vec_insert({msl_t} v, int i, {elem} x) {{ "
         f"{msl_t} r = v; if (i < 0) i += {n}; r.c[i] = x; return r; }}"
     )
+    # device-space lvalue element access — the inline
+    # `&(wp::index(arr, ...).component_ref(k))` store target lowers to
+    # `wp_vec_ref(*wp_address(...), k) = v` (see the prelude device block);
+    # the generated element type lives in device memory
+    lines.append(
+        f"static inline device {elem}& wp_vec_ref(device {msl_t}& v, int i) {{ "
+        f"if (i < 0) i += {n}; return v.c[i]; }}"
+    )
     # element assign/add/sub (vec.h assign/add/sub_inplace: mutation through
     # the thread ref, negative wrap)
     lines.append(
@@ -1872,9 +1880,15 @@ class _BodyTranslator:
     # wrap through wp_address like every array access), tile_store silently
     # drops them, both selected by the compile-time bounds_check template.
 
-    def _tile_addr(self, spec: ArgSpec, idx_srcs: list[str]) -> str:
+    def _elem_addr(self, spec: ArgSpec, idx_srcs: list[str]) -> str:
+        """Element pointer through wp_address (data + meta byte math). Shared
+        by the tile load/store passes and the inline ``&(wp::index(...)
+        .component_ref(k))`` store target (chained subscript stores)."""
         meta = self._meta_ref(spec)
         return f"wp_address({self._data_expr(spec)}, {meta}, {', '.join(idx_srcs)})"
+
+    # Historical alias (tile-only era); kept so external callers don't break.
+    _tile_addr = _elem_addr
 
     def _parse_tile_io(self, rhs: str, what: str, with_shape: bool) -> tuple[str, bool, list[int], list[str]]:
         """(elem, bounds_check, dims, call args) behind a tile_load/tile_store
@@ -3443,6 +3457,30 @@ class _BodyTranslator:
                 # store through an element pointer (wp::indexref result or a
                 # wp::address into an array): `wp::store(p, v)` → *p = v
                 tgt = args[0].strip()
+                # Inline component store through an array element address:
+                # `wp::store(&(wp::index(arr, i[, j]).component_ref(k)), v)` —
+                # upstream's lowering of a chained subscript store
+                # (`cvel_out[w, 0][e] = 0.0`; mjw _comvel_root, Newton
+                # update_axis_properties). Same element pointer the alias
+                # path emits; the device-space wp_vec_ref overload picks the
+                # component (negative wrap, spatial w/v dispatch).
+                m_comp = re.match(
+                    r"^&\(wp::index\((.*)\)\.component_ref\(([^()]+)\)\)$", tgt
+                )
+                if m_comp:
+                    iargs = split_args(m_comp.group(1))
+                    arr_var = iargs[0].strip()
+                    spec = self.array_args.get(arr_var)
+                    if spec is None:
+                        raise TranslationError(
+                            f"wp::store &(...component_ref) target on non-array arg {arr_var!r}"
+                        )
+                    idx_srcs = [self.expr(a) for a in iargs[1:]]
+                    k_src = self.expr(m_comp.group(2))
+                    return (
+                        f"(wp_vec_ref(*{self._elem_addr(spec, idx_srcs)}, {k_src})"
+                        f" = {self.expr(args[1])})"
+                    )
                 alias = self.aliases.get(tgt)
                 if alias is None or not alias[0]:
                     raise TranslationError(f"wp::store target {tgt!r} is not a pointer alias")
@@ -4170,6 +4208,21 @@ class _BodyTranslator:
             return
         # &(expr) reference forms
         inner = init[2:-1].strip()
+        # &(wp::index(arr, i[, j...])): address of an indexed element —
+        # upstream's lowering of chained subscript stores
+        # (`cvel_out[w, 0][e] = x`: take the element address, store through
+        # it). Same element pointer the wp::address branch emits; the
+        # prelude wp_address template carries the meta byte math.
+        if inner.startswith("wp::index(") and inner.endswith(")"):
+            args = split_args(inner[len("wp::index(") : -1])
+            arr_var = args[0].strip()
+            spec = self.array_args.get(arr_var)
+            if spec is None:
+                raise TranslationError(f"&(...wp::index(...)) on non-array arg {arr_var!r}")
+            idx = ", ".join(self.expr(a) for a in args[1:])
+            expr = f"wp_address({self._data_expr(spec)}, {self._meta_ref(spec)}{', ' + idx if idx else ''})"
+            self.aliases[var] = (True, expr)
+            return
         shape_of = re.match(r"^\(?(var_\w+)\.shape\)?$", inner)
         if shape_of:
             spec = self.array_args.get(shape_of.group(1))
@@ -4499,6 +4552,24 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
                 )
         elif kind == "array":
             array_args[f"var_{var.label}"] = spec
+            # Array element types reach the MSL text only through the
+            # generic wp_address template (`device T*`) — no decl line ever
+            # names them, so a generated vecN/matMN element needs its
+            # struct def emitted here (Newton update_axis_properties
+            # stores through `actuator_bias[w, a][k]` with no vec10
+            # locals; latent missing-def until the component-ref store
+            # path landed)
+            try:
+                elem = spec.msl_elem
+            except TranslationError:
+                # untyped `wp::array_t<wp::Any>` (repeat_array_kernel):
+                # byte-copied buffers never name their element struct
+                elem = None
+            if elem is not None:
+                if _RE_GEN_VEC.match(elem):
+                    ensure_vec_def(unit, elem)
+                elif _RE_GEN_MAT.match(elem):
+                    ensure_mat_def(unit, elem)
 
     # ---- transitive user functions, callees first ----
     user_funcs: dict[str, MSLFunction] = {}

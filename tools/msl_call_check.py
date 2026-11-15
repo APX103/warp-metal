@@ -136,8 +136,13 @@ def _parse_param(p: str, index: int):
     if not p:
         return None
     # `device T*` binds a device pointer (devptr); `thread T&` binds a
-    # reference the caller passes by value syntax (value)
-    is_ptr = "*" in p
+    # reference the caller passes by value syntax (value); `device T&`
+    # binds a dereferenced DEVICE pointer — callers write
+    # `*wp_address(...)` (the inline component_ref store target,
+    # KEP-0001 M3.2), which classifies ptr:T
+    m_space = re.match(r"^(?:const\s+)?(device|thread|constant|threadgroup)\s+", p)
+    space = m_space.group(1) if m_space else None
+    is_ptr = "*" in p or (space in ("device", "constant", "threadgroup") and "&" in p)
     base = re.sub(r"^\s*(?:const\s+)?(?:device|thread|constant|threadgroup)\s+", "", p)
     base = base.replace("*", "").replace("&", "").strip()
     tokens = base.split()
