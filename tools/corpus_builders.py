@@ -1039,17 +1039,29 @@ def b_steel_crba_cholesky_kernel(rng):
     spatial_vector forms) + tile_extract + tile_diag_add + tile_cholesky
     (M2.4 P3+P4).
 
+    Three 12-dof articulations (36 1-dof joints/bodies) — every kernel index
+    domain (dof, joint, body, drive-K) is fully in-bounds, so the row is a
+    deterministic test on both sides.  (The original layout staged only 4
+    dofs per articulation against the kernel's 12-dof domain, leaving
+    joint_S_s / drive_dof_K reads past their arrays: the CPU golden read heap
+    slack, Metal read zero-filled buffer slack, and the row silently compared
+    against uninitialized memory — root cause of the 2026-11-15 L_group
+    review regression, whose signature was diagonal pivots collapsing to
+    sqrt(armature) = sqrt(0.5).)
+
     The fixed source map keeps H strictly diagonally dominant so the factor
     never sqrt's a negative: S[d] = amp_d (e_{d%6} + 0.05 e_{(d+1)%6}) with
-    amp_d = 0.8**d, body inertias c_j I6, source_dof diagonal = self and
-    subdiagonal = the dof two steps back (a weak cross term); the augmented
-    drive adds positive K on the odd dofs only."""
-    arts, dofs, joints = _STEEL_ARTS, _STEEL_DOFS, _STEEL_JOINTS
+    amp_d = 0.8**d (per-art local dof), body inertias c_j I6, source_dof
+    diagonal = self and subdiagonal = the dof two steps back (a weak cross
+    term); the augmented drive adds positive K on the even dofs only."""
+    arts, dofs = _STEEL_ARTS, _STEEL_DOFS
+    joints = arts * dofs  # 1-dof joints: joint j belongs to dof j % dofs within its art
     amp = 0.8 ** np.arange(dofs, dtype=np.float32)
-    s_vec = np.zeros((dofs, 6), dtype=np.float32)
-    for d in range(dofs):
-        s_vec[d, d % 6] = amp[d]
-        s_vec[d, (d + 1) % 6] = 0.05 * amp[d]
+    s_vec = np.zeros((joints, 6), dtype=np.float32)
+    for a in range(arts):
+        for d in range(dofs):
+            s_vec[a * dofs + d, d % 6] = amp[d]
+            s_vec[a * dofs + d, (d + 1) % 6] = 0.05 * amp[d]
     body_i = np.zeros((joints + 4, 36), dtype=np.float32)
     for j in range(joints + 4):
         body_i[j] = (np.eye(6, dtype=np.float32) * (1.0 + 0.05 * j)).reshape(36)
@@ -1060,19 +1072,21 @@ def b_steel_crba_cholesky_kernel(rng):
             source_dof[r, r - 1] = r - 2
         if r + 1 < dofs:
             source_dof[r, r + 1] = r
-    drive_k = np.array([0.3 if d % 2 == 0 else 0.0 for d in range(dofs)], dtype=np.float32)
+    drive_k = np.tile(
+        np.array([0.3 if d % 2 == 0 else 0.0 for d in range(dofs)], dtype=np.float32), arts
+    )
     g2a, mask = _steel_layout(rng)
     return (
         [
-            ("articulation_start", "arr:i32", np.arange(arts, dtype=np.int32) * 4),
-            ("articulation_dof_start", "arr:i32", np.arange(arts, dtype=np.int32) * 4),
+            ("articulation_start", "arr:i32", np.arange(arts, dtype=np.int32) * dofs),
+            ("articulation_dof_start", "arr:i32", np.arange(arts, dtype=np.int32) * dofs),
             ("mass_update_mask", "arr:i32", mask),
             ("joint_child", "arr:i32", np.arange(1, joints + 1, dtype=np.int32)),
             ("joint_S_s", "arr:spatial_vector", s_vec),
             ("body_I_c", "arr:spatial_matrix", body_i),
             ("group_to_art", "arr:i32", g2a),
             ("R_group", "arr2:f32", np.full((arts, dofs), 0.5, dtype=np.float32)),
-            ("dof_joint_offset", "arr:i32", np.tile(np.arange(4, dtype=np.int32), arts)),
+            ("dof_joint_offset", "arr:i32", np.tile(np.arange(dofs, dtype=np.int32), arts)),
             ("source_dof", "arr2:i32", source_dof),
             ("fused_augmented_drive", "scalar:i32", 1),
             ("drive_dof_K", "arr:f32", drive_k),
