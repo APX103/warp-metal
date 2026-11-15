@@ -427,6 +427,41 @@ CORPUS_TABLE = [
         "steel_cholesky_inverse_tiled_kernel",
         ("_get_cholesky_inverse_tiled_kernel", [12, "sm_90", 1]),
     ),
+    # KEP-0001 M3.2 P1: mujoco_warp kernels closing over the identity/diag/
+    # matrix/determinant builtin families (M3.1 coverage matrix §4). Factory
+    # rows resolve the @cache_kernel kernels with deterministic=False (the
+    # Newton call sites' default); fixtures in corpus_builders (_rod_layout /
+    # _ellipsoid scene docs there).
+    (
+        "mujoco_warp._src.passive",
+        "_flex_rod_mul",
+        "flex_rod_mul",
+        ("_flex_rod_mul", [False, 0]),
+    ),
+    (
+        "mujoco_warp._src.passive",
+        "_flex_rod_bending",
+        "flex_rod_bending",
+        ("_flex_rod_bending", [0]),
+    ),
+    (
+        "mujoco_warp._src.derivative",
+        "_eff_flex_rod_stiff",
+        "eff_flex_rod_stiff",
+        ("_eff_flex_rod_stiff", [False]),
+    ),
+    (
+        "mujoco_warp._src.derivative",
+        "_qderiv_ellipsoid_fluid",
+        "qderiv_ellipsoid_fluid",
+        ("_qderiv_ellipsoid_fluid", [False]),
+    ),
+    # wp.matrix/wp.diag/wp.identity rows whose closures still carry a second
+    # M3.1 miss beyond the P1 builtins (ratchet: justified builder-None rows)
+    ("mujoco_warp._src.passive", "_flex_hessian_elem", None),
+    ("mujoco_warp._src.passive", "_flex_elasticity", None),
+    ("mujoco_warp._src.smooth", "_cinert", None),
+    ("mujoco_warp._src.forward", "_implicit_free_body", None),
 ]
 
 _GJK_SKIP = "GJK/MPR factory kernel calls @wp.func_native support functions (Metal translation: Phase 2)"
@@ -437,6 +472,25 @@ _SKIP_BY_KERNEL = {
     "narrow_phase_find_mesh_triangle_overlaps_kernel": _GJK_SKIP,
     "mesh_triangle_contacts_to_reducer_kernel": _GJK_SKIP,
     "eval_articulation_fk": _ARTICULATION_SKIP,
+    # KEP-0001 M3.2 P1: the P1 builtins themselves (identity/matrix/diag)
+    # now lower, but these closures carry a SECOND M3.1 matrix miss each —
+    # reported as the next package, not silently expanded here
+    "_flex_hessian_elem": (
+        "closure needs wp::add_inplace (metric[i,j] += value in _snh_cubic_metric) "
+        "MSL lowering — identity/matrix/determinant builtins themselves now lower (M3.2)"
+    ),
+    "_flex_elasticity": (
+        "closure needs wp::sub_inplace (force_spring[vi,x] -= value) MSL lowering — "
+        "the wp.matrix int-table (6x2) + fill (6x3) lowering itself landed in M3.2"
+    ),
+    "_cinert": (
+        "closure needs wp::vec_t<10> register-vector MSL mapping (mujoco_warp vec10 "
+        "cinert_out) — M3.1 matrix miss beyond the P1 diag builtin, which now lowers"
+    ),
+    "_implicit_free_body": (
+        "closure needs wp::add_inplace (element augment on the M block) MSL lowering — "
+        "M3.1 matrix miss beyond the P1 diag builtin, which now lowers"
+    ),
 }
 _DEFAULT_SEED = 20261113
 CORPUS_NPZ = Path(__file__).resolve().parent / "corpus_golden.npz"
@@ -492,6 +546,16 @@ def _arr_view(arr):
     v = getattr(arr, "numpy_view", None)
     return v() if v is not None else arr.numpy()
 
+# composite element dtype keys: their numpy packing carries one (or two)
+# trailing element axes (vec3 → (..., 3), mat33 → (..., 3, 3)), so the
+# array shape is val.shape minus those axes (KEP-0001 M3.2 P1: first arr2
+# rows with composite elements — mujoco_warp xipos/ximat/cdof fixtures)
+_COMPOSITE_DTYPE_KEYS = {
+    "vec2", "vec3", "vec4", "vec2i", "vec3i", "vec4i",
+    "mat33", "transform", "spatial_vector", "spatial_matrix",
+}
+
+
 def _alloc_array(pkg, key, val, device="cpu"):
     """Allocate + fill a WarpArray for an arr:/arr2:/out:/out2: builder key."""
     if key.startswith(("arr:", "io:")):
@@ -503,13 +567,15 @@ def _alloc_array(pkg, key, val, device="cpu"):
         return arr
     if key.startswith("arr2:"):
         elem = _corpus_dtype(pkg, key[5:])
-        arr = pkg.zeros(val.shape, dtype=elem, device=device)
+        shape = val.shape[:-1] if key[5:] in _COMPOSITE_DTYPE_KEYS else val.shape
+        arr = pkg.zeros(shape, dtype=elem, device=device)
         view = _arr_view(arr)
         view[:] = val.reshape(view.shape)
         return arr
     if key.startswith("arr3:"):
         elem = _corpus_dtype(pkg, key[5:])
-        arr = pkg.zeros(val.shape, dtype=elem, device=device)
+        shape = val.shape[:-1] if key[5:] in _COMPOSITE_DTYPE_KEYS else val.shape
+        arr = pkg.zeros(shape, dtype=elem, device=device)
         view = _arr_view(arr)
         view[:] = val.reshape(view.shape)
         return arr

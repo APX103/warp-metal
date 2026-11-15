@@ -1481,6 +1481,47 @@ static inline int wp_extract(int4 v, int i) {
 }
 """
 
+_MAT_FACTORY_OPS = """\
+// ---- identity / diag / determinant factories (KEP-0001 M3.2 P1 builtins;
+// exact mat.h semantics — wp.identity/wp.diag/wp.determinant closure) ----
+// identity (mat.h identity<T>(): zero-init + unit diagonal)
+static inline mat22f wp_identity2() {
+    mat22f m = make_mat22f(); m.c[0][0] = 1.0f; m.c[1][1] = 1.0f; return m;
+}
+static inline mat33f wp_identity3() {
+    mat33f m = make_mat33f(); m.c[0][0] = 1.0f; m.c[1][1] = 1.0f; m.c[2][2] = 1.0f; return m;
+}
+static inline mat44f wp_identity4() {
+    mat44f m = make_mat44f(); m.c[0][0] = 1.0f; m.c[1][1] = 1.0f; m.c[2][2] = 1.0f; m.c[3][3] = 1.0f; return m;
+}
+// diag (mat.h diag<T>(d): zero-fill, then the vector on the diagonal)
+static inline mat22f wp_diag(vec2f d) {
+    mat22f m = make_mat22f(); m.c[0][0] = d.x; m.c[1][1] = d.y; return m;
+}
+static inline mat33f wp_diag(vec3f d) {
+    mat33f m = make_mat33f(); m.c[0][0] = d.x; m.c[1][1] = d.y; m.c[2][2] = d.z; return m;
+}
+static inline mat44f wp_diag(vec4f d) {
+    mat44f m = make_mat44f(); m.c[0][0] = d.x; m.c[1][1] = d.y; m.c[2][2] = d.z; m.c[3][3] = d.w; return m;
+}
+// determinant (mat.h determinant — upstream arithmetic verbatim)
+static inline float wp_determinant(mat22f m) {
+    return m.c[0][0] * m.c[1][1] - m.c[1][0] * m.c[0][1];
+}
+static inline float wp_determinant(mat33f m) {
+    return wp_dot(
+        make_vec3f(m.c[0][0], m.c[0][1], m.c[0][2]),
+        wp_cross(
+            make_vec3f(m.c[1][0], m.c[1][1], m.c[1][2]),
+            make_vec3f(m.c[2][0], m.c[2][1], m.c[2][2])));
+}
+// No 4x4: upstream's determinant(mat_t<4,4>) accumulates in double
+// intermediates (mat.h:3543 "Adapted from USD"), which has no fp32-faithful
+// MSL port (prelude carries no fp64). A 4x4 determinant call fails loud at
+// Metal compile (no wp_determinant(mat44f) overload); the mujoco_warp
+// closure uses 3x3 only.
+"""
+
 _BVH_OPS = """
 // ---- BVH (upstream warp/native/bvh.h layout; runtime/bvh.py builds it) ----
 // BVHPackedNodeHalf packs child/payload in i:31 + leaf flag in b:1; clang
@@ -2656,6 +2697,8 @@ _PRELUDE = (
     + _QUAT_TRANSFORM_OPS
     + "\n"
     + _SCALAR_OPS
+    + "\n"
+    + _MAT_FACTORY_OPS
     + "\n"
     + _BVH_OPS
     + "\n"

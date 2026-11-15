@@ -66,8 +66,8 @@ _VECI_SIZES = {2: "vec2i", 3: "vec3i", 4: "vec4i"}
 _MAT_SIZES = {(2, 2): "mat22f", (3, 3): "mat33f", (4, 4): "mat44f"}
 
 _RE_VEC_T = re.compile(r"^wp::vec_t<(\d+),\s*wp::(float32|int32)>$")
-_RE_MAT_T = re.compile(r"^wp::mat_t<(\d+),\s*(\d+),\s*wp::float32>$")
-_RE_GEN_MAT = re.compile(r"^mat(\d+)x(\d+)f$")
+_RE_MAT_T = re.compile(r"^wp::mat_t<(\d+),\s*(\d+),\s*wp::(float32|int32)>$")
+_RE_GEN_MAT = re.compile(r"^mat(\d+)x(\d+)([fi])$")
 _RE_QUAT_T = re.compile(r"^wp::quat_t<wp::float32>$")
 _RE_TRANSFORM_T = re.compile(r"^wp::transform_t<wp::float32>$")
 _RE_ARRAY_T = re.compile(r"^wp::array_t<(.+)>$")
@@ -80,23 +80,30 @@ _RE_FIXEDARRAY_T = re.compile(r"^wp::fixedarray_t<(\d+),\s*(.+)>$")
 
 
 def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
-    """Emit the struct def + row-extract for a generic ``mat<M>x<N>f``.
+    """Emit the struct def + accessors for a generic ``mat<M>x<N><f|i>``.
 
-    The fixed 2x2/3x3/4x4 mats live in the prelude; sizes beyond those
+    The fixed 2x2/3x3/4x4 float mats live in the prelude; sizes beyond those
     (Newton's FACE_NORMALS icosahedron table is 20x3) are generated per
-    translation unit on first use. Rows extract to vec2/3/4 — anything else
-    fails loud.
+    translation unit on first use. Rows extract to vec2/3/4 of the element
+    type — anything else fails loud.
+
+    int mats (mujoco_warp's 6x2 flex-edge endpoint tables) get the
+    storage / extract / assign / where surface only: they are constant
+    lookup tables, never arithmetic operands — an int-mat mul/trace would
+    fail loud at Metal compile (no wp_mul/wp_trace overload), matching the
+    fail-loud closure discipline.
     """
     m = _RE_GEN_MAT.match(msl_t)
     if m is None or msl_t in unit.structs:
         return
     M, N = int(m.group(1)), int(m.group(2))
-    vec = _VEC_SIZES.get(N)
+    elem = "float" if m.group(3) == "f" else "int"
+    vec = (_VEC_SIZES if elem == "float" else _VECI_SIZES).get(N)
     if vec is None:
         raise TranslationError(f"generic mat {msl_t}: row extract has no vec{N} mapping")
-    lines = [f"struct {msl_t} {{ float c[{M}][{N}]; }};"]
+    lines = [f"struct {msl_t} {{ {elem} c[{M}][{N}]; }};"]
     ctor_args = ", ".join(
-        f"float a{r}{c}" for r in range(M) for c in range(N)
+        f"{elem} a{r}{c}" for r in range(M) for c in range(N)
     )
     ctor_body = "\n".join(
         f"    v.c[{r}][{c}] = a{r}{c};" for r in range(M) for c in range(N)
@@ -111,7 +118,7 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
     lines.append("    return v;")
     lines.append("}")
     # scalar fill (mat.h mat_t(Type s) constructor, e.g. zero-inertia guards)
-    lines.append(f"static inline {msl_t} make_{msl_t}(float s) {{")
+    lines.append(f"static inline {msl_t} make_{msl_t}({elem} s) {{")
     lines.append(f"    {msl_t} v;")
     lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) v.c[i][j] = s;")
     lines.append("    return v;")
@@ -122,7 +129,7 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
     )
     # element form (warp extract(m, i, j) -> scalar)
     lines.append(
-        f"static inline float wp_extract({msl_t} m, int i, int j) {{ return m.c[i][j]; }}"
+        f"static inline {elem} wp_extract({msl_t} m, int i, int j) {{ return m.c[i][j]; }}"
     )
     # row assign (warp assign_inplace(m, i, vec)); wp_extract covers every
     # row type (vec2f-5f, spatial_vectorf) and any width N (mat6x6 rows)
@@ -132,90 +139,91 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
     )
     # scalar element assign (warp assign_inplace(m, i, j, scalar))
     lines.append(
-        f"static inline void wp_assign_inplace(thread {msl_t}& m, int i, int j, float v) {{ m.c[i][j] = v; }}"
+        f"static inline void wp_assign_inplace(thread {msl_t}& m, int i, int j, {elem} v) {{ m.c[i][j] = v; }}"
     )
     lines.append(
         f"static inline {msl_t} wp_where(bool c, {msl_t} a, {msl_t} b) {{ return c ? a : b; }}"
     )
-    if M == N:
-        diag = " + ".join(f"m.c[{i}][{i}]" for i in range(N))
-        lines.append(f"static inline float wp_trace({msl_t} m) {{ return {diag}; }}")
-        # square-mat ops (prelude covers 2x2..4x4; generic sizes like Newton's
-        # spatial-inertia mat6x6f get the same warp-mul/transpose semantics:
-        # row-major r.c[i][j] = sum_k a.c[i][k]*b.c[k][j])
-        lines.append(f"static inline {msl_t} wp_mul({msl_t} a, {msl_t} b) {{")
-        lines.append(f"    {msl_t} r;")
-        terms = " + ".join(f"a.c[i][{k}]*b.c[{k}][j]" for k in range(N))
-        lines.append(f"    for (int i = 0; i < {N}; ++i)")
-        lines.append(f"        for (int j = 0; j < {N}; ++j)")
-        lines.append(f"            r.c[i][j] = {terms};")
-        lines.append("    return r;")
-        lines.append("}")
-        terms_mv = " + ".join(f"m.c[i][{j}]*wp_extract(v, {j})" for j in range(N))
-        lines.append(f"static inline {vec} wp_mul({msl_t} m, {vec} v) {{")
-        lines.append(f"    {vec} r = make_{vec}();")
-        lines.append(f"    for (int i = 0; i < {N}; ++i)")
-        lines.append(f"        r = wp_vec_insert(r, i, {terms_mv});")
-        lines.append("    return r;")
-        lines.append("}")
-        lines.append(f"static inline {msl_t} wp_mul(float s, {msl_t} m) {{")
-        lines.append(f"    {msl_t} r;")
-        lines.append(f"    for (int i = 0; i < {N}; ++i)")
-        lines.append(f"        for (int j = 0; j < {N}; ++j)")
-        lines.append("            r.c[i][j] = s*m.c[i][j];")
-        lines.append("    return r;")
-        lines.append("}")
-        lines.append(f"static inline {msl_t} wp_mul({msl_t} m, float s) {{ return wp_mul(s, m); }}")
-        lines.append(f"static inline {msl_t} wp_transpose({msl_t} m) {{")
-        lines.append(f"    {msl_t} r;")
-        lines.append(f"    for (int i = 0; i < {N}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = m.c[j][i];")
-        lines.append("    return r;")
-        lines.append("}")
-        # value-returning component atomics (warp atomic_add/sub on arrays of
-        # matrix dtype, e.g. featherstone body_I_c accumulation): row-major
-        # float components are independently atomic
-        for op, fname in (("add", "wp_atomic_add_ret_at"), ("sub", "wp_atomic_sub_ret_at")):
-            lines.append(
-                f"static inline {msl_t} {fname}(device {msl_t}* d, wp_arr_meta m, int i, {msl_t} v) {{"
-            )
-            lines.append(
-                f"    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));"
-            )
+    if elem == "float":
+        if M == N:
+            diag = " + ".join(f"m.c[{i}][{i}]" for i in range(N))
+            lines.append(f"static inline float wp_trace({msl_t} m) {{ return {diag}; }}")
+            # square-mat ops (prelude covers 2x2..4x4; generic sizes like Newton's
+            # spatial-inertia mat6x6f get the same warp-mul/transpose semantics:
+            # row-major r.c[i][j] = sum_k a.c[i][k]*b.c[k][j])
+            lines.append(f"static inline {msl_t} wp_mul({msl_t} a, {msl_t} b) {{")
             lines.append(f"    {msl_t} r;")
-            lines.append(f"    for (int a = 0; a < {M}; ++a)")
-            lines.append(f"        for (int b = 0; b < {N}; ++b)")
-            lines.append(
-                f"            r.c[a][b] = atomic_fetch_{op}_explicit((device atomic_float*)(base + a*{N} + b), v.c[a][b], memory_order_relaxed);"
-            )
+            terms = " + ".join(f"a.c[i][{k}]*b.c[{k}][j]" for k in range(N))
+            lines.append(f"    for (int i = 0; i < {N}; ++i)")
+            lines.append(f"        for (int j = 0; j < {N}; ++j)")
+            lines.append(f"            r.c[i][j] = {terms};")
             lines.append("    return r;")
             lines.append("}")
-    # elementwise div, both operand orders (mat.h:3148/3161)
-    lines.append(f"static inline {msl_t} wp_div({msl_t} m, float s) {{")
-    lines.append(f"    {msl_t} r;")
-    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = m.c[i][j] / s;")
-    lines.append("    return r;")
-    lines.append("}")
-    lines.append(f"static inline {msl_t} wp_div(float s, {msl_t} m) {{")
-    lines.append(f"    {msl_t} r;")
-    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = s / m.c[i][j];")
-    lines.append("    return r;")
-    lines.append("}")
-    # elementwise neg/add/sub (mat.h operator surface)
-    lines.append(f"static inline {msl_t} wp_neg({msl_t} m) {{")
-    lines.append(f"    {msl_t} r;")
-    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = -m.c[i][j];")
-    lines.append("    return r;")
-    lines.append("}")
-    lines.append(f"static inline {msl_t} wp_add({msl_t} a, {msl_t} b) {{")
-    lines.append(f"    {msl_t} r;")
-    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = a.c[i][j] + b.c[i][j];")
-    lines.append("    return r;")
-    lines.append("}")
-    lines.append(f"static inline {msl_t} wp_sub({msl_t} a, {msl_t} b) {{")
-    lines.append(f"    {msl_t} r;")
-    lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = a.c[i][j] - b.c[i][j];")
-    lines.append("    return r;")
-    lines.append("}")
+            terms_mv = " + ".join(f"m.c[i][{j}]*wp_extract(v, {j})" for j in range(N))
+            lines.append(f"static inline {vec} wp_mul({msl_t} m, {vec} v) {{")
+            lines.append(f"    {vec} r = make_{vec}();")
+            lines.append(f"    for (int i = 0; i < {N}; ++i)")
+            lines.append(f"        r = wp_vec_insert(r, i, {terms_mv});")
+            lines.append("    return r;")
+            lines.append("}")
+            lines.append(f"static inline {msl_t} wp_mul(float s, {msl_t} m) {{")
+            lines.append(f"    {msl_t} r;")
+            lines.append(f"    for (int i = 0; i < {N}; ++i)")
+            lines.append(f"        for (int j = 0; j < {N}; ++j)")
+            lines.append("            r.c[i][j] = s*m.c[i][j];")
+            lines.append("    return r;")
+            lines.append("}")
+            lines.append(f"static inline {msl_t} wp_mul({msl_t} m, float s) {{ return wp_mul(s, m); }}")
+            lines.append(f"static inline {msl_t} wp_transpose({msl_t} m) {{")
+            lines.append(f"    {msl_t} r;")
+            lines.append(f"    for (int i = 0; i < {N}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = m.c[j][i];")
+            lines.append("    return r;")
+            lines.append("}")
+            # value-returning component atomics (warp atomic_add/sub on arrays of
+            # matrix dtype, e.g. featherstone body_I_c accumulation): row-major
+            # float components are independently atomic
+            for op, fname in (("add", "wp_atomic_add_ret_at"), ("sub", "wp_atomic_sub_ret_at")):
+                lines.append(
+                    f"static inline {msl_t} {fname}(device {msl_t}* d, wp_arr_meta m, int i, {msl_t} v) {{"
+                )
+                lines.append(
+                    f"    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));"
+                )
+                lines.append(f"    {msl_t} r;")
+                lines.append(f"    for (int a = 0; a < {M}; ++a)")
+                lines.append(f"        for (int b = 0; b < {N}; ++b)")
+                lines.append(
+                    f"            r.c[a][b] = atomic_fetch_{op}_explicit((device atomic_float*)(base + a*{N} + b), v.c[a][b], memory_order_relaxed);"
+                )
+                lines.append("    return r;")
+                lines.append("}")
+        # elementwise div, both operand orders (mat.h:3148/3161)
+        lines.append(f"static inline {msl_t} wp_div({msl_t} m, float s) {{")
+        lines.append(f"    {msl_t} r;")
+        lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = m.c[i][j] / s;")
+        lines.append("    return r;")
+        lines.append("}")
+        lines.append(f"static inline {msl_t} wp_div(float s, {msl_t} m) {{")
+        lines.append(f"    {msl_t} r;")
+        lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = s / m.c[i][j];")
+        lines.append("    return r;")
+        lines.append("}")
+        # elementwise neg/add/sub (mat.h operator surface)
+        lines.append(f"static inline {msl_t} wp_neg({msl_t} m) {{")
+        lines.append(f"    {msl_t} r;")
+        lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = -m.c[i][j];")
+        lines.append("    return r;")
+        lines.append("}")
+        lines.append(f"static inline {msl_t} wp_add({msl_t} a, {msl_t} b) {{")
+        lines.append(f"    {msl_t} r;")
+        lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = a.c[i][j] + b.c[i][j];")
+        lines.append("    return r;")
+        lines.append("}")
+        lines.append(f"static inline {msl_t} wp_sub({msl_t} a, {msl_t} b) {{")
+        lines.append(f"    {msl_t} r;")
+        lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) r.c[i][j] = a.c[i][j] - b.c[i][j];")
+        lines.append("    return r;")
+        lines.append("}")
     unit.structs[msl_t] = "\n".join(lines)
 
 
@@ -232,9 +240,10 @@ def msl_type(ctype: str) -> str:
         raise TranslationError(f"wp::vec_t<{n}> has no MSL mapping")
     if m := _RE_MAT_T.match(ctype):
         key = (int(m.group(1)), int(m.group(2)))
-        if key in _MAT_SIZES:
+        if m.group(3) == "float32" and key in _MAT_SIZES:
             return _MAT_SIZES[key]
-        return f"mat{key[0]}x{key[1]}f"  # generic size; def emitted per unit
+        # generic size; def emitted per unit (ensure_mat_def)
+        return f"mat{key[0]}x{key[1]}{'f' if m.group(3) == 'float32' else 'i'}"
     if _RE_QUAT_T.match(ctype):
         return "quatf"
     if _RE_TRANSFORM_T.match(ctype):
@@ -370,6 +379,8 @@ _CALL_TABLE = {
     "isnan": "wp_isnan",
     # matrix
     "skew": "wp_skew",
+    "diag": "wp_diag",
+    "determinant": "wp_determinant",
     # vector
     "dot": "wp_dot",
     "outer": "wp_outer",
@@ -495,6 +506,12 @@ _CTOR_TABLE = {
 _ZEROARG_TABLE = {
     "wp::quat_identity<wp::float32>": "wp_quat_identity()",
     "wp::transform_identity<wp::float32>": "wp_transform_identity()",
+    # wp.identity(n, dtype) lowers to n-constant zero-arg factories (KEP-0001
+    # M3.2 P1; upstream mat.h identity(): unit diagonal). Other sizes/dtypes
+    # fail loud through the generic no-translation path below.
+    "wp::identity<2, wp::float32>": "wp_identity2()",
+    "wp::identity<3, wp::float32>": "wp_identity3()",
+    "wp::identity<4, wp::float32>": "wp_identity4()",
 }
 
 
@@ -3251,9 +3268,10 @@ class _BodyTranslator:
             return f"(({_CAST_TABLE[key]})({self.expr(args[0])}))"
         if key in _CTOR_TABLE:
             return f"{_CTOR_TABLE[key]}({', '.join(self.expr(a) for a in args)})"
-        m_ctor = re.match(r"^wp::mat_t<(\d+), (\d+), wp::float32>$", key)
-        if m_ctor:  # generic-size matrix constructor (e.g. FACE_NORMALS tables)
-            msl_t = f"mat{m_ctor.group(1)}x{m_ctor.group(2)}f"
+        m_ctor = re.match(r"^wp::mat_t<(\d+), (\d+), wp::(float32|int32)>$", key)
+        if m_ctor:  # generic-size matrix constructor (FACE_NORMALS tables,
+            # mujoco_warp's float 6x6 basis + int 6x2 flex-edge tables)
+            msl_t = f"mat{m_ctor.group(1)}x{m_ctor.group(2)}{'f' if m_ctor.group(3) == 'float32' else 'i'}"
             ensure_mat_def(self.unit, msl_t)
             return f"make_{msl_t}({', '.join(self.expr(a) for a in args)})"
         if key == "wp::copy":

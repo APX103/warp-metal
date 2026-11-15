@@ -1119,6 +1119,264 @@ def b_steel_cholesky_inverse_tiled_kernel(rng):
     )
 
 
+# ---------------------------------------------------------------------------
+# KEP-0001 M3.2 P1: mujoco_warp 3.17.0 kernels whose closures use the builtin
+# families wp.identity / wp.diag / wp.matrix / wp.determinant (M3.1 matrix
+# §4 P1 rows). Two shared mini-scenes:
+#
+# _rod_layout/_rod_verts — one 1-D flex rod hinge spanning two 3-dof bodies
+# (Bergou et al. rod bending): 4 flex vertices with the hinge triple in an
+# off-axis knee (rod_hinge's denom = |e0||e1| + e0·e1 ~ 0.38 > MJ_MINVAL, so
+# the ok gate passes and kb/A0/A1 are nonzero). The hinge MUST span bodies —
+# a rod hinge is invariant under rigid motion of any single body, so a
+# one-body hinge makes every dof force exactly zero and the golden degrades
+# to fp32 rounding residue. Vert 1 is on body 1 (dofs 0..2), verts 2-3 on
+# body 2 (dofs 3..5), each body's dof chain walked by flex_gather/scatter_vert
+# through dof_parentid [-1,0,1 | -1,3,4]. flex_bending[adr..adr+3] =
+# [1, 2, 3, 5.0] is the vertex-offset triple + hinge stiffness k.
+#
+# _ellipsoid_fixture — one ellipsoid fluid body: body 1 carries geom 1
+# (GeomType.ELLIPSOID=4, semiaxes = size directly), all 12 geom_fluid
+# coefficients strictly positive so the per-geom loop body always runs;
+# the 3-dof tree (dof_bodyid=1, body_isdofancestor=1) keeps every early
+# return gate open. M_elemid[i,j] = 3i+j makes madr = M_elemid[1,0] = 4 an
+# in-bounds row of the (nworld, 9) qDeriv buffer for the single (Mi,Mj)=(1,0)
+# element, so each (world, madr) slot has exactly one atomic writer.
+#
+# Every array is in-bounds over the kernel's full index domain (the crba
+# fixture rule): dims are (2 worlds, 1 hinge/fluid body, 1 element).
+# ---------------------------------------------------------------------------
+
+
+def _rod_layout():
+    """Model-side rod arrays shared by the rod-hinge kernel fixtures."""
+    return {
+        "body_rootid": np.array([0, 0], dtype=np.int32),
+        "body_weldid": np.array([0, 1], dtype=np.int32),
+        "body_dofnum": np.array([0, 3], dtype=np.int32),
+        "body_dofadr": np.array([0, 0], dtype=np.int32),
+        "body_simple": np.array([0, 0], dtype=np.int32),
+        "dof_parentid": np.array([-1, 0, 1], dtype=np.int32),
+        "flex_vertadr": np.array([0], dtype=np.int32),
+        "flex_vertbodyid": np.array([0, 1, 1, 1], dtype=np.int32),
+        "flex_bending": np.array([1.0, 2.0, 3.0, 5.0], dtype=np.float32),
+        "flex_damping": np.array([0.5], dtype=np.float32),
+        "flex_simple": np.array([True], dtype=bool),
+        "flex_rodhinge_map": np.array([[0, 0]], dtype=np.int32),
+    }
+
+
+_ROD_WORLDS = 2
+_ROD_VERTS = 4
+_ROD_DOFS = 6  # two 3-dof bodies: dofs 0..2 on body 1, 3..5 on body 2
+_ROD_BODIES = 3
+
+
+def _rod_layout():
+    """Model-side rod arrays shared by the rod-hinge kernel fixtures.
+
+    The hinge spans TWO bodies (vert 1 on body 1, verts 2-3 on body 2): a
+    rod hinge is invariant under any rigid motion of a single body, so an
+    all-verts-on-one-body fixture makes every dof force an exactly-zero
+    quantity and the golden degrades to fp32 rounding residue (the
+    configuration the first draft had — caught because every output sat at
+    2^-17-scale epsilon). Two 3-dof bodies chained by dof_parentid
+    [-1,0,1 | -1,3,4] give the J'WJ products a live relative-motion channel."""
+    return {
+        "body_rootid": np.array([0, 0, 0], dtype=np.int32),
+        "body_weldid": np.array([0, 1, 2], dtype=np.int32),
+        "body_dofnum": np.array([0, 3, 3], dtype=np.int32),
+        "body_dofadr": np.array([0, 0, 3], dtype=np.int32),
+        "body_simple": np.array([0, 0, 0], dtype=np.int32),
+        "dof_parentid": np.array([-1, 0, 1, -1, 3, 4], dtype=np.int32),
+        "flex_vertadr": np.array([0], dtype=np.int32),
+        "flex_vertbodyid": np.array([0, 1, 2, 2], dtype=np.int32),
+        "flex_bending": np.array([1.0, 2.0, 3.0, 5.0], dtype=np.float32),
+        "flex_damping": np.array([0.5], dtype=np.float32),
+        "flex_simple": np.array([True], dtype=bool),
+        "flex_rodhinge_map": np.array([[0, 0]], dtype=np.int32),
+    }
+
+
+def _rod_verts():
+    """(nworld, 4, 3) flex-vertex positions: fixed asymmetric knee spanning
+    the two bodies (vert 1 on body 1, verts 2-3 on body 2).
+
+    rod_hinge needs denom = |e0||e1| + e0·e1 > MJ_MINVAL (here ~0.38); the
+    off-axis skew keeps the hinge torque nonzero so outputs sit well above
+    fp32 rounding residue."""
+    verts = np.array(
+        [[0.0, 0.0, 0.0], [0.5, 0.0, 0.2], [1.2, 0.9, 0.1], [0.3, 1.1, 0.7]],
+        dtype=np.float32,
+    )
+    return np.tile(verts[None], (_ROD_WORLDS, 1, 1))
+
+
+def _rod_data_fields(rng):
+    """Data-side rod fields: subtree_com, cdof (nworld, 6 dofs, 6), xpos."""
+    return [
+        ("subtree_com_in", "arr2:vec3", (rng.standard_normal((_ROD_WORLDS, _ROD_BODIES, 3)) * 0.1).astype(np.float32)),
+        ("cdof_in", "arr2:spatial_vector", (rng.standard_normal((_ROD_WORLDS, _ROD_DOFS, 6)) * 0.1).astype(np.float32)),
+        ("flexvert_xpos_in", "arr2:vec3", _rod_verts()),
+    ]
+
+
+def b_flex_rod_mul(rng):
+    """mujoco_warp passive._flex_rod_mul(check_skip=False, nv=0): rod hinge
+    J' W J multiply — the closure reaches wp.identity(3) through
+    rod_hinge_weights (W = 2 k s1 I + sd Wd, M3.1 P1 identity row).
+
+    check_skip=False keeps the wp.static skip gate compiled out (the bool
+    array is still bound); use_timestep=True reads opt_timestep per world;
+    s1_in=1.0 (>0 → s1 = t^2) with disableflags 0 keeps both the spring and
+    damper terms live (t=0.4 so s1*k ~ O(1), not fp32 residue). res_out
+    accumulates via flex_scatter_vert atomics — one hinge means one writer
+    per dof slot."""
+    rod = _rod_layout()
+    args = [
+        ("opt_timestep", "arr:f32", np.full(_ROD_WORLDS, 0.4, dtype=np.float32)),
+        ("opt_disableflags", "scalar:i32", 0),
+    ]
+    for name in (
+        "body_rootid", "body_weldid", "body_dofnum", "body_dofadr", "body_simple", "dof_parentid",
+        "flex_vertadr", "flex_vertbodyid", "flex_bending", "flex_damping", "flex_simple",
+        "flex_rodhinge_map",
+    ):
+        if name in ("flex_bending", "flex_damping"):
+            key = "arr:f32"
+        elif name == "flex_simple":
+            key = "arr:bool"
+        elif name == "flex_rodhinge_map":
+            key = "arr:vec2i"
+        else:
+            key = "arr:i32"
+        args.append((name, key, rod[name]))
+    args += _rod_data_fields(rng)
+    args += [
+        ("vec_in", "arr2:f32", (rng.standard_normal((_ROD_WORLDS, _ROD_DOFS)) * 0.1).astype(np.float32)),
+        ("skip", "arr:bool", np.zeros(_ROD_WORLDS, dtype=bool)),
+        ("s1_in", "scalar:f32", 1.0),
+        ("s2_in", "scalar:f32", 1.0),
+        ("use_timestep", "scalar:bool", True),
+        ("non_simple_only", "scalar:bool", False),
+        ("res_out", "out2:f32", (_ROD_WORLDS, _ROD_DOFS)),
+        ("__dim__", "", (_ROD_WORLDS, 1)),
+    ]
+    return (args, [])
+
+
+def b_flex_rod_bending(rng):
+    """mujoco_warp passive._flex_rod_bending(nv=0): rod hinge passive spring
+    and damper forces — wp.identity(3) closure row (rod_hinge_weights), the
+    qfrc_spring/qfrc_damper outputs both scatter-enabled (dsbl flags False)."""
+    rod = _rod_layout()
+    args = []
+    for name in (
+        "body_rootid", "body_weldid", "body_dofnum", "body_dofadr", "body_simple", "dof_parentid",
+        "flex_vertadr", "flex_vertbodyid", "flex_bending", "flex_damping", "flex_rodhinge_map",
+    ):
+        if name in ("flex_bending", "flex_damping"):
+            key = "arr:f32"
+        elif name == "flex_rodhinge_map":
+            key = "arr:vec2i"
+        else:
+            key = "arr:i32"
+        args.append((name, key, rod[name]))
+    args += [
+        ("qvel_in", "arr2:f32", (rng.standard_normal((_ROD_WORLDS, _ROD_DOFS)) * 0.1).astype(np.float32)),
+    ]
+    args += _rod_data_fields(rng)
+    args += [
+        ("dsbl_spring", "scalar:bool", False),
+        ("dsbl_damper", "scalar:bool", False),
+        ("qfrc_spring_out", "out2:f32", (_ROD_WORLDS, _ROD_DOFS)),
+        ("qfrc_damper_out", "out2:f32", (_ROD_WORLDS, _ROD_DOFS)),
+        ("__dim__", "", (_ROD_WORLDS, 1)),
+    ]
+    return (args, [])
+
+
+def b_eff_flex_rod_stiff(rng):
+    """mujoco_warp derivative._eff_flex_rod_stiff(): rod hinge stiffness into
+    the EFM K CSR — wp.identity(3) closure row (rod_hinge_weights), plus
+    xmat frame rotations around it. Dense 6x6 CSR over the two 3-dof hinge
+    bodies' dofs 0..5 (rownnz 6, sorted colind [0..5] per row —
+    _find_csr_col binary-searches it) so every (dof_i, dof_j) block finds
+    its column and idx + c stays in-bounds for the (nworld, 36) value
+    buffer; timestep 0.4 puts s1*k at O(1). Both worlds share the layout."""
+    rod = _rod_layout()
+    args = [
+        ("opt_timestep", "arr:f32", np.full(_ROD_WORLDS, 0.4, dtype=np.float32)),
+        ("opt_disableflags", "scalar:i32", 0),
+        ("body_weldid", "arr:i32", rod["body_weldid"]),
+        ("body_dofnum", "arr:i32", rod["body_dofnum"]),
+        ("body_dofadr", "arr:i32", rod["body_dofadr"]),
+        ("flex_vertadr", "arr:i32", rod["flex_vertadr"]),
+        ("flex_vertbodyid", "arr:i32", rod["flex_vertbodyid"]),
+        ("flex_bending", "arr:f32", rod["flex_bending"]),
+        ("flex_damping", "arr:f32", rod["flex_damping"]),
+        ("efm_K_rownnz", "arr:i32", np.full(_ROD_DOFS, _ROD_DOFS, dtype=np.int32)),
+        ("efm_K_rowadr", "arr:i32", np.arange(_ROD_DOFS, dtype=np.int32) * _ROD_DOFS),
+        ("efm_K_colind", "arr:i32", np.tile(np.arange(_ROD_DOFS, dtype=np.int32), _ROD_DOFS)),
+        ("flex_simple", "arr:bool", rod["flex_simple"]),
+        ("flex_rodhinge_map", "arr:vec2i", rod["flex_rodhinge_map"]),
+        ("xmat_in", "arr2:mat33", (rng.standard_normal((_ROD_WORLDS, _ROD_BODIES, 9)) * 0.1).astype(np.float32)),
+        ("flexvert_xpos_in", "arr2:vec3", _rod_verts()),
+        ("efm_K_val_out", "out2:f32", (_ROD_WORLDS, _ROD_DOFS * _ROD_DOFS)),
+        ("__dim__", "", (_ROD_WORLDS, 1)),
+    ]
+    return (args, [])
+
+
+def b_qderiv_ellipsoid_fluid(rng):
+    """mujoco_warp derivative._qderiv_ellipsoid_fluid(): ellipsoid fluid
+    qDeriv contribution — wp.diag(vec3) closure row (virtual-inertia diagonal
+    in _geom_ellipsoid_fluid_B). One fluid body (body 1) with one ELLIPSOID
+    geom (type 4), all 12 geom_fluid coefficients positive so the per-geom
+    loop never `continue`s; IntegratorType.IMPLICITFAST=2 keeps the
+    symmetrize branch on. Three (Mi,Mj) elements ((1,0),(2,0),(2,1) — Mi>=Mj
+    tree order) hit three distinct madr slots of M_elemid[i,j]=3i+j in the
+    (nworld, 9) buffer; water-scale density (1000) and timestep 0.4 put the
+    accumulations at O(1)+ so the row is compare-meaningful rather than an
+    fp32 residue; density/viscosity > 0 keep the early-return gates open."""
+    args = [
+        ("opt_timestep", "arr:f32", np.full(_ROD_WORLDS, 0.4, dtype=np.float32)),
+        ("opt_wind", "arr:vec3", np.full((_ROD_WORLDS, 3), 0.1, dtype=np.float32)),
+        ("opt_density", "arr:f32", np.full(_ROD_WORLDS, 1000.0, dtype=np.float32)),
+        ("opt_viscosity", "arr:f32", np.full(_ROD_WORLDS, 1.0, dtype=np.float32)),
+        ("opt_integrator", "scalar:i32", 2),
+        ("body_parentid", "arr:i32", np.array([-1, 0], dtype=np.int32)),
+        ("body_rootid", "arr:i32", np.array([0, 0], dtype=np.int32)),
+        ("body_geomnum", "arr:i32", np.array([0, 1], dtype=np.int32)),
+        ("body_geomadr", "arr:i32", np.array([0, 1], dtype=np.int32)),
+        ("dof_bodyid", "arr:i32", np.full(3, 1, dtype=np.int32)),
+        ("geom_type", "arr:i32", np.array([4, 4], dtype=np.int32)),
+        ("geom_size", "arr2:vec3", np.tile(np.array([[0.2, 0.2, 0.2], [0.3, 0.2, 0.1]], dtype=np.float32)[None], (_ROD_WORLDS, 1, 1))),
+        (
+            "geom_fluid",
+            "arr2:f32",
+            np.array(
+                [[1.0] * 12, [1.0, 0.5, 0.1, 0.2, 0.05, 0.01, 0.3, 0.3, 0.3, 0.05, 0.05, 0.05]],
+                dtype=np.float32,
+            ),
+        ),
+        ("body_fluid_ellipsoid_adr", "arr:i32", np.array([1], dtype=np.int32)),
+        ("body_isdofancestor", "arr2:i32", np.ones((2, 3), dtype=np.int32)),
+        ("M_elemid", "arr2:i32", np.arange(9, dtype=np.int32).reshape(3, 3)),
+        ("xipos_in", "arr2:vec3", (rng.standard_normal((_ROD_WORLDS, 2, 3)) * 0.1).astype(np.float32)),
+        ("geom_xpos_in", "arr2:vec3", (rng.standard_normal((_ROD_WORLDS, 2, 3)) * 0.1).astype(np.float32)),
+        ("geom_xmat_in", "arr2:mat33", (rng.standard_normal((_ROD_WORLDS, 2, 9)) * 0.1).astype(np.float32)),
+        ("subtree_com_in", "arr2:vec3", (rng.standard_normal((_ROD_WORLDS, 2, 3)) * 0.1).astype(np.float32)),
+        ("cdof_in", "arr2:spatial_vector", (rng.standard_normal((_ROD_WORLDS, 3, 6)) * 0.1).astype(np.float32)),
+        ("cvel_in", "arr2:spatial_vector", (rng.standard_normal((_ROD_WORLDS, 2, 6)) * 0.1).astype(np.float32)),
+        ("Mi", "arr:i32", np.array([1, 2, 2], dtype=np.int32)),
+        ("Mj", "arr:i32", np.array([0, 0, 1], dtype=np.int32)),
+        ("qDeriv_out", "out2:f32", (_ROD_WORLDS, 9)),
+        ("__dim__", "", (_ROD_WORLDS, 1, 3)),
+    ]
+    return (args, [])
+
+
 BUILDERS = {
     name[2:]: fn  # strip leading "b_"
     for name, fn in list(globals().items())
