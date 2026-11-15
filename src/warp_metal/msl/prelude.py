@@ -220,6 +220,23 @@ static inline mat33f make_mat33f(float a, float b, float c, float d, float e, fl
     mat33f m; m.c[0][0]=a; m.c[0][1]=b; m.c[0][2]=c; m.c[1][0]=d; m.c[1][1]=e; m.c[1][2]=f;
     m.c[2][0]=g; m.c[2][1]=h; m.c[2][2]=i; return m;
 }
+// ---- copy constructors (C++ mat_t/vec_t/quat_t/transform_t/spatial_vector_t
+// copy ctor: EXACT memberwise copy). The translator cannot type-check SSA
+// ctor args — a single-arg wp.mat33(x) call may be the scalar fill above OR
+// a copy of an aggregate (Newton _eig_inertia returns wp.mat33(vectors)) —
+// so MSL overload resolution mirrors upstream C++ resolution. Cross-dtype
+// conversions (wp.vec3i(vec3f)) deliberately have NO overload: they fail
+// loud at Metal compile (no matching function) instead of mistranslating.
+static inline vec2f make_vec2f(vec2f v) { return v; }
+static inline vec3f make_vec3f(vec3f v) { return v; }
+static inline vec4f make_vec4f(vec4f v) { return v; }
+static inline vec5f make_vec5f(vec5f v) { return v; }
+static inline quatf make_quatf(quatf q) { return q; }
+static inline transformf make_transformf(transformf t) { return t; }
+static inline spatial_vectorf make_spatial_vectorf(spatial_vectorf s) { return s; }
+static inline mat22f make_mat22f(mat22f m) { return m; }
+static inline mat33f make_mat33f(mat33f m) { return m; }
+static inline mat44f make_mat44f(mat44f m) { return m; }
 // ---- integer vectors (vec.h vec_t with int) ----
 static inline vec2i make_vec2i() { vec2i v = {0, 0}; return v; }
 static inline vec3i make_vec3i() { vec3i v = {0, 0, 0}; return v; }
@@ -230,6 +247,11 @@ static inline vec4i make_vec4i(int x, int y, int z, int w) { vec4i v; v.x = x; v
 static inline vec2i make_vec2i(int s) { return make_vec2i(s, s); }
 static inline vec3i make_vec3i(int s) { return make_vec3i(s, s, s); }
 static inline vec4i make_vec4i(int s) { return make_vec4i(s, s, s, s); }
+// copy ctors (vec.h vec_t copy ctor: exact memberwise copy — see the float
+// copy block above for why MSL overload resolution carries it)
+static inline vec2i make_vec2i(vec2i v) { return v; }
+static inline vec3i make_vec3i(vec3i v) { return v; }
+static inline vec4i make_vec4i(vec4i v) { return v; }
 // extract-style component read with runtime index (vec.h extract + component_ref)
 static inline int wp_extract(vec2i v, int i) { return i == 0 ? v.x : v.y; }
 static inline int wp_extract(vec3i v, int i) { return i == 0 ? v.x : (i == 1 ? v.y : v.z); }

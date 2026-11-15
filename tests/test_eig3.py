@@ -24,6 +24,19 @@ names / upstream arithmetic; no Metal device is created, so the module runs
 under CPU-only verification. Numerical validation of the port happens in
 the GPU battery (the mujoco-glue corpus rows); there is no host execution
 path for MSL.
+
+Also pinned here: the aggregate COPY ctors the same Newton chain materializes
+(``_eig_inertia`` returns ``wp.mat33(vectors), wp.vec3(values)`` — SSA
+``wp::mat_t<3, 3, f32>(var)`` / ``wp::vec_t<3, f32>(var)`` through the shared
+``_CTOR_TABLE`` path). Those emit ``make_mat33f(var)`` / ``make_vec3f(var)``
+single-arg calls, which only compile if the prelude carries copy overloads
+alongside the scalar-fill / element overloads; the copy ctor is an EXACT
+memberwise copy (upstream C++ ``mat_t(mat_t)`` / ``vec_t(vec_t)``), pinned as
+the identity-return overload signature. The translator cannot type-check SSA
+ctor args (single-arg may be scalar fill OR copy), so MSL overload resolution
+mirrors upstream C++ resolution — the same coverage is asserted for the whole
+emittable family (mat22/33/44, vec2/3/4/5f, spatial_vector, quat, transform,
+vec2/3/4i) and for ``ensure_mat_def``'s generated generic mats.
 """
 
 import re
@@ -68,6 +81,50 @@ def k_eig_fp64(out: wp.array(dtype=wp.float32)):
     i = wp.tid()
     Q, d = wp.eig3(wp.mat33d(4.0, 1.0, 2.0, 1.0, 3.0, 1.0, 2.0, 1.0, 5.0))
     out[i] = wp.float32(d[0])
+
+
+@wp.kernel
+def k_copies(
+    m3: wp.array(dtype=wp.mat33),
+    v3: wp.array(dtype=wp.vec3),
+    out_m: wp.array(dtype=wp.mat33),
+    out_v: wp.array(dtype=wp.vec3),
+):
+    i = wp.tid()
+    # Newton _eig_inertia return shape: aggregate-from-aggregate ctor
+    a, b = wp.mat33(m3[i]), wp.vec3(v3[i])
+    out_m[i] = a
+    out_v[i] = b
+
+
+@wp.kernel
+def k_copies_more(
+    m4: wp.array(dtype=wp.mat44),
+    q: wp.array(dtype=wp.quat),
+    t: wp.array(dtype=wp.transform),
+    v2i: wp.array(dtype=wp.vec2i),
+    out4: wp.array(dtype=wp.mat44),
+    outq: wp.array(dtype=wp.quat),
+    outt: wp.array(dtype=wp.transform),
+    out2i: wp.array(dtype=wp.vec2i),
+):
+    i = wp.tid()
+    out4[i] = wp.mat44(m4[i])
+    outq[i] = wp.quat(q[i])
+    outt[i] = wp.transform(t[i])
+    out2i[i] = wp.vec2i(v2i[i])
+
+
+@wp.kernel
+def k_generic_mat_int(out: wp.array(dtype=wp.int32)):
+    # mujoco_warp-style 6x2 int matrix: forces the ensure_mat_def generated def
+    i = wp.tid()
+    e = wp.where(
+        i == 0,
+        wp.matrix(0, 1, 1, 2, 2, 0, 2, 3, 0, 3, 1, 3, shape=(6, 2), dtype=int),
+        wp.matrix(1, 2, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, shape=(6, 2), dtype=int),
+    )
+    out[i] = e[i % 6, 0]
 
 
 def _strip_msl_comments(src: str) -> str:
@@ -148,6 +205,58 @@ class TestEig3FailLoud(unittest.TestCase):
         with self.assertRaises(TranslationError) as ctx:
             translate_kernel(k_eig_fp64)
         self.assertIn("float64", str(ctx.exception))
+
+
+class TestAggregateCopyCtors(unittest.TestCase):
+    """The copy-ctor layer under the eig3 chain (KEP-0001 M3.2 follow-up).
+
+    _eig_inertia materializes its return with aggregate-from-aggregate ctors
+    (wp.mat33(vectors) / wp.vec3(values)); the shared _CTOR_TABLE path emits
+    make_<type>(var) single-arg calls, which resolve only against prelude
+    copy overloads — the exact memberwise-copy semantics of upstream C++
+    mat_t(mat_t)/vec_t(vec_t), pinned here as identity-return signatures.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.sources = {
+            "copies": translate_kernel(k_copies).source(),
+            "copies_more": translate_kernel(k_copies_more).source(),
+            "generic_mat": translate_kernel(k_generic_mat_int).source(),
+        }
+
+    def _assert_copy_overload(self, src: str, msl_t: str):
+        # identity-return signature IS the exact memberwise-copy semantics;
+        # the parameter name is semantic (v/q/t/s/m), so match its shape
+        self.assertRegex(src, rf"static inline {msl_t} make_{msl_t}\({msl_t} \w+\) \{{ return \w+; \}}", msl_t)
+
+    def test_newton_chain_copy_emissions(self):
+        # the exact emissions the GPU battery tripped on: single-arg
+        # make_mat33f/make_vec3f calls must now resolve against copy overloads
+        src = self.sources["copies"]
+        self.assertRegex(src, r"var_\d+ = make_mat33f\(var_\d+\);")
+        self.assertRegex(src, r"var_\d+ = make_vec3f\(var_\d+\);")
+        for msl_t in ("mat33f", "vec3f"):
+            self._assert_copy_overload(src, msl_t)
+
+    def test_ctor_table_family_copy_overloads(self):
+        # the whole emittable _CTOR_TABLE family carries copy overloads
+        src = self.sources["copies_more"]
+        for arg in ("var_3", "var_6", "var_9", "var_12"):
+            self.assertRegex(src, rf"var_\d+ = make_\w+\({arg}\);")
+        for msl_t in ("mat44f", "quatf", "transformf", "vec2i"):
+            self._assert_copy_overload(src, msl_t)
+
+    def test_generic_mat_generated_copy_overload(self):
+        # ensure_mat_def's generated ctor table gets the same copy overload
+        self.assertIn("static inline mat6x2i make_mat6x2i(mat6x2i m) { return m; }", self.sources["generic_mat"])
+
+    def test_scalar_fill_still_distinct(self):
+        # copy overloads must not have displaced the scalar-fill / splat
+        # forms (wp.mat33(0.0), wp.vec3(0.0) in the _eig_inertia zero branch)
+        src = self.sources["copies"]
+        self.assertIn("static inline mat33f make_mat33f(float s)", src)
+        self.assertIn("static inline vec3f make_vec3f(float s)", src)
 
 
 if __name__ == "__main__":

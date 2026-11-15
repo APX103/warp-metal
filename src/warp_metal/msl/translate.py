@@ -123,6 +123,11 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
     lines.append(f"    for (int i = 0; i < {M}; ++i) for (int j = 0; j < {N}; ++j) v.c[i][j] = s;")
     lines.append("    return v;")
     lines.append("}")
+    # copy ctor (C++ mat_t(mat_t): exact memberwise copy). A single-arg SSA
+    # ctor call may be the scalar fill above OR a copy of an aggregate — the
+    # translator cannot type-check the arg, so MSL overload resolution
+    # mirrors upstream C++ (see the prelude copy-ctor block)
+    lines.append(f"static inline {msl_t} make_{msl_t}({msl_t} m) {{ return m; }}")
     comps = ", ".join(f"m.c[i][{j}]" for j in range(N))
     lines.append(
         f"static inline {vec} wp_extract({msl_t} m, int i) {{ return make_{vec}({comps}); }}"
