@@ -375,7 +375,7 @@ class UnitChecker:
                 return ("ptr", data_map[ident])
         return ("unknown", e)
 
-    def check_function(self, unit_name, fn, lines, args=None):
+    def check_function(self, unit_name, fn, lines, args=None, unit_fn_names=None):
         findings = []
         # strip // comments first: they carry helper-name mentions that
         # would otherwise register as phantom call sites
@@ -399,6 +399,14 @@ class UnitChecker:
             for fm in _RE_FOR_DECL.finditer(line):
                 var_map[fm.group(2)] = ("val", normalize(fm.group(1)))
         for name, args_, ln_no in _extract_calls(lines):
+            if unit_fn_names and name in unit_fn_names:
+                # unit-internal user function (native_func `_0`/`_1` suffixes
+                # from the vendored dedup, e.g. make_frame_0): translated
+                # into the same unit callee-first, so the MSL is
+                # self-consistent by construction — a missing callee is a
+                # Metal compile error, not a prelude gap. The checker's
+                # scope is the prelude + generated defs.
+                continue
             protos = self.db.get(name)
             if protos is None:
                 findings.append(
@@ -491,10 +499,15 @@ def check_unit(unit, proto_db=None) -> list[Finding]:
             for name, protos in parse_prototypes(definition).items():
                 proto_db.setdefault(name, []).extend(protos)
     checker = UnitChecker(proto_db)
+    fn_names = {fn.name for fn in unit.functions}
     findings = []
-    findings += checker.check_function(unit.kernel.name, unit.kernel, unit.kernel.lines, unit.args)
+    findings += checker.check_function(
+        unit.kernel.name, unit.kernel, unit.kernel.lines, unit.args, unit_fn_names=fn_names
+    )
     for fn in unit.functions:
-        findings += checker.check_function(f"{unit.kernel.name}/{fn.name}", fn, fn.lines)
+        findings += checker.check_function(
+            f"{unit.kernel.name}/{fn.name}", fn, fn.lines, unit_fn_names=fn_names
+        )
     return findings
 
 
@@ -709,9 +722,14 @@ def _check_one(kernel, label, proto_db):
     for definition in unit.structs.values():
         for name, protos in parse_prototypes(definition).items():
             local_db.setdefault(name, []).extend(protos)
-    findings = UnitChecker(local_db).check_function(label, unit.kernel, unit.kernel.lines, unit.args)
+    fn_names = {fn.name for fn in unit.functions}
+    findings = UnitChecker(local_db).check_function(
+        label, unit.kernel, unit.kernel.lines, unit.args, unit_fn_names=fn_names
+    )
     for fn in unit.functions:
-        findings += UnitChecker(local_db).check_function(f"{label}/{fn.name}", fn, fn.lines)
+        findings += UnitChecker(local_db).check_function(
+            f"{label}/{fn.name}", fn, fn.lines, unit_fn_names=fn_names
+        )
     errs = [f for f in findings if f.severity == "ERROR"]
     # group repeated sites (same finding head text)
     groups: dict[str, list[Finding]] = {}

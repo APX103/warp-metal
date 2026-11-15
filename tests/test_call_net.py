@@ -112,6 +112,36 @@ def k_spatial_scalar_broadcast(out: wp.array(dtype=wp.float32)):
     out[0] = s[0] + s[5]
 
 
+vec5 = wp.types.vector(length=5, dtype=float)
+
+
+@wp.kernel
+def k_spatial_equal_zero(out: wp.array(dtype=wp.int32)):
+    # mjw _apply_ft shape: compare a spatial vector against the zero
+    # broadcast (`ft_body == wp.spatial_vector()`). Upstream vec.h
+    # operator== is all-components-equal, bool result; the infix form must
+    # rewrite to wp_equal because MSL structs carry no operator==
+    v = vec6(0.0)
+    v[0] = 1.0
+    if v == vec6():
+        out[0] = 1
+    else:
+        out[0] = 0
+
+
+@wp.kernel
+def k_vec5_noslip_ops(out: wp.array(dtype=wp.float32)):
+    # mjw _noslip_solve shape: neg/dot/add/scalar-mul on the 5-wide efc
+    # force vectors (vec.h componentwise semantics)
+    a = vec5(1.0)
+    b = vec5(2.0)
+    n = -a
+    d = wp.dot(a, b)
+    s = a + b
+    m = 0.5 * a
+    out[0] = n[0] + d + s[1] + m[2]
+
+
 # ---- checker self-tests ----
 
 
@@ -148,6 +178,27 @@ class TestCheckerCore(unittest.TestCase):
         self.assertEqual(len(errs), 1)
         self.assertIn("no prototype found", errs[0].message)
 
+    def test_unit_internal_calls_skipped(self):
+        # unit-internal user functions (vendored `_0`/`_1` dedup suffixes,
+        # e.g. the make_frame_0/make_frame_1 pair from mjw math.py + Newton
+        # kernels.py both defining make_frame) are translated callee-first
+        # into the same unit — they are not prelude surface and must not
+        # register as "no prototype" findings
+        class _StubFn:
+            name = "stub"
+
+            params = []
+
+            lines = ["var_2 = make_frame_0(var_1);"]
+
+        checker = _checker.UnitChecker(_checker.parse_prototypes(PRELUDE))
+        findings = checker.check_function("stub", _StubFn(), _StubFn.lines, unit_fn_names={"make_frame_0"})
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+        findings = checker.check_function("stub", _StubFn(), _StubFn.lines)
+        errs = [f for f in findings if f.severity == "ERROR"]
+        self.assertEqual(len(errs), 1)
+        self.assertIn("make_frame_0", errs[0].message)
+
 
 class TestCheckerOnClosureKernels(unittest.TestCase):
     """Every pinned kernel must pass the static net against the real prelude."""
@@ -180,6 +231,12 @@ class TestCheckerOnClosureKernels(unittest.TestCase):
 
     def test_spatial_scalar_broadcast(self):
         self._check_clean(k_spatial_scalar_broadcast)
+
+    def test_spatial_equal_zero(self):
+        self._check_clean(k_spatial_equal_zero)
+
+    def test_vec5_noslip_ops(self):
+        self._check_clean(k_vec5_noslip_ops)
 
 
 class TestPreludeAtomicSurface(unittest.TestCase):
@@ -309,6 +366,79 @@ class TestEmissionShapes(unittest.TestCase):
     def test_mat33_2d_call_shape(self):
         src = translate_kernel(k_mat33_2d_add).source()
         self.assertIn("wp_atomic_add_ret_at(out_data, _wp_args.out_m, ", src)
+
+
+class TestStructCompareRouting(unittest.TestCase):
+    """Struct equality lowers through wp_equal; struct != fails loud.
+
+    vec.h/quat.h define operator== (all components) but NO operator!= —
+    the same `a != b` on struct values fails to compile upstream native,
+    so mirroring upstream means failing loud here too.
+    """
+
+    def test_equal_emits_wp_equal(self):
+        lines = translate_kernel(k_spatial_equal_zero).kernel.lines
+        self.assertTrue(any("wp_equal(" in l for l in lines))
+
+    def test_not_equal_fails_loud(self):
+        from warp_metal.msl.translate import TranslationError
+
+        def _build():
+            @wp.kernel
+            def k_neq(out: wp.array(dtype=wp.int32)):
+                v = vec6(0.0)
+                if v != vec6():
+                    out[0] = 1
+                else:
+                    out[0] = 0
+
+            return k_neq
+
+        with self.assertRaises(TranslationError):
+            translate_kernel(_build())
+
+    def test_scalar_compare_untouched(self):
+        # scalar/bool == stays infix (wp_iter_cmp(var) == 0 range idiom);
+        # kernel BODY lines only — the shared prelude carries the wp_equal
+        # definitions themselves
+        lines = translate_kernel(k_subtree_com_style).kernel.lines
+        self.assertFalse(any("wp_equal(" in l for l in lines))
+
+    def test_prelude_equality_signatures(self):
+        self.assertIn(
+            "static inline bool wp_equal(vec3f a, vec3f b) { return a.x == b.x && a.y == b.y && a.z == b.z; }",
+            PRELUDE,
+        )
+        self.assertIn("static inline bool wp_equal(spatial_vectorf a, spatial_vectorf b) {", PRELUDE)
+        self.assertIn("static inline bool wp_equal(quatf a, quatf b) {", PRELUDE)
+
+
+class TestClosureVecOverloads(unittest.TestCase):
+    """Signature pins: the sweep8 item-2 scalar-op vec surface.
+
+    Upstream sources: vec.h componentwise (neg/dot/add, scalar broadcast
+    mul), quat.h operator-, mat.h mul(vec, mat) = v^T M, vec.h
+    add_inplace on the spatial (vec_t<6>) form.
+    """
+
+    def test_vec5_arithmetic(self):
+        self.assertIn("static inline vec5f wp_neg(vec5f a) {", PRELUDE)
+        self.assertIn("static inline float wp_dot(vec5f a, vec5f b) {", PRELUDE)
+        self.assertIn("static inline vec5f wp_add(vec5f a, vec5f b) {", PRELUDE)
+        self.assertIn("static inline vec5f wp_mul(float s, vec5f v) {", PRELUDE)
+        self.assertIn("static inline vec5f wp_mul(vec5f v, float s) { return wp_mul(s, v); }", PRELUDE)
+
+    def test_quat_neg(self):
+        self.assertIn("static inline quatf wp_neg(quatf q) { return make_quatf(-q.x, -q.y, -q.z, -q.w); }", PRELUDE)
+
+    def test_row_vector_times_mat33(self):
+        self.assertIn("static inline vec3f wp_mul(vec3f b, mat33f a) {", PRELUDE)
+
+    def test_spatial_add_inplace(self):
+        self.assertIn(
+            "static inline void wp_add_inplace(thread spatial_vectorf& v, int i, float x) {",
+            PRELUDE,
+        )
 
 
 if __name__ == "__main__":

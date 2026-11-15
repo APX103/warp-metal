@@ -69,6 +69,9 @@ _RE_VEC_T = re.compile(r"^wp::vec_t<(\d+),\s*wp::(float32|int32)>$")
 _RE_MAT_T = re.compile(r"^wp::mat_t<(\d+),\s*(\d+),\s*wp::(float32|int32)>$")
 _RE_GEN_MAT = re.compile(r"^mat(\d+)x(\d+)([fi])$")
 _RE_GEN_VEC = re.compile(r"^vec(\d+)([fi])$")
+# MSL struct value types (fixed family + generated) — operands of this kind
+# route infix `==` through wp_equal (see the expr() comparison hook)
+_RE_STRUCT_T = re.compile(r"^(?:spatial_vectorf|transformf|quatf|vec\d+[fi]|mat\d+x\d+[fi]|mat\d+[fi])$")
 _RE_QUAT_T = re.compile(r"^wp::quat_t<wp::float32>$")
 _RE_TRANSFORM_T = re.compile(r"^wp::transform_t<wp::float32>$")
 _RE_ARRAY_T = re.compile(r"^wp::array_t<(.+)>$")
@@ -1341,6 +1344,10 @@ class _BodyTranslator:
         self.array_args = array_args
         self.user_funcs = user_funcs  # native name -> translation (param kinds)
         self.aliases: dict[str, tuple[bool, str]] = {}  # var -> (is_pointer, value expr)
+        # declared var -> MSL type (from the SSA decl lines) — drives the
+        # struct-comparison routing (`a == b` on struct values must rewrite
+        # to wp_equal; MSL structs carry no operator==)
+        self.var_types: dict[str, str] = {}
         # threadgroup slots this body uses, [(k, elem msl, combine)] — the
         # kernel preamble / function preamble declare each slot's shared
         # array in its own function scope
@@ -1639,6 +1646,30 @@ class _BodyTranslator:
             parts = _split_bool_op(src, op)
             if parts is not None:
                 return f"({self.expr(parts[0])} {op} {self.expr(parts[1])})"
+        # struct equality: the vendored codegen lowers `a == b` on struct
+        # values to infix `==` (vec.h/quat.h operator== — all components
+        # equal, bool result; spatial_vector_t is vec_t<6>), but MSL structs
+        # carry no operator==, so route through the prelude wp_equal when
+        # either operand is struct-typed (mjw _apply_ft's
+        # `ft_body == wp.spatial_vector()` zero test). Upstream defines no
+        # struct operator!= — the same form fails to compile upstream too,
+        # so `!=` on struct operands fails loud.
+        e_cmp = src
+        while self._paren_atom(e_cmp):
+            e_cmp = e_cmp[1:-1].strip()
+        for cmp_op in ("==", "!="):
+            cmp_parts = self._split_top_op(e_cmp, cmp_op)
+            if len(cmp_parts) != 2:
+                continue
+            t_left = self.var_types.get(cmp_parts[0].strip())
+            t_right = self.var_types.get(cmp_parts[1].strip())
+            if _RE_STRUCT_T.match(t_left or "") or _RE_STRUCT_T.match(t_right or ""):
+                if cmp_op == "!=":
+                    raise TranslationError(
+                        "struct '!=' has no upstream native definition (vec.h/quat.h "
+                        "define operator== only) — rewrite as not(wp_equal(a, b))"
+                    )
+                return f"wp_equal({self.expr(cmp_parts[0])}, {self.expr(cmp_parts[1])})"
         idx = src.find("wp::")
         if idx != 0:
             # user function call in expression context (RHS of assignment):
@@ -4093,6 +4124,7 @@ class _BodyTranslator:
                 msl_t = msl_type(ctype)
             except TranslationError as e:
                 raise TranslationError(f"decl line {line!r}: {e}")
+            self.var_types[name] = msl_t
             if _RE_GEN_MAT.match(msl_t):
                 ensure_mat_def(self.unit, msl_t)
             elif _RE_GEN_VEC.match(msl_t):

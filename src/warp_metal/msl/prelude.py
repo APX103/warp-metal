@@ -1406,6 +1406,23 @@ static inline int wp_atomic_exch_ret_at(device int* d, wp_arr_meta m, int i, int
     return atomic_exchange_explicit((device atomic_int*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v, memory_order_relaxed);
 }
 
+// composite (vec2f) atomics: per-component fetch on the packed 2-float
+// layout (mjw energy kernels accumulate 2-wide potential slots)
+static inline vec2f wp_atomic_add_ret_at(device vec2f* d, wp_arr_meta m, int i, vec2f v) {
+    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    vec2f r;
+    r.x = atomic_fetch_add_explicit((device atomic_float*)(base + 0), v.x, memory_order_relaxed);
+    r.y = atomic_fetch_add_explicit((device atomic_float*)(base + 1), v.y, memory_order_relaxed);
+    return r;
+}
+static inline vec2f wp_atomic_sub_ret_at(device vec2f* d, wp_arr_meta m, int i, vec2f v) {
+    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    vec2f r;
+    r.x = atomic_fetch_sub_explicit((device atomic_float*)(base + 0), v.x, memory_order_relaxed);
+    r.y = atomic_fetch_sub_explicit((device atomic_float*)(base + 1), v.y, memory_order_relaxed);
+    return r;
+}
+
 // composite (spatial_vectorf) atomics: per-component fetch on the packed
 // 6-float layout (upstream lowers wp.atomic_add on vector dtypes the same way)
 static inline spatial_vectorf wp_atomic_add_ret_at(device spatial_vectorf* d, wp_arr_meta m, int i, spatial_vectorf v) {
@@ -1560,6 +1577,56 @@ static inline vec2f wp_neg(vec2f a) { return -a; }
 static inline vec3f wp_neg(vec3f a) { return -a; }
 static inline vec4f wp_neg(vec4f a) { return -a; }
 static inline spatial_vectorf wp_neg(spatial_vectorf s) { return make_spatial_vectorf(-s.w, -s.v); }
+
+// ---- closure scalar-op vec overloads (KEP-0001 M3.2) ----
+// vec5f arithmetic (vec.h componentwise; the 5-wide efc force/cone vectors in
+// mjw _noslip_solve / Newton convert_newton_contacts). quatf neg (quat.h
+// operator-). Row-vector times matrix (mat.h mul(vec, mat): r = sum_i
+// row_i(a) * b[i], i.e. v^T M).
+static inline vec5f wp_neg(vec5f a) { return make_vec5f(-a.x, -a.y, -a.z, -a.w, -a.u); }
+static inline float wp_dot(vec5f a, vec5f b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w + a.u * b.u;
+}
+static inline vec5f wp_add(vec5f a, vec5f b) {
+    return make_vec5f(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w, a.u + b.u);
+}
+static inline vec5f wp_mul(float s, vec5f v) { return make_vec5f(s * v.x, s * v.y, s * v.z, s * v.w, s * v.u); }
+static inline vec5f wp_mul(vec5f v, float s) { return wp_mul(s, v); }
+static inline quatf wp_neg(quatf q) { return make_quatf(-q.x, -q.y, -q.z, -q.w); }
+static inline vec3f wp_mul(vec3f b, mat33f a) {
+    return make_vec3f(
+        b.x * a.c[0][0] + b.y * a.c[1][0] + b.z * a.c[2][0],
+        b.x * a.c[0][1] + b.y * a.c[1][1] + b.z * a.c[2][1],
+        b.x * a.c[0][2] + b.y * a.c[1][2] + b.z * a.c[2][2]
+    );
+}
+// vec.h add_inplace(v, i, x) on the spatial form (spatial_vector_t is
+// vec_t<6>: w/v dispatch, negative wrap like every component helper here)
+static inline void wp_add_inplace(thread spatial_vectorf& v, int i, float x) {
+    if (i < 0) i += 6;
+    if (i < 3) {
+        wp_add_inplace(v.w, i, x);
+    } else {
+        wp_add_inplace(v.v, i - 3, x);
+    }
+}
+
+// ---- struct equality (KEP-0001 M3.2) ----
+// vec.h/quat.h operator==: all components equal, bool result (spatial
+// vector is vec_t<6>, so w then v). MSL structs carry no operator==; the
+// translator routes infix `==` on struct-typed operands through wp_equal
+// (mjw _apply_ft's `ft_body == wp.spatial_vector()` zero test). Upstream
+// defines NO struct operator!= — the same form fails to compile upstream,
+// so `!=` fails loud in the translator.
+static inline bool wp_equal(vec3f a, vec3f b) { return a.x == b.x && a.y == b.y && a.z == b.z; }
+// quat.h operator== (componentwise, bool result) — exercised by the flex
+// bend-stiffness kernel's frame quaternion comparisons
+static inline bool wp_equal(quatf a, quatf b) {
+    return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
+}
+static inline bool wp_equal(spatial_vectorf a, spatial_vectorf b) {
+    return wp_equal(a.w, b.w) && wp_equal(a.v, b.v);
+}
 // cw_mul/cw_div: component-wise vector ops (upstream sametypes constraint)
 static inline vec2f wp_cw_mul(vec2f a, vec2f b) { return make_vec2f(a.x * b.x, a.y * b.y); }
 static inline vec3f wp_cw_mul(vec3f a, vec3f b) { return make_vec3f(a.x * b.x, a.y * b.y, a.z * b.z); }
