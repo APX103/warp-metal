@@ -842,14 +842,48 @@ def flush() -> None:
     _mm.flush()
 
 
-class array:
+class _ArrayMeta(type):
+    """Metaclass for the public ``wp.array`` facade (KEP-0001 M3.2).
+
+    Upstream ``isinstance(x, wp.array)`` accepts every ``wp.array`` instance,
+    including the annotation-mode descriptors ``wp.array(ndim=..., dtype=...)``
+    returns (mujoco_warp builds its array specs exactly that way — types.py:950
+    — and probes them with ``isinstance(typ, wp.array)``, warp_util.py:26).
+    The facade is a plain wrapper class, though: neither runtime ``WarpArray``
+    values nor vendored annotation descriptors are Python subclasses of it, so
+    the default type() check answers False for both — mujoco_warp's put_model
+    then routed every one of the 521 Model fields to the scalar ``f.type(value)``
+    branch and raised ``TypeError: 'array' object is not callable`` (matrix
+    §5-1). The checks here restore the upstream answers: a runtime WarpArray or
+    a vendored array descriptor passes; everything else keeps the plain
+    subclass answer.
+    """
+
+    def __instancecheck__(cls, instance):
+        from ..frontend.types import array as _vendored_array
+
+        return isinstance(instance, WarpArray) or isinstance(instance, _vendored_array)
+
+    def __subclasscheck__(cls, subclass):
+        from ..frontend.types import array as _vendored_array
+
+        if subclass is cls:
+            return True
+        return issubclass(subclass, (WarpArray, _vendored_array))
+
+
+class array(metaclass=_ArrayMeta):
     """Public ``wp.array``: runtime-backed construction (KEP-0001 M1.6).
 
     Newton's builder creates arrays host-side with data; the runtime
     WarpArray is the native Metal allocation (shared storage). Subscripting
-    yields the vendored annotations and ``isinstance`` accepts both runtime
-    and vendored instances, so kernel annotations and struct fields behave
-    identically to upstream. ``ptr``/``capacity`` aliasing needs a native
+    yields the vendored annotations, and ``isinstance`` accepts both runtime
+    and vendored instances via the ``_ArrayMeta`` metaclass above (a bare
+    in-class ``__instancecheck__`` never fires — ``isinstance`` dispatches on
+    the metaclass — so the facade check must live on ``_ArrayMeta``; M3.2),
+    so kernel annotations, struct fields, and downstream isinstance-based
+    spec probes (mujoco_warp ``is_array_spec``) behave identically to
+    upstream. ``ptr``/``capacity`` aliasing needs a native
     ``buffer_from_ptr`` (Phase 2) and fails loud; ``copy=False`` lands as a
     copy (Metal cannot alias non-page-aligned host memory — see __new__);
     grad/pinned flags stay Non-Goals.
@@ -913,15 +947,9 @@ class array:
 
         return _parse_array_subscript(_vendored_array, params)
 
-    def __instancecheck__(cls, instance):
-        from ..frontend.types import array as _vendored_array
-
-        return isinstance(instance, WarpArray) or isinstance(instance, _vendored_array)
-
-    def __subclasscheck__(cls, subclass):
-        from ..frontend.types import array as _vendored_array
-
-        return issubclass(subclass, (WarpArray, _vendored_array))
+    # isinstance/issubclass parity lives on _ArrayMeta (the metaclass): an
+    # __instancecheck__ defined in this class body would never fire, because
+    # isinstance() dispatches on type(cls), i.e. the metaclass.
 
 
 def device_name() -> str:
