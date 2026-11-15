@@ -972,6 +972,9 @@ static inline void wp_atomic_sub(device atomic_int* addr, int value) {
 static inline void wp_atomic_sub(device atomic_uint* addr, uint value) {
     atomic_fetch_sub_explicit(addr, value, memory_order_relaxed);
 }
+static inline void wp_atomic_sub(device atomic_float* addr, float value) {
+    atomic_fetch_sub_explicit(addr, value, memory_order_relaxed);
+}
 static inline void wp_atomic_min(device atomic_int* addr, int value) {
     int old = atomic_load_explicit(addr, memory_order_relaxed);
     while (value < old && !atomic_compare_exchange_weak_explicit(addr, &old, value, memory_order_relaxed, memory_order_relaxed)) {}
@@ -1005,6 +1008,9 @@ static inline void wp_atomic_max(device atomic_float* addr, float value) {
 // captures the result (var_x = wp::atomic_min(...)).
 static inline float wp_atomic_add_ret(device atomic_float* addr, float value) {
     return atomic_fetch_add_explicit(addr, value, memory_order_relaxed);
+}
+static inline float wp_atomic_sub_ret(device atomic_float* addr, float value) {
+    return atomic_fetch_sub_explicit(addr, value, memory_order_relaxed);
 }
 static inline int wp_atomic_sub_ret(device atomic_int* addr, int value) {
     return atomic_fetch_sub_explicit(addr, value, memory_order_relaxed);
