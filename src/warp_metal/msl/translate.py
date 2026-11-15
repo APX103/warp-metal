@@ -2102,7 +2102,16 @@ class _BodyTranslator:
                 "are in the closure (ternary maps have no _CALL_TABLE operator)"
             )
         op = args[0].strip()
-        op_msl = _CALL_TABLE.get(op[4:] if op.startswith("wp::") else op)
+        if op.startswith("wp::"):
+            op_msl = _CALL_TABLE.get(op[4:])
+        elif op in self.user_funcs:
+            # user-function map (vendored dedup suffixes: mjw solver's
+            # _state_check_0/_active_check_0 over the JTDAJ tiles) — the
+            # translated unit function is directly callable with the same
+            # element arity
+            op_msl = op
+        else:
+            op_msl = _CALL_TABLE.get(op)
         if op_msl is None:
             raise TranslationError(f"tile_map operator {op!r} has no MSL translation")
         self.unit.uses_tile_ops = True
@@ -2249,6 +2258,64 @@ class _BodyTranslator:
         mask = self.expr(sargs[2 + nd])
         return [
             f"if ({mask}) {{ {arr}[{addr}] = {value}; }}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _tile_scatter_add(self, stripped: str) -> list[str]:
+        """``wp::tile_scatter_add(tile, idx[, idx1], value, has_value);`` —
+        tile.h:4859 collective scatter-ADD: every lane calls it, lanes with
+        ``has_value == false`` skip the write, and the sync at tile.h:4960 is
+        unconditional (it also orders the accumulation before cross-lane
+        reads).
+
+        Lowered on the Atomic=false template branch verbatim (`data(i) += v`,
+        tile.h:4868): the closure's only site (mjw solver.py:2709 JTDAJ
+        densify) scatters CSR entries whose (col, row) positions are unique
+        per block, so in-block addresses never collide and a serial add per
+        lane is bit-exact against the CPU bd=1 golden. A future closure with
+        genuine same-address collisions must switch to a CAS loop (Metal has
+        no native float atomics) — fail loud is not available here, so the
+        uniqueness premise lives in this comment and the corpus fixture.
+        """
+        self.unit.uses_tile_ops = True
+        open_p = len("wp::tile_scatter_add(") - 1
+        close = _find_balanced(stripped, open_p)
+        sargs = split_args(stripped[open_p + 1 : close])
+        if len(sargs) not in (4, 5):
+            raise TranslationError(f"tile_scatter_add with {len(sargs)} args")
+        nd = len(sargs) - 3  # 1-D (idx) or 2-D (idx0, idx1)
+        tvar = self._tvar(sargs[0].strip(), "tile_scatter_add")
+        if tvar.kind != "shr":
+            if self.unit.block_dim is None:
+                # plain launch without block_dim: per-thread degenerate —
+                # the tile is the thread's own single element, accumulated
+                # only when the index selects element (0[,0]) and has_value
+                # is set (matches the scalar tier of tile_scatter_masked)
+                tgt = sargs[0].strip()
+                guards = [f"({self.expr(s)}) == 0" for s in sargs[1 : 1 + nd]]
+                return [
+                    (
+                        f"if ({self.expr(sargs[2 + nd])} && {' && '.join(guards)}) "
+                        f"{{ {tgt} += {self.expr(sargs[1 + nd])}; }}"
+                    )
+                ]
+            raise TranslationError(
+                f"tile_scatter_add target {sargs[0].strip()!r} is not a shared-storage tile: "
+                "the per-thread-copy lowering cannot accumulate across lanes — "
+                'declare the tile with storage="shared"'
+            )
+        self._check_uniform("wp::tile_scatter_add")
+        arr = f"_wp_tile_shr_{tvar.slot}"
+        if nd == 1:
+            addr = tvar.coord_addr([self.expr(sargs[1])])
+        else:
+            addr = tvar.coord_addr([self.expr(sargs[1]), self.expr(sargs[2])])
+        value = self.expr(sargs[1 + nd])
+        has_value = self.expr(sargs[2 + nd])
+        return [
+            f"if ({has_value}) {{ {arr}[{addr}] += {value}; }}",
+            # tile.h:4960: the trailing sync is UNCONDITIONAL (also reached
+            # when every lane's has_value is false)
             "threadgroup_barrier(mem_flags::mem_threadgroup);",
         ]
 
@@ -4176,6 +4243,8 @@ class _BodyTranslator:
 
         if stripped.startswith("wp::tile_scatter_masked("):
             return self._tile_scatter(stripped)
+        if stripped.startswith("wp::tile_scatter_add("):
+            return self._tile_scatter_add(stripped)
         if stripped.startswith("wp::tile_sort("):
             # in-place key-value sort (the SSA strips the trailing semicolon
             # below; the parser wants the bare call)

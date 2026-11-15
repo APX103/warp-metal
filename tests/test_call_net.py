@@ -142,6 +142,23 @@ def k_vec5_noslip_ops(out: wp.array(dtype=wp.float32)):
     out[0] = n[0] + d + s[1] + m[2]
 
 
+@wp.kernel
+def k_tile_scatter_add(x: wp.array(dtype=wp.float32)):
+    # mjw solver.py:2709 JTDAJ densify shape: tile_scatter_add into a shared
+    # tile with has_value gating (unique per-lane addresses — the closure's
+    # only site scatters CSR entries whose (col, row) positions are unique
+    # per block, which is the premise for the Atomic=false lowering)
+    t = wp.tile_zeros(shape=(8,), dtype=float, storage="shared")
+    i = wp.tid()
+    cond = i < 4
+    pos = wp.where(cond, i, 0)
+    wp.tile_scatter_add(t, pos, wp.where(cond, 1.0, 0.0), cond)
+    wp.tile_store(x, t)
+
+
+_TILE_SCATTER_ADD_BD = 4
+
+
 # ---- checker self-tests ----
 
 
@@ -411,6 +428,39 @@ class TestStructCompareRouting(unittest.TestCase):
         )
         self.assertIn("static inline bool wp_equal(spatial_vectorf a, spatial_vectorf b) {", PRELUDE)
         self.assertIn("static inline bool wp_equal(quatf a, quatf b) {", PRELUDE)
+
+
+class TestTileScatterAdd(unittest.TestCase):
+    """tile.h:4859 collective scatter-add on the Atomic=false branch.
+
+    Every lane calls it; has_value=false skips the write; the trailing sync
+    (tile.h:4960) is unconditional. Lowered as `data(i) += v` per lane —
+    valid because the closure's only site (mjw solver.py:2709 JTDAJ CSR
+    densify) scatters unique in-block addresses.
+    """
+
+    def test_emission_and_barrier(self):
+        unit = translate_kernel(k_tile_scatter_add, options={"block_dim": _TILE_SCATTER_ADD_BD})
+        add_lines = [l for l in unit.kernel.lines if "+=" in l and "_wp_tile_shr_" in l]
+        self.assertEqual(len(add_lines), 1)
+        self.assertIn("if (", add_lines[0])
+        # the trailing barrier follows unconditionally (not nested in the if)
+        idx = unit.kernel.lines.index(add_lines[0])
+        self.assertIn("threadgroup_barrier", unit.kernel.lines[idx + 1])
+
+    def test_checker_clean(self):
+        unit = translate_kernel(k_tile_scatter_add, options={"block_dim": _TILE_SCATTER_ADD_BD})
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+    def test_plain_launch_scalar_tier(self):
+        # plain launch (no block_dim): the tile is the thread's own single
+        # element — accumulate only when the index selects element 0 and
+        # has_value is set; no barrier (nothing is cross-lane visible)
+        unit = translate_kernel(k_tile_scatter_add)
+        add_lines = [l for l in unit.kernel.lines if "+=" in l and "_wp_tile_shr_" not in l]
+        self.assertEqual(len(add_lines), 1)
+        self.assertIn("== 0", add_lines[0])
 
 
 class TestClosureVecOverloads(unittest.TestCase):
