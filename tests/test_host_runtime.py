@@ -332,7 +332,10 @@ class TestCapturePassthrough(unittest.TestCase):
     def test_graph_constructs_fail_loud(self):
         # capture_if outside capture = upstream eager semantics (callable
         # dispatch on the condition element); Graph callbacks and
-        # capture_while stay the M2.5 boundary and fail loud.
+        # capture-INTERNAL capture_while stay the M2.5 boundary and fail
+        # loud. capture_while OUTSIDE capture is upstream's no-graph eager
+        # fallback (context.py "just execute the kernels directly"), so a
+        # foreign condition still fails loud with the type error.
         cond = wp.zeros(1, dtype=wp.int32, device="metal")
         called = []
 
@@ -345,8 +348,8 @@ class TestCapturePassthrough(unittest.TestCase):
         self.assertEqual(called, [2, 3])
         with self.assertRaises(TypeError):
             wp.capture_if(cond, on_true=object())
-        with self.assertRaises(NotImplementedError):
-            wp.capture_while(lambda: True)
+        with self.assertRaises(TypeError):
+            wp.capture_while(lambda: True)  # condition must be an int32 WarpArray
 
     def test_capture_launch_rejects_foreign(self):
         with self.assertRaises(RuntimeError):

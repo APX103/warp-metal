@@ -2527,8 +2527,39 @@ def capture_if(condition, on_true=None, on_false=None, stream=None, **kwargs):
 
 
 def capture_while(condition, while_body=None, stream=None, **kwargs):
-    """While-loop graph nodes are CUDA-graph machinery — fail loudly."""
-    raise NotImplementedError("wp.capture_while is not supported by warp-metal (CUDA-graph construct)")
+    """Upstream-faithful eager loop outside graph capture; fail-loud inside.
+
+    Outside capture, upstream's ``capture_while`` takes its no-graph branch
+    (context.py: "since no graph is active, just execute the kernels
+    directly"): read the condition element on the host each iteration and
+    run the callable body until it clears — no CUDA-graph machinery
+    involved, and the same branch upstream CPU devices always take. mjw's
+    solver reaches ``wp.capture_while`` only outside a capture (Newton never
+    capture_begins around mjw steps), so this eager form reproduces the
+    upstream CPU semantics exactly. Capture-INTERNAL while nodes stay the
+    rejected candidate (KEP-0001 graph_conditional disposition; see
+    capture_if) and fail loud, matching the APIC-record path upstream uses
+    for CPU captures.
+    """
+    if _CAPTURE_RECORDS is not None:
+        raise CaptureStateError(
+            "wp.capture_while inside an active capture: upstream CPU records "
+            "an APIC while-op here, but warp-metal's record/replay capture "
+            "would have to eager-read the condition once and replay that "
+            "fixed iteration count on every replay. Capture the loop outside "
+            "the graph (host while-loop between replays)."
+        )
+    if not isinstance(condition, WarpArray) or condition.numpy.dtype != np.int32:
+        raise TypeError("Condition must be a Warp array of int32 with a single element")
+    if while_body is None:
+        return
+    while True:
+        if not bool(condition.numpy[0]):
+            break
+        if callable(while_body):
+            while_body(**kwargs)
+        else:
+            raise TypeError("while_body must be a Callable (Graph replay: Phase 2, M2.5)")
 
 
 def init() -> None:

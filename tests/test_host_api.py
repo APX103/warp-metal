@@ -21,7 +21,9 @@ the kernel compile unit, so the shared prelude must define the macro
 
 HOST-ONLY: kernel decoration and ``translate_kernel`` emit are pure-Python
 (AST → MSL text); nothing here compiles a Metal library, dispatches, or
-creates a WarpArray/device.
+creates a device buffer (the capture eager tests construct numpy-backed
+CPU-side WarpArrays only, and fake the capture state with a module
+attribute — no Metal object is involved).
 """
 
 import inspect
@@ -77,6 +79,79 @@ class TestGetSuggestedBlockSize(unittest.TestCase):
         kernel = _plain_kernel()
         with self.assertRaises(ValueError):
             wp.get_suggested_block_size(kernel, "nosuchdevice")
+
+
+class TestCaptureWhileEager(unittest.TestCase):
+    """wp.capture_while = upstream's no-graph eager fallback.
+
+    Upstream warp 1.19 (context.py capture_while, ``graph is None`` branch)
+    reads the condition element on the host each iteration and runs the
+    callable body until it clears — the branch every non-CUDA device takes,
+    no CUDA-graph machinery involved. mjw's solver reaches capture_while
+    only outside a capture (Newton never capture_begins around mjw steps),
+    so the eager form IS the upstream CPU eager path; capture-INTERNAL
+    while nodes stay the rejected KEP-0001 candidate and fail loud (see
+    capture_if). Arrays here are numpy-backed CPU-side — nothing touches a
+    Metal buffer or dispatch.
+    """
+
+    def _cond(self):
+        return wp.zeros(1, dtype=wp.int32, device="cpu")
+
+    def test_eager_loop_runs_until_condition_clears(self):
+        # the mjw solver shape: body updates the condition array (nsolving
+        # counts down), loop exits when it hits zero; kwargs forward
+        cond = self._cond()
+        cond.numpy[0] = 3
+        seen = []
+        seen_kwargs = []
+        def body(**kwargs):
+            seen.append(1)
+            seen_kwargs.append(dict(kwargs))
+            cond.numpy[0] -= 1
+        wp.capture_while(cond, while_body=body, m="model", compact=False)
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(seen_kwargs, [{"m": "model", "compact": False}] * 3)
+        self.assertEqual(cond.numpy[0], 0)
+
+    def test_clear_condition_never_runs_body(self):
+        cond = self._cond()
+        called = []
+        wp.capture_while(cond, while_body=lambda: called.append(1))
+        self.assertEqual(called, [])
+
+    def test_condition_type_validation(self):
+        # upstream raises the same TypeError for non-array and wrong-dtype
+        with self.assertRaises(TypeError):
+            wp.capture_while(None, while_body=lambda: None)
+        with self.assertRaises(TypeError):
+            wp.capture_while(wp.zeros(1, dtype=wp.float32, device="cpu"), while_body=lambda: None)
+
+    def test_non_callable_body_fails_loud(self):
+        cond = self._cond()
+        cond.numpy[0] = 1
+        with self.assertRaises(TypeError):
+            wp.capture_while(cond, while_body=object())
+
+    def test_inside_capture_fails_loud_named(self):
+        # capture-INTERNAL while nodes are the rejected KEP-0001 candidate
+        # (graph_conditional disposition): no eager execution either, and
+        # the message names the remedy (move the loop outside the graph)
+        import warp_metal.runtime.host as host_mod
+        cond = self._cond()
+        cond.numpy[0] = 1
+        called = []
+        saved = host_mod._CAPTURE_RECORDS
+        host_mod._CAPTURE_RECORDS = []  # any non-None sentinel: "recording"
+        try:
+            with self.assertRaises(wp.CaptureStateError) as ctx:
+                wp.capture_while(cond, while_body=lambda: called.append(1))
+            message = str(ctx.exception)
+            self.assertIn("capture_while", message)
+            self.assertIn("outside", message)
+            self.assertEqual(called, [])
+        finally:
+            host_mod._CAPTURE_RECORDS = saved
 
 
 class TestTileSyncPrelude(unittest.TestCase):
