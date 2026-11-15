@@ -3,6 +3,20 @@
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
 # use this file except in compliance with the License. You may obtain a copy
 # of the License at http://www.apache.org/licenses/LICENSE-2.0.
+
+
+def _src_without_tile_sync_define(src: str) -> str:
+    """Drop the shared-prelude ``#define WP_TILE_SYNC`` line from MSL source.
+
+    The M3.2 prelude carries ``#define WP_TILE_SYNC threadgroup_barrier(...)``
+    in every compiled unit (mujoco_warp func_native snippets need it). The
+    plain-launch pins assert that no barrier is EXECUTED in a scalar-routed
+    kernel, so the inert define mention must not trip them; real barrier
+    statements still fail the pin.
+    """
+    return "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#define WP_TILE_SYNC")
+    )
 """Tile op family (KEP-0001 M2.4): threadgroup-backed tile model.
 
 Every shared-storage tile is a full-shape ``threadgroup`` array read and
@@ -569,7 +583,7 @@ class TestTileModelPins(unittest.TestCase):
         src = u.source()
         self.assertEqual(u.shr_arrays, [])
         self.assertNotIn("_wp_tile_shr", src)
-        self.assertNotIn("threadgroup_barrier", src)
+        self.assertNotIn("threadgroup_barrier", _src_without_tile_sync_define(src))
         self.assertNotIn("_wp_live", src)
         self.assertIn("const int _wp_lane = 0;", src)
 
@@ -587,7 +601,7 @@ class TestTileModelPins(unittest.TestCase):
         src = u.source()
         self.assertEqual(u.shr_arrays, [])
         self.assertNotIn("_wp_tile_shr", src)
-        self.assertNotIn("threadgroup_barrier", src)
+        self.assertNotIn("threadgroup_barrier", _src_without_tile_sync_define(src))
 
     def test_plain_block_dim_also_scalar(self):
         # round-5 single rule: ANY plain launch (block_dim supplied or not)
@@ -628,7 +642,7 @@ class TestTileModelPins(unittest.TestCase):
         u = self._translate(k_plain_reduce)
         src = u.source()
         self.assertEqual(u.shr_arrays, [])
-        self.assertNotIn("threadgroup_barrier", src)
+        self.assertNotIn("threadgroup_barrier", _src_without_tile_sync_define(src))
         self.assertNotIn("_wp_tile_shr", src)
         # argmin degenerate form resolves to the single index
         self.assertIn("= 0;", src)
@@ -1540,7 +1554,7 @@ class TestTileP5Pins(unittest.TestCase):
 
         u = self._translate(k_plain)
         self.assertEqual(u.shr_arrays, [])
-        self.assertNotIn("threadgroup_barrier", u.source())
+        self.assertNotIn("threadgroup_barrier", _src_without_tile_sync_define(u.source()))
 
 
 # ---- P3+P4 numpy references -----------------------------------------------
@@ -1950,7 +1964,7 @@ class TestTileP34Pins(unittest.TestCase):
         u = self._translate(k_plain_chol)
         src = u.source()
         self.assertIn("= sqrt(", src)
-        self.assertNotIn("threadgroup_barrier", src)
+        self.assertNotIn("threadgroup_barrier", _src_without_tile_sync_define(src))
         self.assertEqual(u.shr_arrays, [])
 
     def test_plain_solve_guarded_division(self):
@@ -1967,7 +1981,7 @@ class TestTileP34Pins(unittest.TestCase):
         u = self._translate(k_plain_solve)
         src = u.source()
         self.assertIn("!= 0.0f", src)
-        self.assertNotIn("threadgroup_barrier", src)
+        self.assertNotIn("threadgroup_barrier", _src_without_tile_sync_define(src))
         self.assertEqual(u.shr_arrays, [])
 
     def test_matmul_strided_gemm_loop(self):
