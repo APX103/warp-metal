@@ -26,6 +26,17 @@ Scenes
                       CUDA-only in CI) because it is the CPU-viable rigid-body
                       example that exercises the Newton collision pipeline's
                       mesh paths headless, and it runs in CI test mode on cpu.
+- ``pendulum_batch``  **the M2.6 gate scene** (revised acceptance, ratified
+                      2026-11-15): one double-pendulum rig byte-faithful to
+                      ``basic_pendulum``, replicated ``--num-envs`` times
+                      (default 4096, gate requires >=256) into independent
+                      worlds via ``ModelBuilder.replicate`` -- batch-parallel
+                      envs, SolverXPBD, CollisionPipeline.  The >=3x
+                      metal-vs-single-thread-CPU gate is judged **here**; the
+                      three stock scenes above are dispatch-overhead evidence
+                      and no longer gate criteria.  Scene defined in this
+                      repo's ``tools/scene_pendulum_batch.py`` (public Newton
+                      APIs only; not a registered Newton example).
 
 GPU exclusivity law: one process = one device.  Run each measurement as its
 own solo invocation, then regenerate the report::
@@ -113,6 +124,16 @@ WARP_METAL_REPO = "/Users/apx103/work/warp-metal"
 DEFAULT_WARMUP_FRAMES = 10
 DEFAULT_FRAMES = 100
 
+# Bench-local scene modules live next to this harness (not in newton.examples).
+_TOOLS_DIR = Path(__file__).resolve().parent
+
+
+def _ensure_tools_on_path() -> None:
+    """Make bench-local scene modules importable by module name."""
+    tools = str(_TOOLS_DIR)
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+
 
 @dataclass(frozen=True)
 class SceneSpec:
@@ -159,6 +180,12 @@ class SceneSpec:
                 help="Conveyor tangential speed [m/s].",
             )
         else:  # pragma: no cover - registry is static
+            if self.module.startswith("scene_"):
+                _ensure_tools_on_path()
+                scene = importlib.import_module(self.module)
+                if hasattr(scene, "add_parser_arguments"):
+                    scene.add_parser_arguments(parser)
+                return parser
             raise RuntimeError(f"SceneSpec {self.name!r} has no parser builder")
         return parser
 
@@ -195,7 +222,22 @@ SCENES: dict[str, SceneSpec] = {
             "Eager stepping (the example guards capture to CUDA), exactly as "
             "example.step() runs."
         ),
-        parser_additions="--solver xpbd",
+        parser_additions="--solver xpbd --belt-speed 0.75",
+    ),
+    "pendulum_batch": SceneSpec(
+        name="pendulum_batch",
+        module="scene_pendulum_batch",  # bench-local: tools/scene_pendulum_batch.py
+        timed_loop=(
+            "10 substeps/frame x 4096 independent pendulum worlds (one rig "
+            "replicated via ModelBuilder.replicate, separate worlds): "
+            "clear_forces; CollisionPipeline.collide; SolverXPBD.step; state "
+            "swap. Graph-replayed (cpu APIC / metal record-replay), exactly as "
+            "the stock pendulum example.step() runs. THE M2.6 >=3x gate scene "
+            "(batch 4096 >= 256; sized so the per-frame workload sits far "
+            "above the metal replay-overhead floor measured on the stock "
+            "tiny scenes)."
+        ),
+        parser_additions="--num-envs 4096",
     ),
 }
 
@@ -329,6 +371,8 @@ def measure_scene(spec: SceneSpec, device: str, frames: int, warmup_frames: int)
         _assert_cpu_single_thread(wp)
     wp.set_device(device)
 
+    if spec.module.startswith("scene_"):
+        _ensure_tools_on_path()
     module = importlib.import_module(spec.module)
     example_cls = getattr(module, "Example", None)
     if example_cls is None:
