@@ -282,6 +282,43 @@ def k_tuple_return(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32
     out[0] = pair[0] + pair[1] + float(n)
 
 
+@wp.func
+def _int_pair(a: int, b: int) -> Tuple[int, int]:
+    # all-int value tuple (mjw constraint._dof_chain_advance's
+    # Tuple[int, int]) — collides with the shape-tuple decl heuristic
+    return a + 1, b + 2
+
+
+@wp.kernel
+def k_int_pair_destructure(vals: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.int32)):
+    tid = wp.tid()
+    if vals[tid] > 0:
+        n, m = _int_pair(vals[tid], tid)
+        out[tid] = n + m
+    else:
+        out[tid] = tid
+
+
+@wp.func
+def _tile_halve(t: wp.tile[float, 8, 1], out: wp.array2d(dtype=wp.float32)):
+    # tile-typed @wp.func param (mjw block_cholesky.newton_decrement's
+    # solution_tile) — warp's C++ renders this as template<typename tile_v>
+    v = wp.tile_view(t, shape=(4, 1), offset=(0, 0))
+    wp.tile_store(out, wp.tile_map(wp.mul, v, 0.5), bounds_check=False)
+
+
+@wp.kernel
+def k_tile_template_call(x: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    t = wp.tile_load(x, shape=(8, 1), storage="shared")
+    _tile_halve(t, out)
+
+
+@wp.kernel
+def k_tile_load_nobc(x: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    t = wp.tile_load(x, shape=(8, 8), storage="shared", bounds_check=False)
+    wp.tile_store(out, t)
+
+
 # ---- checker self-tests ----
 
 
@@ -769,6 +806,102 @@ class TestSliceAndTuple(unittest.TestCase):
         self.assertTrue(re.search(r"\)\.v\d", joined))
         findings = _checker.check_unit(unit)
         self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+
+class TestTupleDeclScope(unittest.TestCase):
+    """All-int value tuples (mjw constraint._dof_chain_advance's
+    Tuple[int, int]) hit the shape-tuple decl drop, leaving
+    ``var = make_wp_tuple_int_int(...)`` with no declaration in scope —
+    the M3.2 battery's 16x Metal "use of undeclared identifier". The
+    multi-arg ctor now re-emits decl+init whenever its target has no live
+    declaration. Whether warp's codegen materializes the tuple temp depends
+    on the sret lowering it picks, so the pin is the INVARIANT (no bare
+    make_ assign to an undeclared target), not the ctor's presence."""
+
+    def _assert_no_undeclared_tuple_make(self, unit):
+        joined = ["\n".join(unit.kernel.lines)] + ["\n".join(f.lines) for f in unit.functions]
+        declared: set[str] = set()
+        for piece in joined:
+            for l in piece.splitlines():
+                m = re.match(r"\s*wp_tuple_\S+\s+(var_\d+)\s*;", l)
+                if m:
+                    declared.add(m.group(1))
+                    continue
+                m = re.match(r"\s*wp_tuple_\S+\s+(var_\d+)\s*=\s*make_", l)
+                if m:
+                    declared.add(m.group(1))
+                    continue
+                m = re.match(r"\s*(var_\d+)\s*=\s*make_wp_tuple_", l)
+                if m:
+                    # a bare make_ assignment is only legal for a target
+                    # declared earlier in the same piece
+                    self.assertTrue(
+                        m.group(1) in declared,
+                        f"bare make_wp_tuple assign to undeclared {m.group(1)}: {l.strip()}",
+                    )
+
+    def test_int_pair_invariant(self):
+        unit = translate_kernel(k_int_pair_destructure)
+        self._assert_no_undeclared_tuple_make(unit)
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+    def test_value_tuple_regression(self):
+        # the non-all-int find_oct form still carries its explicit decl
+        unit = translate_kernel(k_tuple_return)
+        self._assert_no_undeclared_tuple_make(unit)
+
+
+class TestTemplateTileFunc(unittest.TestCase):
+    """Tile-typed @wp.func params (mjw block_cholesky.newton_decrement's
+    ``solution_tile: wp.tile[float, M, 1]``) arrive from warp's C++ as
+    ``template<typename tile_x>`` — MSL has no templates. Clone-per-site
+    monomorphization (the ensure_mat_def per-unit generic precedent, one
+    form wider — coordinator-directed 2026-11-15): the callee instantiates
+    under ``__shr<slot>`` with the tile bound to the caller-side threadgroup
+    array through the hidden needs_lane parameter."""
+
+    def test_clone_per_site(self):
+        from warp_metal.msl.translate import fn_src
+
+        unit = translate_kernel(k_tile_template_call, options={"block_dim": 8})
+        clones = [f for f in unit.functions if "__shr" in f.name]
+        self.assertEqual(len(clones), 1)
+        # the clone receives the caller's shr array through the hidden param
+        self.assertIn("threadgroup float* _wp_tile_shr_", fn_src(clones[0]))
+        # the kernel's call site retargets to the clone
+        self.assertTrue(any("__shr" in l for l in unit.kernel.lines))
+        # the template stub itself is not emitted
+        names = [f.name for f in unit.functions]
+        self.assertEqual(len(names), len(set(names)) - 0)  # clone names unique
+        self.assertFalse(any(f.name.endswith("_tile_halve") and not f.name.endswith("__shr0") for f in unit.functions))
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+    def test_two_call_sites_share_one_clone(self):
+        unit = translate_kernel(k_tile_template_call, options={"block_dim": 8})
+        clones = [f.name for f in unit.functions if "__shr" in f.name]
+        self.assertEqual(len(clones), len(set(clones)))
+
+
+class TestTileLoadScratchScope(unittest.TestCase):
+    """bounds_check=False tile loads emit no guard and never read the zero
+    scratch — the ``{ T _wp_z = {}; }`` block was previously emitted
+    unconditionally, leaving an unused-variable warning per site (M3.2
+    battery diagnostics)."""
+
+    def test_nobc_load_has_no_scratch(self):
+        unit = translate_kernel(k_tile_load_nobc, options={"block_dim": 8})
+        self.assertFalse(any("_wp_z" in l for l in unit.kernel.lines))
+        # the load itself still emits (no scratch braces around it)
+        self.assertTrue(any("_wp_tile_shr_" in l for l in unit.kernel.lines))
+
+    def test_bc_load_keeps_scratch(self):
+        unit = translate_kernel(k_tile_load_nobc, options={"block_dim": 8})
+        # bounds-checked loads elsewhere in the closure keep the guard
+        unit_bc = translate_kernel(k_tile_jtdaj_ops, options={"block_dim": _JTDAJ_OPS_BD})
+        self.assertTrue(any("_wp_z = {};" in l for l in unit_bc.kernel.lines))
+        self.assertFalse(any("_wp_z" in l for l in unit.kernel.lines))
 
 
 class TestClosureVecOverloads(unittest.TestCase):

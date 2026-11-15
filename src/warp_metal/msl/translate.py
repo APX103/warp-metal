@@ -1026,13 +1026,27 @@ class ArgSpec:
 class Param:
     """MSL parameter of a device function."""
 
-    def __init__(self, kind: str, msl: str, name: str, array_fields: list[tuple[str, str]] | None = None):
-        self.kind = kind  # 'value' | 'array' | 'ref' (thread T&) | 'struct'
+    def __init__(
+        self,
+        kind: str,
+        msl: str,
+        name: str,
+        array_fields: list[tuple[str, str]] | None = None,
+        slot: int = -1,
+    ):
+        self.kind = kind  # 'value' | 'array' | 'ref' (thread T&) | 'struct' | 'tile_binding'
         self.msl = msl  # MSL type (elem type for arrays)
         self.name = name
         # for kind == 'struct': [(field, elem ctype)] split array fields
         # expanded into extra data+meta params right after the value param
         self.array_fields = array_fields or []
+        # for kind == 'tile_binding': the caller-side threadgroup slot whose
+        # ``_wp_tile_shr_{slot}`` array carries this tile-typed argument
+        # (clone-per-site monomorphization of template<typename tile_...>
+        # callees; fn_src skips the param — the tile travels through the
+        # hidden shr-slot pointer, not a value param). On a template stub,
+        # ``msl`` holds the template TYPE name instead of an MSL type.
+        self.slot = slot
 
 
 class MSLFunction:
@@ -1043,6 +1057,12 @@ class MSLFunction:
         self.ret_msl = ret_msl  # None → void
         self.params: list[Param] = []
         self.lines: list[str] = []
+        # template<typename tile_...> stub pending clone-per-site
+        # instantiation (warp's C++ for tile-typed @wp.func params); the
+        # concrete clones live under per-binding suffixed names
+        self.is_template = False
+        self.template_params: list[str] = []  # template param type names
+        self.template_func = None  # the original warp func, for instantiation
         # tile-using function: takes a hidden trailing ``int _wp_lane``
         # parameter plus one ``threadgroup elem* _wp_tile_shr_{k}`` per
         # reduction slot (fn.params stays SSA-aligned; fn_src/_call_user add
@@ -1109,6 +1129,9 @@ class KernelUnit:
         # per-thread lowering is exact when every threadgroup lane runs, e.g.
         # dim a multiple of block_dim; see tests/test_launch_routing.py).
         self.uses_tile_ops = False
+        # a callee forwards _wp_live (its tile reduces need the fold guard):
+        # the kernel preamble must define it (kernel_src)
+        self.callee_needs_live = False
         # in-device wp.zeros() (wp::fixedarray_t) allocations: every site in
         # the unit (kernel + all @wp.func bodies) claims a unique byte offset
         # in the per-thread arena (`device uchar* _wp_arena`, bytes_per_thread
@@ -1204,7 +1227,8 @@ class KernelUnit:
         fields.append("    wp_arr_meta _dims;  // launch bounds for multi-dim tid")
         body = "\n".join(fn.lines) or "    ;"
         if "_wp_live" in body and not (
-            self.block_dim is not None and (self.tile_reduces or self.uses_live)
+            self.block_dim is not None
+            and (self.tile_reduces or self.uses_live or self.callee_needs_live)
         ):
             # static self-check (mirrors the one in fn_src): a kernel-body
             # fold or stack rank walk needs the preamble definition, which
@@ -1248,7 +1272,7 @@ class KernelUnit:
                 # scalar-carve-out tile ops (the wp.tile(v) per-thread form)
                 # use the lane index without claiming a shared array
                 preamble += f"    const int _wp_lane = _idx % {self.block_dim};\n"
-            if self.tile_reduces or self.uses_live:
+            if self.tile_reduces or self.uses_live or self.callee_needs_live:
                 preamble += f"    const int _wp_live = min((int)_gsize.x - (_idx - _wp_lane), {self.block_dim});\n"
         elif self.uses_tile_ops:
             # plain launch without block_dim: per-thread degenerate tile
@@ -1320,6 +1344,11 @@ class KernelUnit:
 def fn_src(fn: MSLFunction) -> str:
     params = []
     for p in fn.params:
+        if p.kind == "tile_binding":
+            # clone-per-site template binding: the tile travels through the
+            # hidden `_wp_tile_shr_{slot}` trailing param (needs_lane), not a
+            # value param — nothing to emit here
+            continue
         if p.kind == "array":
             params.append(f"    device {p.msl}* {p.name}_data")
             params.append(f"    wp_arr_meta {p.name}_m")
@@ -1399,9 +1428,13 @@ def fn_src(fn: MSLFunction) -> str:
 
 class _BodyTranslator:
     def __init__(self, unit: KernelUnit, array_args: dict[str, ArgSpec], user_funcs: dict[str, "MSLFunction"],
-                 scope: str = "kernel"):
+                 scope: str = "kernel", codegen=None):
         self.unit = unit
         self.scope = scope  # "kernel" (Params buffer) | "func" (meta params)
+        # warp codegen handle — kept so _call_user can instantiate
+        # template-typed callees (clone-per-site monomorphization) lazily at
+        # the first call site
+        self.codegen = codegen
         # array bindings visible in this scope, keyed by every SSA form that
         # can reference them: ``var_<arg>`` for top-level arrays,
         # ``var_<struct>.<field>`` for split struct array fields, and (added
@@ -1423,6 +1456,22 @@ class _BodyTranslator:
         self.used_shr: list[tuple[int, str, str]] = []
         # `wp::Any var_N;` decls (wp.static temps) — typed at first assignment
         self.deferred_any: set[str] = set()
+        # all-int wp::tuple_t decls dropped by the shape-tuple heuristic —
+        # the multi-arg wp::tuple ctor re-emits decl+init for these
+        # (mjw _dof_chain_advance's genuine Tuple[int, int])
+        self._tuple_decl_dropped: set[str] = set()
+        # provable block-uniformity: SSA vars/ranges whose value every lane
+        # of the block computes identically (constants, scalar params, range
+        # loop indices over uniform bounds, arithmetic over those). Drives
+        # the barrier-uniformity checkpoint's provable branch — tile ops
+        # under an `if` whose condition is uniform cannot diverge (upstream
+        # warp's own uniformity rule; mujoco's blocked cholesky guards
+        # tile_assign with `end == matrix_size`). Conservative: unknown
+        # provenance (array loads, tid-derived values, opaque calls) is
+        # divergent.
+        self.uniform_vars: set[str] = set()
+        self.uniform_ranges: set[str] = set()
+        self._tid_vars: set[str] = set()
         # tiled kernels: SSA tile var -> TileVar (threadgroup-backed shared
         # array or the per-thread one-element register form); plus
         # compile-time SSA constants (const var = literal) for tile_extract
@@ -1465,6 +1514,9 @@ class _BodyTranslator:
         # a callee needs the lane + threadgroup arrays: merge its slots into
         # used_shr so this body's signature forwards them transitively
         self.callee_needs_lane = False
+        # a callee forwards _wp_live (its tile reduces need the fold guard):
+        # the kernel preamble must define it
+        self.callee_needs_live = False
         # this body reads wp.mesh_get (needs the `_wp_mesh_table` binding)
         self.used_mesh = False
         # a callee reaches wp.mesh_get: forward the table binding transitively
@@ -1628,6 +1680,91 @@ class _BodyTranslator:
             self._const_vars.pop(name, None)
             return
         self._const_vars[name] = value
+
+    def _is_uniform_expr(self, expr: str) -> bool:
+        """True when every SSA identifier in expr is provably block-uniform.
+        Qualified builtin names (``wp::add`` — the ``::`` makes the bare word
+        its own token) are skipped; their arguments carry the classification.
+        Anything not tracked as uniform — array loads, tid-derived values,
+        opaque calls — classifies divergent."""
+        for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", expr):
+            tok = m.group(0)
+            if expr[max(0, m.start() - 2) : m.start()] == "::":
+                continue  # qualified name (wp::add, wp::int32 …)
+            if tok.startswith("wp") or tok in ("true", "false"):
+                continue
+            if tok in self.uniform_vars or tok in self.uniform_ranges:
+                continue
+            return False
+        return True
+
+    def _note_uniformity(self, stripped: str) -> None:
+        """Track provable block-uniformity from raw SSA assignment lines
+        (before statement routing — the classification is SSA-level, not
+        emission-level)."""
+        m = re.match(
+            r"^([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)"
+            r"\s*=\s*wp::tid\(\);",
+            stripped,
+        )
+        if m:
+            for t in m.group(1).split(","):
+                self._tid_vars.add(t.strip())
+            return
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?);?$", stripped)
+        if not m:
+            # typed const/scalar decl (`const wp::int32 var_k = 0;`) — the
+            # block_size/border_size constants feeding range bounds arrive
+            # this way; a missed seed would poison the whole chain
+            m = re.match(
+                r"^(?:const\s+)?(?:bool|char|short|int|long|float|double|half"
+                r"|unsigned|signed|wp::(?:int|uint|bool)\d*|uint\d+_t|int\d+_t)"
+                r"\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?);?$",
+                stripped,
+            )
+        if not m:
+            # bare typed decl (`wp::range_t var_73;`) — a fresh var number:
+            # invalidate any classification from the block that used this
+            # number before (SSA numbers are block-scoped)
+            m = re.match(
+                r"^(?:const\s+)?(?:bool|char|short|int|long|float|double|half"
+                r"|unsigned|signed|wp::[A-Za-z_0-9]+|uint\d+_t|int\d+_t)"
+                r"\s+([A-Za-z_][A-Za-z0-9_]*);$",
+                stripped,
+            )
+            if m:
+                self.uniform_vars.discard(m.group(1))
+                self.uniform_ranges.discard(m.group(1))
+            return
+        name, rhs = m.group(1), m.group(2).strip()
+        # SSA var numbers are block-scoped and get REUSED across basic
+        # blocks (var_73 is a range iterator in one loop, a tile load in the
+        # next) — every reassignment must invalidate the previous
+        # classification, not just potentially add a new one
+        self.uniform_vars.discard(name)
+        self.uniform_ranges.discard(name)
+        m_r = re.match(r"^wp::range\((.*)\)$", rhs, re.DOTALL)
+        if m_r:
+            if self._is_uniform_expr(m_r.group(1)):
+                self.uniform_ranges.add(name)
+            return
+        # tile-typed values are never scalar-uniform
+        if "wp::tile_" in rhs:
+            return
+        # data-dependent loads and opaque calls stay divergent (conservative)
+        if "wp::address(" in rhs or "wp::load(" in rhs or rhs.startswith("*"):
+            return
+        # a range iterator's induction values advance identically on every
+        # lane of the block when the range bounds are uniform — the mjw
+        # blocked-cholesky loop indices (`end = k + block_size`) come from
+        # exactly this form
+        m_i = re.match(r"^wp::iter_next\(([A-Za-z_][A-Za-z0-9_]*)\)$", rhs)
+        if m_i:
+            if m_i.group(1) in self.uniform_ranges:
+                self.uniform_vars.add(name)
+            return
+        if self._is_uniform_expr(rhs):
+            self.uniform_vars.add(name)
 
     def _check_uniform(self, what: str) -> None:
         """Barrier-uniformity checkpoint: cooperative tile ops emit
@@ -2043,7 +2180,11 @@ class _BodyTranslator:
         meta = self._meta_ref(spec)
         offs = [self.expr(a) for a in cargs[1:]]
         n = tvar.size
-        lines = [f"{{ {elem} _wp_z = {{}};"]
+        # bounds_check=False emits no guard and never reads the zero scratch:
+        # only open the scratch block when the bounds checks will reference it
+        # (bounds_check=False loads otherwise leave an unused-variable warning
+        # per site)
+        lines = [f"{{ {elem} _wp_z = {{}};"] if bc else []
         # bounds_check=True: zero-fill coordinates at or past the upper
         # extent; bounds_check=False: unconditional access (the caller
         # guarantees in-bounds, matching upstream)
@@ -2077,7 +2218,10 @@ class _BodyTranslator:
                     ),
                     "}",
                 ]
-            lines += ["threadgroup_barrier(mem_flags::mem_threadgroup);", "}"]
+            tail = ["threadgroup_barrier(mem_flags::mem_threadgroup);"]
+            if bc:
+                tail.append("}")
+            lines += tail
         else:
             # per-thread one-element register form: this thread owns linear
             # element _wp_lane
@@ -2086,8 +2230,9 @@ class _BodyTranslator:
             lines += [
                 f"int _wp_s0 = ({offs[0]}) + _wp_lane;",
                 "    " + _load_if(target, self._tile_addr(spec, ["_wp_s0"]), [f"_wp_s0 < {meta}.shape[0]"]),
-                "}",
             ]
+            if bc:
+                lines.append("}")
         return lines
 
     def _tile_load_indexed(self, target: str, rhs: str) -> list[str]:
@@ -3784,7 +3929,12 @@ class _BodyTranslator:
         address the thread's one element and fail loud)."""
         args, _tmpl = self._parse_tile_call(rhs, "tile_assign", False)
         if len(args) < 3:
-            raise TranslationError(f"tile_assign with {len(args)} args (needs dst, src, offsets...)")
+            if len(args) != 2:
+                raise TranslationError(f"tile_assign with {len(args)} args (needs dst, src, offsets...)")
+            d_t0 = self._tvar(args[0].strip(), "tile_assign")
+            if d_t0.dims != self._tvar(args[1].strip(), "tile_assign").dims:
+                raise TranslationError("tile_assign without offsets needs matching dst/src dims")
+            args = args + ["0"] * len(d_t0.dims)
         d_t = self._tvar(args[0].strip(), "tile_assign")
         s_t = self._tvar(args[1].strip(), "tile_assign")
         if d_t.dims != s_t.dims:
@@ -4144,6 +4294,7 @@ class _BodyTranslator:
         if not stripped or stripped.startswith("//"):
             return []
         self._const_note(stripped)
+        self._note_uniformity(stripped)
 
         # control flow: label/goto → while(true)/break/continue
         if m := _RE_LABEL.match(line):
@@ -4165,9 +4316,19 @@ class _BodyTranslator:
             # a compile-time-constant condition (the wp.constant fold — e.g.
             # steel's `if COMPUTE_DIAG != 0:`) reaches every lane of the block
             # with the same value: the branch is taken or skipped block-wide,
-            # so barriers inside it cannot diverge. Only runtime-variable
-            # conditions mark the enclosing scope non-uniform.
-            self._block_stack.append("if-const" if self._const_eval(cond) is not None else "if")
+            # so barriers inside it cannot diverge. Next best: a provably
+            # uniform runtime condition (loop indices over uniform ranges,
+            # scalar params, arithmetic over those — mujoco's blocked
+            # cholesky guards tile_assign with `end == matrix_size`); warp's
+            # own uniformity rule admits tile ops there. Only genuinely
+            # divergent runtime conditions mark the scope non-uniform.
+            if self._const_eval(cond) is not None:
+                marker = "if-const"
+            elif self._is_uniform_expr(cond):
+                marker = "if-uniform"
+            else:
+                marker = "if"
+            self._block_stack.append(marker)
             # array truthiness (`if arr:` — upstream emits `if (array_var)`
             # via array_t's non-null data check; warp-metal binds a real
             # buffer even for None args, so truthiness reads the meta's
@@ -4440,7 +4601,15 @@ class _BodyTranslator:
                             raise TranslationError(f"wp::tuple member {a.strip()!r} has no tracked type")
                         elems.append(e)
                     tname = ensure_tuple_def(self.unit, elems)
+                    prev = self.var_types.get(target)
                     self.var_types[target] = tname
+                    # A dropped/never-emitted all-int tuple decl (shape-tuple
+                    # heuristic above; mjw _dof_chain_advance's Tuple[int, int])
+                    # leaves this assignment with no declaration in scope —
+                    # MSL "use of undeclared identifier". Merge decl+init.
+                    if target in self._tuple_decl_dropped or prev != tname:
+                        self._tuple_decl_dropped.discard(target)
+                        return [f"{tname} {target} = make_{tname}({', '.join(self.expr(a) for a in targs)});"]
                     return [f"{target} = make_{tname}({', '.join(self.expr(a) for a in targs)});"]
                 inner = rhs[len("wp::tuple(") : -1].strip()
                 self.aliases[target] = (False, self.expr(inner))
@@ -4615,7 +4784,13 @@ class _BodyTranslator:
                 inner_elems = split_args(ctype.strip()[len("wp::tuple_t<") : -1])
                 if all(e.strip() in ("wp::int32", "wp::int64", "wp::uint32") for e in inner_elems):
                     # shape-tuple temp decl: `t = wp::tuple(x);` registers the
-                    # value alias — drop the decl
+                    # value alias — drop the decl. All-int tuples can ALSO be
+                    # genuine value tuples (mjw _dof_chain_advance's
+                    # Tuple[int, int]), and the decl line is the only way to
+                    # tell: the multi-arg `wp::tuple(a, b)` ctor below checks
+                    # this set and re-emits decl+init when the drop starved
+                    # it of a declaration.
+                    self._tuple_decl_dropped.add(name)
                     return []
                 # value tuple (tuple.h tuple_t): a declared struct local
                 # (mjw find_oct's vec8 weight triples)
@@ -4736,6 +4911,12 @@ class _BodyTranslator:
             return [f"{t} = {t} {op} ({self.expr(r)});"]
 
         if m := re.match(r"^\s*(.+?);\s*$", line):
+            body = m.group(1)
+            # tile-to-tile move (loop-carried SSA phi, mjw blocked cholesky):
+            # route before call_stmt — the copy needs multi-line emission
+            m_ta = re.match(r"^wp::assign\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)$", body)
+            if m_ta and m_ta.group(1) in self.tile_vars and m_ta.group(2) in self.tile_vars:
+                return self._tile_assign_stmt(f"wp::tile_assign({m_ta.group(1)}, {m_ta.group(2)})")
             return [self.call_stmt(m.group(1)) + ";"]
 
         raise TranslationError(f"unparsed statement {line!r}")
@@ -4866,6 +5047,27 @@ class _BodyTranslator:
             raise TranslationError(f"trailing text after call stmt {src!r}")
 
         if key == "wp::assign":
+            if len(args) == 2 and args[0].strip() in self.tile_vars and args[1].strip() in self.tile_vars:
+                raise TranslationError("tile-to-tile wp::assign reached call_stmt (stmt routing bug)")
+            if len(args) >= 3 and args[0].strip() in self.tile_vars:
+                # tile element store (`t[i, j] = v` / `t[i] = v`): a plain
+                # store through the tile's coordinate map — every lane writes
+                # the same address with the same value under uniform indices
+                # (upstream warp semantics), so no barrier is needed; the
+                # next collective op's barrier orders it.
+                tvar = self.tile_vars[args[0].strip()]
+                coords = [self.expr(a) for a in args[1:-1]]
+                value = self.expr(args[-1])
+                if len(coords) != len(tvar.dims):
+                    raise TranslationError(
+                        f"wp::assign element store needs {len(tvar.dims)} indices, got {len(coords)}"
+                    )
+                if tvar.kind == "scalar":
+                    if len(coords) != 1:
+                        raise TranslationError("per-thread tile element store is 1-D only in the closure")
+                    return f"{args[0].strip()} = {value}"
+                arr = self._shrub(tvar)
+                return f"{arr}[{tvar.coord_addr(coords)}] = {value}"
             if len(args) != 2:
                 raise TranslationError(f"wp::assign with {len(args)} args")
             return f"{args[0].strip()} = {self.expr(args[1])}"
@@ -4914,6 +5116,43 @@ class _BodyTranslator:
                 # wp.printf lowers to a native printf call; elided like wp::print
                 return "/* wp.print elided (Metal) */ 0"
             return f"{name}({', '.join(self.expr(a) for a in args)})"
+        if getattr(fn, "is_template", False):
+            # clone-per-site monomorphization (ensure_mat_def pattern one
+            # form wider): bind each template tile param to the concrete
+            # caller-side tile, instantiate under a per-slot suffixed name,
+            # and re-target the call. Directed decision (coordinator,
+            # 2026-11-15): the dtype-keyed-specialization alternative was
+            # rejected as novel machinery — this follows the established
+            # per-unit generic precedent.
+            bindings: dict[str, tuple[int, str, list[int]]] = {}
+            slots: list[int] = []
+            for p in fn.params:
+                if p.kind != "tile_binding":
+                    continue
+                idx = fn.params.index(p)
+                arg = args[idx]
+                tvar = self.tile_vars.get(arg.strip())
+                if tvar is None or tvar.kind != "shr" or tvar.slot < 0:
+                    raise TranslationError(
+                        f"call {name}: tile param {p.name} got {arg!r} — template callee "
+                        "monomorphization needs a shared-storage tile argument"
+                    )
+                bindings[p.msl] = (tvar.slot, tvar.elem, list(tvar.dims))
+                slots.append(tvar.slot)
+            concrete = name + "".join(f"__shr{s}" for s in slots)
+            if concrete not in self.user_funcs:
+                inst = _translate_function(
+                    fn.template_func,
+                    self.unit,
+                    self.user_funcs,
+                    self.codegen,
+                    tile_bindings=bindings,
+                    inst_name=concrete,
+                )
+                self.user_funcs[concrete] = inst
+                self.unit.functions.append(inst)
+            fn = self.user_funcs[concrete]
+            name = concrete
         out: list[str] = []
         vi = 0
         for p in fn.params:
@@ -4921,6 +5160,16 @@ class _BodyTranslator:
                 raise TranslationError(f"call {name}: missing argument for param {p.name}")
             arg = args[vi]
             vi += 1
+            if p.kind == "tile_binding":
+                # tile travels via the hidden shr-slot pointer; verify the
+                # call-site tile matches the instantiation's concrete binding
+                tvar = self.tile_vars.get(arg.strip())
+                if tvar is None or tvar.slot != p.slot:
+                    raise TranslationError(
+                        f"call {name}: tile arg {arg!r} does not match the "
+                        f"instantiated binding (slot {p.slot})"
+                    )
+                continue
             if p.kind == "array":
                 spec = self._array_arg_spec(arg)
                 if spec is None:
@@ -4957,6 +5206,9 @@ class _BodyTranslator:
             for k, _elem in fn.shr_slots:
                 out.append(f"_wp_tile_shr_{k}")
             self.callee_needs_lane = True
+            # the forwarded _wp_live argument needs the kernel-preamble
+            # definition (callees run tile reduces this body never sees)
+            self.callee_needs_live = True
             for slot_k, slot_elem in fn.shr_slots:
                 if all(slot_k != k for k, _e, _c in self.used_shr):
                     self.used_shr.append((slot_k, slot_elem, "+"))
@@ -5140,14 +5392,20 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
             visit(callee)
         fn = _translate_function(f, unit, user_funcs, _codegen)
         user_funcs[fname] = fn
-        unit.functions.append(fn)
+        if not getattr(fn, "is_template", False):
+            unit.functions.append(fn)
 
     for uf in adj.called_user_functions:
         visit(uf)
 
     # ---- kernel body ----
     src = _codegen.codegen_func_forward(adj, func_type="kernel", device="cpu")
-    tr = _BodyTranslator(unit, array_args, user_funcs)
+    tr = _BodyTranslator(unit, array_args, user_funcs, codegen=_codegen)
+    # kernel scalar args ride the constant Params buffer — identical for
+    # every block: seed the provable-uniformity set with their SSA names
+    for a in unit.args:
+        if a.kind == "scalar":
+            tr.uniform_vars.update({f"var_{a.name}", a.name})
     body: list[str] = []
     section = None
     for line in src.splitlines():
@@ -5166,6 +5424,10 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
     bindings = [f"{a.msl} var_{a.name} = _wp_args.{a.name};" for a in unit.args if a.kind in ("scalar", "struct")]
     if tr.used_mesh:
         unit.needs_mesh = True
+    if tr.callee_needs_live:
+        # a callee forwards _wp_live into the kernel body's call text: the
+        # preamble must define it (kernel_src checks this exact flag)
+        unit.callee_needs_live = True
     unit.kernel.lines = bindings + tr.hoisted + body
     return unit
 
@@ -5204,8 +5466,24 @@ def _translate_native_function(f, snippet: str, unit: KernelUnit, _codegen) -> M
     return fn
 
 
-def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLFunction:
-    """Translate one built ``@wp.func`` (callee-first order guaranteed)."""
+def _translate_function(
+    f,
+    unit: KernelUnit,
+    user_funcs: dict,
+    _codegen,
+    tile_bindings: dict[str, tuple[int, str, list[int]]] | None = None,
+    inst_name: str | None = None,
+) -> MSLFunction:
+    """Translate one built ``@wp.func`` (callee-first order guaranteed).
+
+    Tile-typed params arrive from warp's C++ as ``template<typename tile_x>``:
+    with ``tile_bindings=None`` the translation stops at a template STUB
+    (params kept SSA-aligned, no body); ``_call_user`` instantiates it
+    per concrete caller-side tile (clone-per-site monomorphization, the
+    ensure_mat_def pattern one form wider) by re-entering with
+    ``tile_bindings={template type name: (slot, elem, dims)}`` and
+    ``inst_name=fn__shr<slot>``.
+    """
     from ..frontend.codegen import Var as _Var
 
     fname = f.native_func
@@ -5230,6 +5508,15 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
             body_start = i + 1
             break
     header = " ".join(hdr)
+    # template<typename A, typename B> prefix precedes `static ...` — strip
+    # the whole clause (a plain `header[len("static "):]` chop would cut
+    # seven letters off "template" and leave garbage in ret_cpp)
+    template_names: list[str] = []
+    if header.startswith("template<"):
+        tclose = header.index(">")
+        inner = header[len("template<") : tclose]
+        template_names = [p.strip().split()[-1] for p in split_args(inner) if p.strip()]
+        header = header[tclose + 1 :].lstrip()
     header = header[len("static ") :]
     open_idx = header.index("(")
     close_idx = header.rindex(")")
@@ -5243,12 +5530,20 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
         else:
             ret_msl = msl_type(ret_cpp)
 
-    fn = MSLFunction(fn_name, ret_msl)
+    fn = MSLFunction(inst_name or fn_name, ret_msl)
     array_args: dict[str, ArgSpec] = {}
 
     for arg_src in split_args(header[open_idx + 1 : close_idx]):
         if "&" in arg_src:
             ctype, pname = arg_src.split("&")
+            if ctype.strip() in template_names:
+                # tile-typed param (warp's template<typename tile_x> form):
+                # kept SSA-aligned as a tile_binding param — nothing emitted
+                # in the signature, the tile travels through the caller's
+                # `_wp_tile_shr_{slot}` hidden param. On the stub, ``msl``
+                # carries the template type name (the binding key).
+                fn.params.append(Param("tile_binding", ctype.strip(), pname.strip()))
+                continue
             if _RE_TUPLE_T.match(ctype.strip()):
                 ensure_tuple_def(unit, [msl_type(e.strip()) for e in split_args(_RE_TUPLE_T.match(ctype.strip()).group(1))])
             fn.params.append(Param("ref", msl_type(ctype), pname.strip()))
@@ -5279,7 +5574,47 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
         else:
             fn.params.append(Param("value", msl_type(ctype), pname))
 
-    tr = _BodyTranslator(unit, array_args, user_funcs, scope="func")
+    # template stub: tile-typed params present, no concrete bindings yet —
+    # defer body translation to the first call site (clone-per-site)
+    if tile_bindings is None and any(p.kind == "tile_binding" for p in fn.params):
+        fn.is_template = True
+        fn.template_params = [p.msl for p in fn.params if p.kind == "tile_binding"]
+        fn.template_func = f
+        return fn
+
+    bound_tiles: list[tuple[Param, int, str, list[int]]] = []
+    if tile_bindings:
+        for p in fn.params:
+            if p.kind != "tile_binding":
+                continue
+            if p.msl not in tile_bindings:
+                raise TranslationError(
+                    f"function {fname}: no concrete binding for template param {p.msl!r}"
+                )
+            slot, elem, dims = tile_bindings[p.msl]
+            p.slot = slot
+            p.msl = elem
+            bound_tiles.append((p, slot, elem, dims))
+
+    tr = _BodyTranslator(unit, array_args, user_funcs, scope="func", codegen=_codegen)
+    # by-value scalar params are block-identical (C++ value semantics): their
+    # names seed the provable-uniformity set (mjw blocked cholesky's
+    # `end == matrix_size` guards)
+    for p in fn.params:
+        if p.kind == "value":
+            bare = p.name.removeprefix("var_")
+            tr.uniform_vars.update({p.name, bare, f"var_{bare}"})
+    # bind the template tile params into the body scope: the tile ops inside
+    # (tile_view / tile_map / tile_reduce over the param) read the caller's
+    # threadgroup array through the hidden shr-slot param
+    for p, slot, elem, dims in bound_tiles:
+        size = 1
+        for d in dims:
+            size *= d
+        tvar = TileVar("shr", elem, slot=slot, size=size, dims=list(dims))
+        for key in (p.name, p.name.removeprefix("var_"), f"var_{p.name.removeprefix('var_')}"):
+            tr.tile_vars[key] = tvar
+        tr.used_shr.append((slot, elem, "+"))
     section = None
     depth = 0  # emitted-brace depth; 0 → the C++ function's closing brace
     for line in lines[body_start:]:
