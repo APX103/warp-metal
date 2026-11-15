@@ -140,6 +140,16 @@ def ensure_mat_def(unit: KernelUnit, msl_t: str) -> None:
     lines.append(
         f"static inline {elem} wp_extract({msl_t} m, int i, int j) {{ return m.c[i][j]; }}"
     )
+    # column extract (warp extract(m, slice, j) -> vec of M comps, the
+    # codegen's `m[:, j]` lowering via wp_matcol). Mats whose row count has
+    # no vector form (the 6x2 int flex tables, the 20x3 icosahedron) get no
+    # overload — a column extract on them fails loud at the call.
+    colvec = (_VEC_SIZES if elem == "float" else _VECI_SIZES).get(M)
+    if colvec is not None:
+        colcomps = ", ".join(f"m.c[{i}][j]" for i in range(M))
+        lines.append(
+            f"static inline {colvec} wp_matcol({msl_t} m, int j) {{ return make_{colvec}({colcomps}); }}"
+        )
     # row assign (warp assign_inplace(m, i, vec)); wp_extract covers every
     # row type (vec2f-5f, spatial_vectorf) and any width N (mat6x6 rows)
     assign_body = "; ".join(f"m.c[i][{j}] = wp_extract(v, {j})" for j in range(N))
@@ -295,6 +305,13 @@ def ensure_vec_def(unit: KernelUnit, msl_t: str) -> None:
     lines.append(
         f"static inline {elem} wp_extract({msl_t} v, int i) {{ if (i < 0) i += {n}; return v.c[i]; }}"
     )
+    if elem == "float":
+        # dot (vec.h operator*(vec,vec) reduction — the closure's live use is
+        # the mjw octree SDF weight dot `wp.dot(weights[0], oct_coeff[node])`
+        # over vec_t<8>; other componentwise arithmetic stays ungenerated,
+        # failing loud at Metal compile instead of silently mistranslating)
+        dot_body = " + ".join(f"a.c[{i}] * b.c[{i}]" for i in range(n))
+        lines.append(f"static inline float wp_dot({msl_t} a, {msl_t} b) {{ return {dot_body}; }}")
     # register-vector element store (wp::store(v, i, x))
     lines.append(
         f"static inline {msl_t} wp_vec_insert({msl_t} v, int i, {elem} x) {{ "
@@ -359,11 +376,49 @@ def ensure_vec_def(unit: KernelUnit, msl_t: str) -> None:
     unit.structs[msl_t] = "\n".join(lines)
 
 
+_RE_TUPLE_T = re.compile(r"^wp::tuple_t<(.+)>$")
+
+
+def ensure_tuple_def(unit: "KernelUnit", elems: list[str]) -> str:
+    """Emit the struct def + tuple ctor for a ``wp::tuple_t<T0, T1, ...>``
+    value tuple (upstream tuple.h tuple_t) and return its MSL struct name.
+
+    ``elems`` are the MSL element type names in order. The closure's only
+    value tuples are mjw collision_sdf's ``Tuple[vec8, vec8, vec8]`` octree
+    weight triples, passed by reference through the multi-return ref-param
+    lowering; member reads lower inline as ``.v{i}`` (see the wp::extract
+    tuple intercept). Shape tuples (all-int ``wp::tuple(x)`` temps) never
+    reach here — they stay metadata-only aliases.
+    """
+    name = "wp_tuple_" + "_".join(elems)
+    if name in unit.structs:
+        return name
+    for e in elems:
+        if e.startswith("wp_tuple_"):
+            continue  # nested tuple: its def was ensured when it was built
+        if _RE_GEN_VEC.match(e):
+            ensure_vec_def(unit, e)
+        elif _RE_GEN_MAT.match(e):
+            ensure_mat_def(unit, e)
+    lines = [f"struct {name} {{ " + " ".join(f"{e} v{i};" for i, e in enumerate(elems)) + " };"]
+    ctor_args = ", ".join(f"{e} a{i}" for i, e in enumerate(elems))
+    lines.append(f"static inline {name} make_{name}({ctor_args}) {{")
+    lines.append(f"    {name} t;")
+    for i in range(len(elems)):
+        lines.append(f"    t.v{i} = a{i};")
+    lines.append("    return t;")
+    lines.append("}")
+    unit.structs[name] = "\n".join(lines)
+    return name
+
+
 def msl_type(ctype: str) -> str:
     """Map a warp-native C++ type string from the SSA text to an MSL type."""
     ctype = ctype.strip()
     if ctype in _SCALAR_CTYPES:
         return _SCALAR_CTYPES[ctype]
+    if m := _RE_TUPLE_T.match(ctype):
+        return "wp_tuple_" + "_".join(msl_type(e.strip()) for e in split_args(m.group(1)))
     if m := _RE_VEC_T.match(ctype):
         n = int(m.group(1))
         sizes = _VEC_SIZES if m.group(2) == "float32" else _VECI_SIZES
@@ -1358,6 +1413,10 @@ class _BodyTranslator:
         # struct-comparison routing (`a == b` on struct values must rewrite
         # to wp_equal; MSL structs carry no operator==)
         self.var_types: dict[str, str] = {}
+        # wp::slice_t values (warp codegen's `m[begin:end, j]` lowering):
+        # name -> (begin, end, step) — pure metadata; the only consumer is
+        # the sliced wp::extract (the rangefinder depth term's mat33[:, 2])
+        self._slices: dict[str, tuple[int, int, int]] = {}
         # threadgroup slots this body uses, [(k, elem msl, combine)] — the
         # kernel preamble / function preamble declare each slot's shared
         # array in its own function scope
@@ -1776,9 +1835,11 @@ class _BodyTranslator:
                 raise TranslationError(f"tile_reduce with {len(parts)} args (axis form is outside the closure)")
             op, src = parts[0].strip(), parts[1].strip()
             op_msl = _CALL_TABLE.get(op[4:] if op.startswith("wp::") else op)
-            if op_msl not in ("wp_min", "wp_max", "wp_bit_or"):
-                raise TranslationError(f"tile_reduce operator {op!r} is outside the closure (min/max/bit_or only)")
-            combine = {"wp_min": "wp_min", "wp_max": "wp_max", "wp_bit_or": "|"}[op_msl]
+            if op_msl not in ("wp_min", "wp_max", "wp_bit_or", "wp_add"):
+                raise TranslationError(
+                    f"tile_reduce operator {op!r} is outside the closure (add/min/max/bit_or only)"
+                )
+            combine = {"wp_min": "wp_min", "wp_max": "wp_max", "wp_bit_or": "|", "wp_add": "+"}[op_msl]
         tvar = self._tvar(src, "tile_reduce")
         elem = tvar.elem
         if arg_op and elem not in _SCALAR_IDENT:
@@ -4033,6 +4094,33 @@ class _BodyTranslator:
         # generic calls carry a template suffix (`wp::matrix_from_cols<wp::float32>`);
         # strip it for the plain-call table (cast/ctor tables keep the full key)
         base = key[4:].split("<", 1)[0]
+        m_ext = re.match(r"^wp::extract<(\d+)>$", key)
+        if m_ext and len(args) == 1 and self.var_types.get(args[0].strip(), "").startswith("wp_tuple_"):
+            # `wp::extract<i>(tuple)` — tuple.h member read, lowered inline
+            return f"({self.expr(args[0])}).v{m_ext.group(1)}"
+        if base == "extract" and len(args) == 3 and args[1].strip() in self._slices:
+            # `wp::extract<N>(m, slice, j)` — the `m[:, j]` column form
+            # (rangefinder depth: cam_xmat[:, 2]); upstream vec.h mat_t
+            # slice indexing. Only a full-range slice is in the closure:
+            # (0, -1, 1) or (0, rows, 1) with the matrix's own row count
+            # (the codegen spells `m[0:3, 2]` on a mat33 with the literal).
+            b, e, s = self._slices[args[1].strip()]
+            rows = None
+            m_src = self.var_types.get(args[0].strip(), "")
+            m_rows = re.match(r"^mat(\d+)x(\d+)f$", m_src)
+            if m_rows:
+                rows = int(m_rows.group(1))
+            else:
+                m_sq = re.match(r"^mat(\d+)f$", m_src)
+                if m_sq:
+                    # square mats spell one digit per dim (mat33f = 3x3)
+                    rows = int(m_sq.group(1)[0])
+            if not (b == 0 and s == 1 and (e == -1 or (rows is not None and e == rows))):
+                raise TranslationError(
+                    f"wp::extract over slice ({b}, {e}, {s}): only the full-range "
+                    "[:, j] slice is in the closure"
+                )
+            return f"wp_matcol({self.expr(args[0])}, {self.expr(args[2])})"
         if base.startswith("tile_"):
             # tile-family calls (tile_mesh_query_aabb stub family etc.) ride
             # launch_tiled (block, lane) semantics like every tile construct
@@ -4174,6 +4262,15 @@ class _BodyTranslator:
         # "type" on multi-output ref-assign lines (T & ret_0 params)
         if m := re.match(r"^\s*(\w+(?:\.\w+)*)\s*=\s*(.+?);\s*$", line):
             target, rhs = m.group(1), m.group(2)
+            if rhs.startswith("wp::slice_t("):
+                # `var = wp::slice_t(begin, end, step);` — record for the
+                # sliced wp::extract; emits nothing (pure metadata)
+                aargs = split_args(rhs[len("wp::slice_t(") : -1])
+                vals = tuple(self._const_eval(a) for a in aargs)
+                if len(vals) != 3 or any(v is None for v in vals):
+                    raise TranslationError(f"wp::slice_t with non-constant bounds {rhs!r}")
+                self._slices[target] = vals
+                return []
             if rhs.startswith("wp::address(") or rhs.startswith("&("):
                 self._alias(target, rhs)
                 return []  # alias collapsed: no MSL line, no decl (pointer decl was dropped)
@@ -4331,7 +4428,20 @@ class _BodyTranslator:
             if rhs.startswith("wp::tuple("):
                 # `t = wp::tuple(x);` shape-tuple temp: a value alias (only
                 # fixedarray/array_t ctors consume these, which read the
-                # template + shape scalars, not the tuple itself)
+                # template + shape scalars, not the tuple itself). Multi-arg
+                # ctors are VALUE tuples (tuple.h tuple_t — the mjw octree
+                # weight triples): a real struct with a make_ ctor
+                targs = split_args(rhs[len("wp::tuple(") : -1])
+                if len(targs) > 1:
+                    elems = []
+                    for a in targs:
+                        e = self.var_types.get(a.strip())
+                        if e is None:
+                            raise TranslationError(f"wp::tuple member {a.strip()!r} has no tracked type")
+                        elems.append(e)
+                    tname = ensure_tuple_def(self.unit, elems)
+                    self.var_types[target] = tname
+                    return [f"{target} = make_{tname}({', '.join(self.expr(a) for a in targs)});"]
                 inner = rhs[len("wp::tuple(") : -1].strip()
                 self.aliases[target] = (False, self.expr(inner))
                 return []
@@ -4502,9 +4612,16 @@ class _BodyTranslator:
                 # registers the (arena data, meta) pair — drop the decl
                 return []
             if ctype.strip().startswith("wp::tuple_t<"):
-                # shape-tuple temp decl: `t = wp::tuple(x);` registers the
-                # value alias — drop the decl
-                return []
+                inner_elems = split_args(ctype.strip()[len("wp::tuple_t<") : -1])
+                if all(e.strip() in ("wp::int32", "wp::int64", "wp::uint32") for e in inner_elems):
+                    # shape-tuple temp decl: `t = wp::tuple(x);` registers the
+                    # value alias — drop the decl
+                    return []
+                # value tuple (tuple.h tuple_t): a declared struct local
+                # (mjw find_oct's vec8 weight triples)
+                tname = ensure_tuple_def(self.unit, [msl_type(e.strip()) for e in inner_elems])
+                self.var_types[name] = tname
+                return [f"{tname} {name};"]
             if ctype.strip() == "wp::Any":
                 # wp.static temps: type-erased in the SSA; declared as
                 # `const auto` at the first (only) assignment instead
@@ -4512,6 +4629,10 @@ class _BodyTranslator:
                 return []
             if ctype.strip() == "wp::str":
                 # string-literal temps feed only wp.print, which is elided
+                return []
+            if ctype.strip() == "wp::slice_t":
+                # bare slice decl: the bounds arrive with the
+                # wp::slice_t(begin, end, step) assignment — pure metadata
                 return []
             if not ctype:
                 raise TranslationError(f"EMPTY TYPE on line {line!r}")
@@ -5115,7 +5236,12 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
     ret_and_name = header[:open_idx].strip()
     ret_cpp, fn_name = ret_and_name.rsplit(None, 1)
     assert fn_name == fname, f"function name mismatch: {fn_name} vs {fname}"
-    ret_msl = None if ret_cpp == "void" else msl_type(ret_cpp)
+    ret_msl = None
+    if ret_cpp != "void":
+        if _RE_TUPLE_T.match(ret_cpp):
+            ret_msl = ensure_tuple_def(unit, [msl_type(e.strip()) for e in split_args(_RE_TUPLE_T.match(ret_cpp).group(1))])
+        else:
+            ret_msl = msl_type(ret_cpp)
 
     fn = MSLFunction(fn_name, ret_msl)
     array_args: dict[str, ArgSpec] = {}
@@ -5123,6 +5249,8 @@ def _translate_function(f, unit: KernelUnit, user_funcs: dict, _codegen) -> MSLF
     for arg_src in split_args(header[open_idx + 1 : close_idx]):
         if "&" in arg_src:
             ctype, pname = arg_src.split("&")
+            if _RE_TUPLE_T.match(ctype.strip()):
+                ensure_tuple_def(unit, [msl_type(e.strip()) for e in split_args(_RE_TUPLE_T.match(ctype.strip()).group(1))])
             fn.params.append(Param("ref", msl_type(ctype), pname.strip()))
             continue
         ctype, pname = arg_src.rsplit(None, 1)

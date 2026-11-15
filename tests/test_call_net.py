@@ -244,6 +244,44 @@ def k_tile_map_ternary(
     wp.tile_store(out, c)
 
 
+@wp.kernel
+def k_tile_reduce_add(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    # mjw solver PCG shapes (_pcg_init_tiled et al): tile_reduce(wp.add, t) —
+    # the add-operator fold over a shared tile (identity 0, "+" combine)
+    t = wp.tile_load(x, shape=(4,), storage="shared")
+    s = wp.tile_reduce(wp.add, t)
+    wp.tile_store(out, s)
+
+
+@wp.kernel
+def k_matcol_slice(x: wp.array2d(dtype=wp.mat33), out: wp.array(dtype=wp.float32)):
+    # mjw sensor rangefinder depth: the `m[:, 2]` column slice lowering
+    # (wp::slice_t metadata + wp::extract<3> -> wp_matcol)
+    i = wp.tid()
+    m = x[i, 0]
+    col = m[:, 2]
+    out[0] = wp.dot(col, col)
+
+
+from typing import Tuple
+
+
+@wp.func
+def _sdf_pair(a: wp.array(dtype=wp.float32), n: int) -> Tuple[int, Tuple[float, float]]:
+    # mjw collision_sdf.find_oct shape: a wp.func returning
+    # Tuple[int, Tuple[...]] — the ref-param lowering carries an opaque
+    # value-tuple struct through the call chain; members read via template
+    # extract (tuple.h tuple_t .v{i})
+    return n, (a[0], a[1])
+
+
+@wp.kernel
+def k_tuple_return(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    n, pair = _sdf_pair(x, 2)
+    # tuple members read through subscript (the SSA's wp::extract<i>)
+    out[0] = pair[0] + pair[1] + float(n)
+
+
 # ---- checker self-tests ----
 
 
@@ -678,6 +716,59 @@ class TestTileMapTernary(unittest.TestCase):
             unit = translate_kernel(k_tile_map_ternary, options=None if bd is None else {"block_dim": bd})
             findings = _checker.check_unit(unit)
             self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+
+class TestTileReduceAdd(unittest.TestCase):
+    """tile_reduce(wp.add, t) — the add-operator fold (identity 0, "+"
+    combine) over the barriered threadgroup tree; the mjw solver PCG
+    kernels (_pcg_init_tiled, _solve_*_cg_tiled, _energy_vel_kinetic) all
+    ride it."""
+
+    def test_tiled_emission(self):
+        unit = translate_kernel(k_tile_reduce_add, options={"block_dim": 4})
+        self.assertEqual(len(unit.tile_reduces), 1)
+        elem, combine = unit.tile_reduces[0]
+        self.assertEqual((elem, combine), ("float", "+"))
+        joined = "\n".join(unit.kernel.lines)
+        self.assertRegex(joined, r"float _wp_ident_\d+ = \{\};")
+
+    def test_checker_clean(self):
+        for bd in (4, None):
+            unit = translate_kernel(k_tile_reduce_add, options=None if bd is None else {"block_dim": bd})
+            findings = _checker.check_unit(unit)
+            self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+
+class TestSliceAndTuple(unittest.TestCase):
+    """The slice-column and value-tuple typing surfaces: wp::slice_t is pure
+    metadata resolving through wp_matcol (the rangefinder depth term's
+    ``m[:, 2]``); a wp.func returning Tuple[...] carries an opaque
+    wp_tuple_* struct through the ref-param chain with ``.v{i}`` member
+    reads (mjw collision_sdf.find_oct)."""
+
+    def test_matcol_emission(self):
+        unit = translate_kernel(k_matcol_slice, options={"block_dim": 4})
+        cols = [l for l in unit.kernel.lines if "wp_matcol" in l]
+        self.assertEqual(len(cols), 1)
+        self.assertIn("wp_matcol(", cols[0])
+        # the slice decl/construction lines emit nothing
+        self.assertFalse(any("slice_t" in l for l in unit.kernel.lines))
+
+    def test_matcol_checker_clean(self):
+        unit = translate_kernel(k_matcol_slice, options={"block_dim": 4})
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+    def test_tuple_return(self):
+        unit = translate_kernel(k_tuple_return)
+        self.assertIn("wp_tuple_float_float", unit.structs)
+        joined = "\n".join(
+            ["\n".join(unit.kernel.lines)] + ["\n".join(f.lines) for f in unit.functions]
+        )
+        self.assertIn("make_wp_tuple_float_float(", joined)
+        self.assertTrue(re.search(r"\)\.v\d", joined))
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
 
 
 class TestClosureVecOverloads(unittest.TestCase):

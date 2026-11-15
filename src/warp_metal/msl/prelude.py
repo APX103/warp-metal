@@ -312,6 +312,12 @@ static inline vec4f wp_extract(mat44f m, int r) { return make_vec4f(m.c[r][0], m
 static inline float wp_extract(mat22f m, int r, int c) { return m.c[r][c]; }
 static inline float wp_extract(mat33f m, int r, int c) { return m.c[r][c]; }
 static inline float wp_extract(mat44f m, int r, int c) { return m.c[r][c]; }
+// columns of matrices (mat.h extract(mat, slice, col) — the codegen's
+// `m[:, j]` slice lowering resolves to wp_matcol; gen-mat sizes get their
+// own overload from ensure_mat_def)
+static inline vec2f wp_matcol(mat22f m, int j) { return make_vec2f(m.c[0][j], m.c[1][j]); }
+static inline vec3f wp_matcol(mat33f m, int j) { return make_vec3f(m.c[0][j], m.c[1][j], m.c[2][j]); }
+static inline vec4f wp_matcol(mat44f m, int j) { return make_vec4f(m.c[0][j], m.c[1][j], m.c[2][j], m.c[3][j]); }
 // trace (mat.h wp::trace: sum of the diagonal; gen-mat sizes get their own
 // overload from ensure_mat_def)
 static inline float wp_trace(mat22f m) { return m.c[0][0] + m.c[1][1]; }
