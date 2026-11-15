@@ -316,6 +316,35 @@ def ensure_vec_def(unit: KernelUnit, msl_t: str) -> None:
         f"static inline thread {elem}& wp_vec_ref(thread {msl_t}& v, int i) {{ "
         f"if (i < 0) i += {n}; return v.c[i]; }}"
     )
+    # atomic add, 2-D arrays (upstream vec.h:1831-1839 lowers wp.atomic_add on
+    # vector dtypes per component through the scalar cores, returning the old
+    # vector; mjw crb accumulates vec10 mass matrices on array2d). Only the
+    # add family has a live closure: other ops / arities fail loud as
+    # implicit declarations at Metal compile, exactly like the arithmetic
+    # above — extend here when a kernel exercises them.
+    if elem == "float":
+        lines.append(
+            f"static inline void wp_atomic_add_at(device {msl_t}* d, wp_arr_meta m, int i, int j, {msl_t} v) {{"
+        )
+        lines.append(
+            "    device atomic_float* c = (device atomic_float*)(("
+            "device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1]));"
+        )
+        for k in range(n):
+            lines.append(f"    wp_atomic_add(c + {k}, v.c[{k}]);")
+        lines.append("}")
+        lines.append(
+            f"static inline {msl_t} wp_atomic_add_ret_at(device {msl_t}* d, wp_arr_meta m, int i, int j, {msl_t} v) {{"
+        )
+        lines.append(
+            "    device atomic_float* c = (device atomic_float*)(("
+            "device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1]));"
+        )
+        lines.append(f"    {msl_t} old;")
+        for k in range(n):
+            lines.append(f"    old.c[{k}] = wp_atomic_add_ret(c + {k}, v.c[{k}]);")
+        lines.append("    return old;")
+        lines.append("}")
     unit.structs[msl_t] = "\n".join(lines)
 
 

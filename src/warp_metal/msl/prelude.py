@@ -192,6 +192,9 @@ static inline spatial_vectorf make_spatial_vectorf(vec3f w, vec3f v) { spatial_v
 static inline spatial_vectorf make_spatial_vectorf(float wx, float wy, float wz, float vx, float vy, float vz) {
     spatial_vectorf s; s.w.x = wx; s.w.y = wy; s.w.z = wz; s.v.x = vx; s.v.y = vy; s.v.z = vz; return s;
 }
+// scalar broadcast (vec.h vec_t(Type s): every length, spatial included;
+// mjw _implicit_free_body seeds spatial values from a scalar)
+static inline spatial_vectorf make_spatial_vectorf(float s) { return make_spatial_vectorf(s, s, s, s, s, s); }
 
 static inline vec2f make_vec2f(float x, float y) { vec2f v; v.x = x; v.y = y; return v; }
 static inline vec3f make_vec3f(float x, float y, float z) { vec3f v; v.x = x; v.y = y; v.z = z; return v; }
@@ -1304,9 +1307,34 @@ static inline vec3f wp_atomic_max_ret_at(device vec3f* d, wp_arr_meta m, int i, 
     old.z = wp_atomic_max_ret(c + 2, v.z);
     return old;
 }
+// vec3f component-wise add (upstream vec.h:1831-1839 lowers wp.atomic_add on
+// vector dtypes per component through the scalar cores, returning the old
+// vector; mjw _subtree_com_acc accumulates subtree COMs on array2d[vec3])
+static inline void wp_atomic_add_at(device vec3f* d, wp_arr_meta m, int i, int j, vec3f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1]));
+    wp_atomic_add(c + 0, v.x);
+    wp_atomic_add(c + 1, v.y);
+    wp_atomic_add(c + 2, v.z);
+}
+static inline vec3f wp_atomic_add_ret_at(device vec3f* d, wp_arr_meta m, int i, int j, vec3f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1]));
+    vec3f old;
+    old.x = wp_atomic_add_ret(c + 0, v.x);
+    old.y = wp_atomic_add_ret(c + 1, v.y);
+    old.z = wp_atomic_add_ret(c + 2, v.z);
+    return old;
+}
 // 2D _ret_at variants (array2d atomics, e.g. world extents reduction)
 static inline float wp_atomic_add_ret_at(device float* d, wp_arr_meta m, int i, int j, float v) {
     return wp_atomic_add_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+// float 2-D sub (mjw derivative _qderiv_tendon_damping scatters damping
+// derivatives on array2d[float])
+static inline void wp_atomic_sub_at(device float* d, wp_arr_meta m, int i, int j, float v) {
+    wp_atomic_sub((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
+}
+static inline float wp_atomic_sub_ret_at(device float* d, wp_arr_meta m, int i, int j, float v) {
+    return wp_atomic_sub_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
 }
 static inline float wp_atomic_min_ret_at(device float* d, wp_arr_meta m, int i, int j, float v) {
     return wp_atomic_min_ret((device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1])), v);
@@ -1372,6 +1400,78 @@ static inline spatial_vectorf wp_atomic_add_ret_at(device spatial_vectorf* d, wp
 }
 static inline spatial_vectorf wp_atomic_sub_ret_at(device spatial_vectorf* d, wp_arr_meta m, int i, spatial_vectorf v) {
     device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    spatial_vectorf r;
+    r.w.x = atomic_fetch_sub_explicit((device atomic_float*)(base + 0), v.w.x, memory_order_relaxed);
+    r.w.y = atomic_fetch_sub_explicit((device atomic_float*)(base + 1), v.w.y, memory_order_relaxed);
+    r.w.z = atomic_fetch_sub_explicit((device atomic_float*)(base + 2), v.w.z, memory_order_relaxed);
+    r.v.x = atomic_fetch_sub_explicit((device atomic_float*)(base + 3), v.v.x, memory_order_relaxed);
+    r.v.y = atomic_fetch_sub_explicit((device atomic_float*)(base + 4), v.v.y, memory_order_relaxed);
+    r.v.z = atomic_fetch_sub_explicit((device atomic_float*)(base + 5), v.v.z, memory_order_relaxed);
+    return r;
+}
+// 2D spatial add (mjw flex spring/damper body-force accumulation and
+// flexvert hessian row scatter on array2d[spatial_vector])
+static inline void wp_atomic_add_at(device spatial_vectorf* d, wp_arr_meta m, int i, int j, spatial_vectorf v) {
+    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1]));
+    atomic_fetch_add_explicit((device atomic_float*)(base + 0), v.w.x, memory_order_relaxed);
+    atomic_fetch_add_explicit((device atomic_float*)(base + 1), v.w.y, memory_order_relaxed);
+    atomic_fetch_add_explicit((device atomic_float*)(base + 2), v.w.z, memory_order_relaxed);
+    atomic_fetch_add_explicit((device atomic_float*)(base + 3), v.v.x, memory_order_relaxed);
+    atomic_fetch_add_explicit((device atomic_float*)(base + 4), v.v.y, memory_order_relaxed);
+    atomic_fetch_add_explicit((device atomic_float*)(base + 5), v.v.z, memory_order_relaxed);
+}
+static inline spatial_vectorf wp_atomic_add_ret_at(device spatial_vectorf* d, wp_arr_meta m, int i, int j, spatial_vectorf v) {
+    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1]));
+    spatial_vectorf r;
+    r.w.x = atomic_fetch_add_explicit((device atomic_float*)(base + 0), v.w.x, memory_order_relaxed);
+    r.w.y = atomic_fetch_add_explicit((device atomic_float*)(base + 1), v.w.y, memory_order_relaxed);
+    r.w.z = atomic_fetch_add_explicit((device atomic_float*)(base + 2), v.w.z, memory_order_relaxed);
+    r.v.x = atomic_fetch_add_explicit((device atomic_float*)(base + 3), v.v.x, memory_order_relaxed);
+    r.v.y = atomic_fetch_add_explicit((device atomic_float*)(base + 4), v.v.y, memory_order_relaxed);
+    r.v.z = atomic_fetch_add_explicit((device atomic_float*)(base + 5), v.v.z, memory_order_relaxed);
+    return r;
+}
+// 2D mat33f component-wise add (mjw _flex_hessian_elem scatters edge-edge
+// hessian blocks on array2d[mat33]; row-major .c[3][3] is 9 packed floats)
+static inline void wp_atomic_add_at(device mat33f* d, wp_arr_meta m, int i, int j, mat33f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1]));
+    for (int r = 0; r < 3; ++r)
+        for (int q = 0; q < 3; ++q)
+            wp_atomic_add(c + r * 3 + q, v.c[r][q]);
+}
+static inline mat33f wp_atomic_add_ret_at(device mat33f* d, wp_arr_meta m, int i, int j, mat33f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1]));
+    mat33f old;
+    for (int r = 0; r < 3; ++r)
+        for (int q = 0; q < 3; ++q)
+            old.c[r][q] = wp_atomic_add_ret(c + r * 3 + q, v.c[r][q]);
+    return old;
+}
+// spatial component index write (same index map as wp_extract: i<3 -> w,
+// else v; mjw flex kernels write spatial_vector[i] per component)
+static inline void wp_assign_inplace(thread spatial_vectorf& s, int i, float x) {
+    if (i < 0) i += 6;
+    if (i == 0) { s.w.x = x; } else if (i == 1) { s.w.y = x; } else if (i == 2) { s.w.z = x; }
+    else if (i == 3) { s.v.x = x; } else if (i == 4) { s.v.y = x; } else { s.v.z = x; }
+}
+static inline void wp_sub_inplace(thread spatial_vectorf& s, int i, float x) {
+    if (i < 0) i += 6;
+    if (i == 0) { s.w.x -= x; } else if (i == 1) { s.w.y -= x; } else if (i == 2) { s.w.z -= x; }
+    else if (i == 3) { s.v.x -= x; } else if (i == 4) { s.v.y -= x; } else { s.v.z -= x; }
+}
+// 2D spatial sub (mjw derivative _qderiv_tendon_damping scatters tendon
+// damping derivatives on array2d[spatial_vector])
+static inline void wp_atomic_sub_at(device spatial_vectorf* d, wp_arr_meta m, int i, int j, spatial_vectorf v) {
+    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1]));
+    atomic_fetch_sub_explicit((device atomic_float*)(base + 0), v.w.x, memory_order_relaxed);
+    atomic_fetch_sub_explicit((device atomic_float*)(base + 1), v.w.y, memory_order_relaxed);
+    atomic_fetch_sub_explicit((device atomic_float*)(base + 2), v.w.z, memory_order_relaxed);
+    atomic_fetch_sub_explicit((device atomic_float*)(base + 3), v.v.x, memory_order_relaxed);
+    atomic_fetch_sub_explicit((device atomic_float*)(base + 4), v.v.y, memory_order_relaxed);
+    atomic_fetch_sub_explicit((device atomic_float*)(base + 5), v.v.z, memory_order_relaxed);
+}
+static inline spatial_vectorf wp_atomic_sub_ret_at(device spatial_vectorf* d, wp_arr_meta m, int i, int j, spatial_vectorf v) {
+    device float* base = (device float*)((device char*)d + (size_t)(m.offset + i * m.strides[0] + j * m.strides[1]));
     spatial_vectorf r;
     r.w.x = atomic_fetch_sub_explicit((device atomic_float*)(base + 0), v.w.x, memory_order_relaxed);
     r.w.y = atomic_fetch_sub_explicit((device atomic_float*)(base + 1), v.w.y, memory_order_relaxed);
