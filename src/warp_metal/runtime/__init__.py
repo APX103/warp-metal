@@ -19,6 +19,7 @@ from .host import (
     full,
     launch,
     synchronize,
+    flush,
     device_name,
 )
 from .modules import Module  # noqa: F401  (placeholder hub, M1.2 replaces)
@@ -31,6 +32,7 @@ __all__ = [
     "full",
     "launch",
     "synchronize",
+    "flush",
     "device_name",
     "Module",
 ]

@@ -15,8 +15,51 @@ Built on the M0.4 prototype:
     launches inside a capture are recorded, not executed; ``capture_launch``
     replays the records in order, batching consecutive kernel records plus
     eligible copies / zero fills into one Metal command buffer per run
-    (kernels as compute sections, copies/zero-fills as blit sections)
+    (kernels as compute sections, copies/zero-fills as blit sections),
+    pre-marshaled once at ``capture_end`` (M2.6)
   - ``init``/``synchronize``/device module
+
+Eager dispatch model (M2.6): launches ENCODE into one persistent command
+buffer (one process-lifetime device + queue, native side) and execute at
+the next explicit flush — ``flush()``/``synchronize()``, and implicitly at
+every host-visible read of array data (``.numpy``/``.numpy_view()``/
+``__getitem__`` element reads/``to_numpy``/``copy``/``clone`` host paths),
+at every host write through an existing array (``__setitem__``/``assign``/
+host-path ``fill_``), and at the capture_begin/end/launch boundaries.
+``zero_``/``fill_`` and eligible array-to-array copies default to the
+round-1 ORDERED HOST PATH (flush — pending dispatches commit and complete
+first — then the host write; dispatches launched afterwards observe it).
+Round 2 encoded these ops as blit sections and round 2b as compute
+sections in the pending command buffer; both measured healthy at micro
+scale (tests/test_deferred_micro.py) but round 2 regressed the Newton
+conveyor ~35x and the 2b compute encoding is unproven at Newton scale
+(mechanism unknown — lead: flush cadence vs Newton collide() ``.numpy``
+reads turning a long pending pipeline into serialized full commit+wait
+cycles), so per KEP D2 the GPU encoding ships only behind the opt-in knob
+``WARP_METAL_EAGER_GPU_FILLS=1`` (read per call, like every other knob).
+With the knob set, ``zero_``/``fill_`` encode COMPUTE sections on the
+same compute encoder as the launches around them (upstream CUDA
+semantics: device-side memsets/memcpys on the stream, ordered with the
+launches around them) — no host write, no flush, no encoder transition.
+``fill_`` values whose element bytes are one replicable 8-bit pattern
+encode on the GPU (0 anywhere, -1 in int/uint, True in bool); anything
+else segments to the ordered host path (flush + write), the M2.5
+commit-2 rule for non-representable fills. Eligible copies (equal dtype,
+same device, no same-buffer overlap — the shared ``_blit_copy_payload``
+rule) encode as compute copies; ineligible copies keep the host path.
+Host reads of a GPU-filled/copied array go through the flush-on-read
+property (shared storage shows the GPU-written bytes only once the buffer
+completes).
+``WARP_METAL_SYNC_EAGER=1`` reverts to per-dispatch commit+wait with
+ordered host writes for ``zero_``/``fill_``/``copy`` regardless of the
+fill knob (its check comes first, so the two knobs compose), for triage.
+Held-view hazard (upstream-async equivalent): a numpy view grabbed BEFORE
+a launch — or before a knob-enabled GPU-encoded fill (``v =
+arr.numpy_view()``) — bypasses the flush-on-read property: it reads stale
+bytes until some later flush point, exactly like holding a host view
+across an async CUDA launch. (The default host-path fills flush before
+writing, so a view held across them sees the write — it aliases the same
+shared bytes.)
 
 Arrays live in unified memory regardless of the allocating device, so a
 ``"cpu"`` array is directly usable by Metal kernels — the foundation for
@@ -333,9 +376,26 @@ class WarpArray:
             flags=0,
         )
 
-    def numpy_view(self):
-        """Zero-copy host view: ``self.shape`` for scalars, ``self.shape +
-        (comps,)`` for vec/quat/mat (mirrors real warp's shaped numpy data)."""
+    @property
+    def numpy(self) -> np.ndarray:
+        """Zero-copy host view over the shared storage.
+
+        Every access flushes the pending eager dispatches first (M2.6
+        flush-on-read: a host read of shared storage is only exact once the
+        uncommitted command buffer has completed — upstream eager semantics
+        order host reads after launched kernels, and this is the same
+        contract under deferred commits). The flush is a no-op when nothing
+        is pending. Host writes through this view therefore also land after
+        pending kernels, never under them."""
+        _mm.flush()
+        return self._numpy
+
+    @numpy.setter
+    def numpy(self, view) -> None:
+        self._numpy = view
+
+    def numpy_view(self) -> np.ndarray:
+        """Zero-copy host view (flush-on-read, see ``numpy``)."""
         return self.numpy
 
     def _build_numpy_view(self):
@@ -419,26 +479,96 @@ class WarpArray:
         raise TypeError(f"unsupported array index {key!r}")
 
     def __setitem__(self, key, value):
+        # host write into an existing buffer: pending kernels must run first
+        # (the .numpy property flush covers this; explicit for clarity)
+        _mm.flush()
         if isinstance(key, (int, np.integer)) and len(self.shape) == 1:
-            self.numpy[key] = value
+            self._numpy[key] = value
             return
-        self.numpy_view()[key] = value
+        self._numpy[key] = value
 
     def zero_(self):
         """In-place zero fill (warp convention method).
 
-        Upstream this is a stream memset — captured by graph recording. The
-        host memset here is likewise recorded so replay re-runs it (SolverXPBD
-        re-zeros its atomic-accumulation deltas every iteration).
+        DEFAULT (round-1 semantics): an ordered host write — pending eager
+        dispatches flush first (commit + wait), the zeros land on shared
+        storage, and dispatches launched afterwards observe them (upstream
+        eager semantics: a host-side memset synchronized with the stream).
+        ``WARP_METAL_EAGER_GPU_FILLS=1`` instead encodes a tiny fill-kernel
+        COMPUTE section on the same compute encoder as the launches around
+        it (round 2b — no host write, no flush, no encoder transition; a
+        dependent launch observes the fill in stream order; SolverXPBD
+        re-zeros its atomic-accumulation deltas every iteration). Round 2
+        encoded this as a ``fillBuffer`` blit section, which regressed the
+        Newton conveyor ~35x; the 2b compute encoding measured healthy at
+        micro scale (tests/test_deferred_micro.py) but is unproven at
+        Newton scale, so the conveyor-safe round-1 host path stays the
+        default and the GPU encoding is opt-in (KEP D2: a known regression
+        never ships as the default). Host reads of a knob-filled array
+        flush first (flush-on-read: shared storage shows the GPU-written
+        bytes only once the buffer completes). Inside a capture the fill
+        is recorded for replay, plus the record-time host write documented
+        on ``ScopedCapture``; ``WARP_METAL_SYNC_EAGER=1`` keeps the flush +
+        ordered host write regardless of the knob.
         """
-        self.numpy[...] = 0
-        _record_fill(self, 0.0)
+        if _CAPTURE_RECORDS is not None:
+            _mm.flush()  # boundary safety: capture_begin already drained
+            self._numpy[...] = 0
+            _record_fill(self, 0.0)
+            return self
+        if _sync_eager() or not _eager_gpu_fills():
+            # round-1 default (and the SYNC_EAGER escape hatch): ordered
+            # host write — pending dispatches complete first, the write
+            # lands, later dispatches observe it (no-op flush in sync mode,
+            # where nothing ever pends)
+            _mm.flush()
+            self._numpy[...] = 0
+            return self
+        if self.n == 0:
+            return self  # upstream skips the memset for empty arrays
+        _mm.compute_fill(
+            self.buffer, self.offset_elems * self.item_bytes, self.n * self.item_bytes, 0
+        )
         return self
 
     def fill_(self, value):
-        """In-place constant fill (warp convention method; recorded like zero_)."""
-        self.numpy[...] = value
-        _record_fill(self, value)
+        """In-place constant fill (warp convention method; recorded like zero_).
+
+        DEFAULT (round-1 semantics): the ordered host path for every value —
+        pending dispatches flush first, the write lands, later dispatches
+        observe it. ``WARP_METAL_EAGER_GPU_FILLS=1`` encodes a GPU
+        compute-section fill (see ``zero_``) when the value's per-element
+        bytes are one replicable 8-bit pattern (``0`` in any dtype, ``-1``
+        in int/uint dtypes, ``True`` in bool — Newton's per-iteration fills
+        are dominated by exactly these), keeping everything else on the
+        ordered host path, the M2.5 commit-2 rule for non-representable
+        fills — SolverSteel's ``INT32_MAX`` status sentinels and arbitrary
+        float inits pay the flush cost only for those fills. Ordering and
+        host-visibility semantics are ``zero_``'s; ``WARP_METAL_SYNC_EAGER=1``
+        and capture keep the host write for every value."""
+        if _CAPTURE_RECORDS is not None:
+            _mm.flush()
+            self._numpy[...] = value
+            _record_fill(self, value)
+            return self
+        if _sync_eager() or not _eager_gpu_fills():
+            # round-1 default (and SYNC_EAGER): ordered host write, any value
+            _mm.flush()
+            self._numpy[...] = value
+            return self
+        if self.n == 0:
+            return self  # upstream fill_ converts nothing for empty arrays
+        byte = _exact_fill_byte(self, value)
+        if byte is not None:
+            _mm.compute_fill(
+                self.buffer, self.offset_elems * self.item_bytes, self.n * self.item_bytes, byte
+            )
+            return self
+        # not byte-replicable (INT32_MAX sentinels, -0.0, arbitrary scalars):
+        # segment to the ordered host path — pending dispatches complete
+        # first, the write lands, later dispatches observe it
+        _mm.flush()
+        self._numpy[...] = value
         return self
 
     def assign(self, value) -> None:
@@ -447,13 +577,15 @@ class WarpArray:
         Accepts another WarpArray or any host array-like; ``numpy.copyto``
         checks shape and casts dtype the same way upstream does. Storage is
         shared memory, so the write is immediately visible to in-flight and
-        captured dispatches.
-        """
+        captured dispatches. Pending dispatches flush first (host write must
+        not land under a kernel that has not executed yet)."""
         if isinstance(value, WarpArray):
             value = value.numpy
-        np.copyto(self.numpy, value)
+        _mm.flush()
+        np.copyto(self._numpy, value)
 
     def to_numpy(self):
+        """Host copy of the array data (flush-on-read; see ``numpy``)."""
         return self.numpy_view().copy()
 
     def release(self) -> None:
@@ -490,7 +622,7 @@ register_runtime_array_family(WarpArray, _wp_array)
 
 def zeros(shape, dtype=float32, device=None, requires_grad=False, pinned=False, retain_grad=False, **kwargs):
     arr = _allocate(shape, dtype, device, requires_grad, pinned, retain_grad)
-    arr.numpy.fill(0)
+    arr._numpy.fill(0)  # internal view: fresh buffer, no pending dispatch can reference it
     return arr
 
 
@@ -500,7 +632,7 @@ def empty(shape, dtype=float32, device=None, requires_grad=False, pinned=False, 
 
 def ones(shape, dtype=float32, device=None, requires_grad=False, pinned=False, retain_grad=False, **kwargs):
     arr = _allocate(shape, dtype, device, requires_grad, pinned, retain_grad)
-    arr.numpy.fill(1)
+    arr._numpy.fill(1)  # internal view: fresh buffer (see zeros)
     return arr
 
 
@@ -524,9 +656,9 @@ def full(shape, value, dtype=None, device=None, requires_grad=False, pinned=Fals
             row = np.full(comps, value, dtype=arr.np_dtype)
         if len(row) != comps:
             raise ValueError(f"full: {len(row)} components for a {comps}-component dtype")
-        arr.numpy_view()[...] = row
+        arr._numpy[...] = row  # internal view: fresh buffer (see zeros)
     else:
-        arr.numpy.fill(value)
+        arr._numpy.fill(value)
     return arr
 
 
@@ -561,8 +693,18 @@ def clone(src, device=None, requires_grad=False, pinned=False, retain_grad=False
         # upstream stream memcpy: recorded, executed at replay (the record
         # holds both arrays, so neither buffer dies under the graph)
         _CAPTURE_RECORDS.append(("copy", arr, src, 0, 0, None))
-    else:
-        arr.numpy[:] = src.numpy
+        return arr
+    payload = _blit_copy_payload(arr, src, 0, 0, src.n)
+    if payload is not None and src.n > 0 and not _sync_eager() and _eager_gpu_fills():
+        # GPU-encoded stream memcpy (opt-in knob; same eligibility as the
+        # replay path — equal dtype, same device, fresh dest never
+        # overlaps), encoded as a compute section (round 2b). The fresh
+        # destination's host view is stale until the usual flush-on-read —
+        # the upstream-async equivalent.
+        _mm.compute_copy(payload[1], payload[2], payload[3], payload[4], payload[5])
+        return arr
+    _mm.flush()  # host copy: read src after pending kernels, not under them
+    arr._numpy[:] = src.numpy  # dest is fresh (internal view); src read flushes
     return arr
 
 
@@ -574,6 +716,19 @@ def copy(dest, src, dest_offset=0, src_offset=0, count=None, stream=None):
     — dtype identity is not required (float32 ↔ float canonicalize to the
     same 4-byte element upstream; int32 ↔ float32 same-size copies are
     equally legal there).
+
+    DEFAULT (round-1 semantics): the ordered host copy — pending dispatches
+    flush first (the copy reads src's post-kernel state), the write lands,
+    later dispatches observe dest. ``WARP_METAL_EAGER_GPU_FILLS=1`` encodes
+    the copy as a GPU compute section (round 2b: a tiny copy-kernel dispatch
+    on the same compute encoder as the launches around it — the round-2
+    ``copyFromBuffer`` blit encoding regressed the Newton conveyor ~35x)
+    when it matches the replay path's copy eligibility (equal dtype — dense
+    row-major layouts are then byte-identical, composite dtypes included —
+    same device, no same-buffer overlap; the shared ``_blit_copy_payload``
+    rule), killing the host flush entirely and ordering the copy with the
+    launches around it. Ineligible copies keep the host path under the knob
+    too, as does ``WARP_METAL_SYNC_EAGER=1``.
     """
     if not isinstance(src, WarpArray) or not isinstance(dest, WarpArray):
         # upstream: "Copy source and destination must be arrays" (context.py:15197)
@@ -591,6 +746,20 @@ def copy(dest, src, dest_offset=0, src_offset=0, count=None, stream=None):
     if _CAPTURE_RECORDS is not None:
         _CAPTURE_RECORDS.append(("copy", dest, src, dest_offset, src_offset, n))
         return
+    if n == 0:
+        return  # zero-size copy: nothing to do, no flush either
+    if not _sync_eager() and _eager_gpu_fills():
+        payload = _blit_copy_payload(dest, src, dest_offset, src_offset, n)
+        if payload is not None:
+            # GPU-encoded stream memcpy as a compute section (round 2b,
+            # opt-in knob): in-stream ordered, no flush
+            _mm.compute_copy(payload[1], payload[2], payload[3], payload[4], payload[5])
+            return
+    # host fallback (the default, SYNC_EAGER, or a copy outside copy
+    # eligibility under the knob — cross-dtype same-size, overlapping
+    # ranges): flush so the copy reads src's post-kernel state and lands
+    # before any later dispatch observes dest
+    _mm.flush()
     dest.numpy[dest_offset : dest_offset + n] = src.numpy[src_offset : src_offset + n]
 
 
@@ -653,12 +822,24 @@ def from_numpy(arr, dtype=None, shape=None, device=None, requires_grad=False, re
             f"from_numpy shape mismatch: numpy has {flat.size} scalars, "
             f"target {out.shape} of {getattr(dtype, '__name__', dtype)} needs {total_scalars}"
         )
-    out.numpy[:total_scalars] = flat.reshape(out.numpy.shape)
+    out._numpy[:total_scalars] = flat.reshape(out._numpy.shape)  # fresh buffer (see zeros)
     return out
 
 
 def synchronize() -> None:
-    _mm.synchronize()
+    """Wait for outstanding eager dispatches (upstream ``wp.synchronize``).
+
+    Flushes the pending eager command buffer (commit + watchdog-bounded
+    wait); raises MetalError naming the pending-dispatch count on failure."""
+    _mm.flush()
+
+
+def flush() -> None:
+    """Commit the pending eager command buffer and wait (no-op when idle).
+
+    Same native wait as :func:`synchronize`; the explicit name for the
+    M2.6 deferred eager model. Also available as ``wp.flush``."""
+    _mm.flush()
 
 
 class array:
@@ -990,7 +1171,10 @@ def _mesh_assets_build(rec: dict) -> None:
 def _mesh_assets_refit(rec: dict) -> None:
     """mesh.cpp mesh_refit_host port: recompute the per-triangle bounds from
     the CURRENT points, then refit the tree over them (node buffers re-uploaded
-    in place; the embedded context is address-stable, no table rebuild)."""
+    in place; the embedded context is address-stable, no table rebuild).
+    Flushes first: the bounds/BVH host writes must not land under pending
+    eager dispatches that dereference the same buffers."""
+    _mm.flush()
     points, indices = rec["points"], rec["indices"]
     num_tris, num_points = rec["num_tris"], rec["num_points"]
     pts = points.numpy().reshape(-1, 3)[:num_points]
@@ -1583,7 +1767,10 @@ def launch_tiled(
     if stream is not None or record_cmd is not None or max_blocks is not None:
         # accepted-for-parity in launch(); there is no batching here at all,
         # so tiled variants fail loud instead of ignoring silently
-        raise RuntimeError("launch_tiled does not accept stream/record_cmd/max_blocks (synchronous dispatch)")
+        raise RuntimeError(
+            "launch_tiled does not accept stream/record_cmd/max_blocks "
+            "(deferred eager dispatch flushes at host-visible reads; stream batching is a Non-Goal)"
+        )
     if dim is None:
         raise TypeError("launch_tiled() missing required argument 'dim'")
 
@@ -1654,13 +1841,14 @@ def launch(
 
     ``adj_*``/``adjoint``/``record_tape`` fail loudly (adjoint is a KEP
     Non-Goal); ``stream``/``record_cmd``/``max_blocks`` are accepted for API
-    parity (dispatch is synchronous, batching is Phase 2). ``dim`` may be an
-    int or a tuple: total threads = prod(dim), exactly upstream. An explicit
-    ``block_dim`` on a plain launch selects per-thread tile semantics (every
-    tile op collapses to the thread's own element — the CPU-golden
-    convention); per-block shared tile semantics require ``launch_tiled``.
-    Scalar kernel params are passed interleaved in ``inputs``/``outputs`` in
-    declaration order, exactly like upstream warp.
+    parity (eager dispatches encode into the pending command pipeline and
+    flush at host-visible reads; stream batching is a Non-Goal). ``dim`` may
+    be an int or a tuple: total threads = prod(dim), exactly upstream. An
+    explicit ``block_dim`` on a plain launch selects per-thread tile
+    semantics (every tile op collapses to the thread's own element — the
+    CPU-golden convention); per-block shared tile semantics require
+    ``launch_tiled``. Scalar kernel params are passed interleaved in
+    ``inputs``/``outputs`` in declaration order, exactly like upstream warp.
     """
     if adj_inputs is not None or adj_outputs is not None or adjoint or record_tape:
         raise RuntimeError(
@@ -1742,7 +1930,10 @@ class Graph:
     records into one Metal command buffer (kernels as compute sections,
     eligible copies / zero fills as blit sections — one commit + watchdog
     wait per batch) and applying host records between batches in record
-    order.
+    order. The batch segments are PRE-MARSHALED into native
+    ``wmm_batch_record`` payloads once (at ``capture_end`` — the records are
+    immutable from there; M2.6), so every replay is one pre-marshaled native
+    call per batch.
     Recorded param/arg-buffer temporaries are owned (and released) by the
     graph, and each record holds strong references to the arrays it binds —
     their buffers stay alive for the graph's lifetime even if the launching
@@ -1754,6 +1945,50 @@ class Graph:
         self.n_ops = n_ops
         self._records: list = []
         self._owned: list[int] = []
+        # pre-marshaled replay segments: [("batch", BatchPayload, base_index)
+        # | ("host", record), ...] — built at capture_end (or lazily at the
+        # first replay); None = not built yet
+        self._segments: list | None = None
+        self._segments_len = -1
+
+    def _prebuild_replay(self) -> None:
+        """Pre-marshal the batched replay path (M2.6).
+
+        Walks the records once, classifying each as batch-eligible (compute
+        section, blit copy / zero fill — the same eligibility matrix as the
+        per-replay walk had) or a host-record batch splitter, and marshals
+        each eligible run into a native payload reused at every replay. The
+        WARP_METAL_BATCH=0 escape hatch bypasses these segments entirely
+        (it replays record-by-record through the synchronous entries).
+        """
+        segments: list = []
+        batch: list = []
+        batch_base = 0
+        records = self._records
+        for index, record in enumerate(records):
+            kind = record[0]
+            if kind == "metal":
+                _, pso, handles, threads, block_dim, _owned, _refs, tiled = record
+                batch.append(
+                    ("compute", pso, handles, threads,
+                     block_dim if tiled else 0, 1 if tiled else 0)
+                )
+                continue
+            blit = _blit_payload(record) if kind in ("copy", "fill") else None
+            if blit is not None:
+                batch.append(blit)
+                continue
+            if batch:
+                segments.append(("batch", _mm.make_batch_payload(batch), batch_base))
+                batch = []
+            if kind not in ("copy", "fill", "fallback"):
+                raise RuntimeError(f"capture_launch: unknown record kind {kind!r}")
+            segments.append(("host", record))
+            batch_base = index + 1
+        if batch:
+            segments.append(("batch", _mm.make_batch_payload(batch), batch_base))
+        self._segments = segments
+        self._segments_len = len(records)
 
     def __del__(self):
         try:
@@ -1776,8 +2011,9 @@ class ScopedTimer:
     positional — Newton passes ``False``) disables the timer entirely,
     ``print`` gates the exit print, ``dict`` receives per-name elapsed
     lists. Warp's profiler plumbing (CUDA events, NVTX, cProfile) is out
-    of scope; timing lands on this process's wall clock, which is exact
-    for the synchronous Metal dispatch model.
+    of scope; timing lands on this process's wall clock. Eager dispatches
+    flush at the timed section's host-visible reads, so a completed section
+    includes their execution.
     """
 
     enabled = True
@@ -1914,10 +2150,15 @@ def capture_begin(device=None, stream=None, force_module_load=False, external=No
     """Begin capture: launches are RECORDED, not executed (upstream graph
     semantics). The in-progress Graph is registered for the target device's
     implicit stream (observable through ``Device.captures``/``Device.is_capturing``);
-    replay batches consecutive eligible records into one command buffer."""
+    replay batches consecutive eligible records into one command buffer.
+    Pending eager dispatches flush at the boundary (upstream capture_begin
+    syncs the stream; here it guarantees capture-time host writes — e.g.
+    recorded fills' immediate host writes — never land under pre-capture
+    kernels)."""
     global _CAPTURE_DEPTH, _CAPTURE_RECORDS, _CAPTURE_GRAPH, _CAPTURE_DEVICE
     if external is not None or apic:
         raise RuntimeError("warp-metal does not support external/apic capture (CUDA-graph machinery)")
+    _mm.flush()
     with _CAPTURE_LOCK:
         if _CAPTURE_DEPTH == 0:
             dev = get_device(device)
@@ -1933,8 +2174,10 @@ def capture_begin(device=None, stream=None, force_module_load=False, external=No
 
 def capture_end(device=None, stream=None) -> Graph:
     """End capture; returns the recorded graph — the same Graph object the
-    device's ``captures`` view exposed while recording."""
+    device's ``captures`` view exposed while recording. The graph's replay
+    batches are pre-marshaled here (records are immutable from this point)."""
     global _CAPTURE_DEPTH, _CAPTURE_RECORDS, _CAPTURE_GRAPH, _CAPTURE_DEVICE
+    _mm.flush()  # boundary: nothing pending may straddle capture end
     with _CAPTURE_LOCK:
         _CAPTURE_DEPTH = max(0, _CAPTURE_DEPTH - 1)
         graph = _CAPTURE_GRAPH
@@ -1947,6 +2190,7 @@ def capture_end(device=None, stream=None) -> Graph:
         # empty-graph return (upstream raises here)
         return Graph(get_device(device).name if device is not None else None)
     graph.n_ops = len(records) if records else 0
+    graph._prebuild_replay()
     return graph
 
 
@@ -1957,60 +2201,135 @@ def _batching_enabled() -> bool:
     return os.environ.get("WARP_METAL_BATCH", "") != "0"
 
 
+def _sync_eager() -> bool:
+    """Python-side mirror of the native SYNC_EAGER check.
+
+    Read per call, exactly the way the native dispatch entries read the
+    environment, so eager host ops and the deferred GPU encodes can never
+    disagree about the active mode within one call sequence.
+    """
+    s = os.environ.get("WARP_METAL_SYNC_EAGER")
+    return bool(s) and s != "0"
+
+
+def _eager_gpu_fills() -> bool:
+    """The eager GPU-encode knob: ``WARP_METAL_EAGER_GPU_FILLS=1`` only.
+
+    Round 2b encoded eager ``zero_``/``fill_``/``copy``/``clone`` as
+    compute sections in the pending command buffer; it measures healthy at
+    micro scale (tests/test_deferred_micro.py) but is implicated in the
+    unexplained ~35x Newton conveyor regression (round-2 lead: flush
+    cadence vs collide()'s ``.numpy`` reads), so per KEP D2 the round-1
+    ordered host path is the DEFAULT and this knob opts into the GPU
+    encoding. Read per call, exactly like :func:`_sync_eager` (any other
+    value — unset included — keeps the host path), so in-process tests can
+    toggle it; SYNC_EAGER keeps precedence (checked first at every call
+    site), so setting both knobs means per-dispatch commit+wait with host
+    writes.
+    """
+    return os.environ.get("WARP_METAL_EAGER_GPU_FILLS") == "1"
+
+
+def _is_zero_value(value) -> bool:
+    """True when ``value`` is an exact zero for the fill eligibility checks.
+
+    ``-0.0`` is excluded: it compares equal to zero but its float bit
+    pattern is not all-zero bytes, so a blit fill would corrupt it.
+    """
+    if isinstance(value, (bool, np.bool_)):
+        return not value
+    if isinstance(value, (int, np.integer)):
+        return value == 0
+    if isinstance(value, (float, np.floating)):
+        return value == 0.0 and not np.signbit(value)
+    return False
+
+
+def _exact_fill_byte(arr, value) -> int | None:
+    """The single 8-bit pattern whose replication over one ``arr`` element
+    produces exactly ``value`` (Metal ``fillBuffer`` semantics), or None
+    when no exact pattern exists — the fill must then stay on a host path
+    (equal-to-zero values) or fail loud (everything else, eager mode).
+
+    Scalar values only: composite/list fills broadcast per component and
+    are not byte-replicable. Struct dtypes keep the M2.5 rule (only an
+    exact zero matches the default-constructed all-zero bytes).
+    """
+    np_t = np.dtype(arr.np_dtype)
+    if np_t.names:  # struct element: default construction is all-zero bytes
+        return 0 if _is_zero_value(value) else None
+    if hasattr(value, "__len__"):
+        return None
+    try:
+        raw = np.array(value, dtype=np_t).tobytes()
+    except (TypeError, ValueError, OverflowError, FloatingPointError):
+        return None
+    if not raw:
+        return None
+    first = raw[0]
+    return first if all(b == first for b in raw) else None
+
+
+def _blit_copy_payload(dest, src, dest_offset, src_offset, n):
+    """GPU-side blit payload for an array→array copy, or None when the copy
+    must stay on the host path (splitting a replay batch / keeping the
+    eager host copy). Shared by the eager ``wp.copy``/``clone`` GPU path
+    and the graph-replay records, so both sides enforce the same
+    eligibility matrix. Element offsets/sizes become buffer byte
+    offsets/sizes — ``offset_elems`` (sliced/row views share the base
+    buffer) folds in on both sides.
+
+    Eligibility (M2.5 commit-2 rule): same device (single-device runtime —
+    checked anyway), same dtype/element size (``wp.copy`` enforces equal
+    element sizes at record time, and runtime arrays are dense row-major,
+    so equal dtype means byte-identical element layout — composite dtypes
+    included — and the byte range copy is exact), and no overlapping
+    src/dst byte ranges within one buffer (blit aliasing is undefined —
+    those go back to the host numpy copy).
+    """
+    if dest.device != src.device:
+        return None
+    if dest.dtype != src.dtype or dest.item_bytes != src.item_bytes:
+        return None
+    if n < 0:
+        return None  # unreachable (wp.copy validates); host path anyway
+    src_off = (src.offset_elems + src_offset) * src.item_bytes
+    dst_off = (dest.offset_elems + dest_offset) * dest.item_bytes
+    nbytes = n * dest.item_bytes
+    if src.buffer == dest.buffer and (
+        src_off < dst_off + nbytes and dst_off < src_off + nbytes
+    ):
+        return None  # overlapping ranges in one buffer: host copy
+    return ("copy", src.buffer, dest.buffer, src_off, dst_off, nbytes)
+
+
 def _blit_payload(record):
     """GPU-side blit payload for a ``"copy"``/``"fill"`` graph record, or
     None when the record must stay on the host replay path (splitting the
-    batch). Element offsets/sizes become buffer byte offsets/sizes —
-    ``offset_elems`` (sliced/row views share the base buffer) folds in on
-    both sides.
+    batch).
 
     Eligibility (commit-2 brief; anything else segments to the host path,
     preserving the pre-batching behavior):
     - fill: value must be an exact zero (``fillBuffer`` takes an 8-bit
       pattern; a non-zero or ``-0.0`` float pattern is not representable —
       Newton's captured fills are zero re-zeroings). Zero-size ranges are
-      eligible but encode nothing.
-    - copy: same device (single-device runtime — checked anyway), same
-      dtype/element size (``wp.copy`` enforces equal dtypes at record time,
-      and runtime arrays are dense row-major, so equal dtype means
-      byte-identical element layout and the byte range copy is exact), and
-      no overlapping src/dst byte ranges within one buffer (blit aliasing
-      is undefined — those go back to the host numpy copy).
+      eligible but encode nothing. (The eager path additionally accepts
+      other byte-exact patterns through ``_exact_fill_byte`` — the replay
+      rule stays conservative.)
+    - copy: delegated to ``_blit_copy_payload`` (the shared eager/replay
+      eligibility).
     """
     kind = record[0]
     if kind == "fill":
         _, arr, value = record
-        if isinstance(value, (bool, np.bool_)):
-            zero = not value
-        elif isinstance(value, (int, np.integer)):
-            zero = value == 0
-        elif isinstance(value, (float, np.floating)):
-            # -0.0 compares equal to zero but its float bit pattern is not
-            # 0x00 — a blit fill would corrupt it; host path
-            zero = value == 0.0 and not np.signbit(value)
-        else:
-            zero = False
-        if not zero:
+        if not _is_zero_value(value):
             return None
         return ("fill", arr.buffer, arr.offset_elems * arr.item_bytes,
                 arr.n * arr.item_bytes, 0)
     if kind == "copy":
         _, dest, src, dest_offset, src_offset, count = record
-        if dest.device != src.device:
-            return None
-        if dest.dtype != src.dtype or dest.item_bytes != src.item_bytes:
-            return None
         n = src.n - src_offset if count is None else int(count)
-        if n < 0:
-            return None  # unreachable (wp.copy validates); host path anyway
-        src_off = (src.offset_elems + src_offset) * src.item_bytes
-        dst_off = (dest.offset_elems + dest_offset) * dest.item_bytes
-        nbytes = n * dest.item_bytes
-        if src.buffer == dest.buffer and (
-            src_off < dst_off + nbytes and dst_off < src_off + nbytes
-        ):
-            return None  # overlapping ranges in one buffer: host copy
-        return ("copy", src.buffer, dest.buffer, src_off, dst_off, nbytes)
+        return _blit_copy_payload(dest, src, dest_offset, src_offset, n)
     return None
 
 
@@ -2029,6 +2348,24 @@ def _replay_batch(batch, base_index: int, total: int) -> None:
         ) from None
 
 
+def _replay_host_record(record) -> None:
+    """Execute one host-path replay record (batch-ineligible copy/fill or a
+    CPU-fallback port) — the ops that split the native batches."""
+    kind = record[0]
+    if kind == "fill":
+        _, arr, value = record
+        arr.numpy[...] = value
+    elif kind == "copy":
+        _, dest, src, dest_offset, src_offset, count = record
+        n = src.n - src_offset if count is None else int(count)
+        dest.numpy[dest_offset : dest_offset + n] = src.numpy[src_offset : src_offset + n]
+    elif kind == "fallback":
+        _, kernel, dim, merged, fb = record
+        fb(kernel, dim, merged)
+    else:
+        raise RuntimeError(f"capture_launch: unknown record kind {kind!r}")
+
+
 def capture_launch(graph, stream=None):
     """Replay a captured graph: execute every recorded operation in order.
 
@@ -2040,54 +2377,40 @@ def capture_launch(graph, stream=None):
     non-zero fills / fallback ports are host operations that split the
     batch, applying their host side effects between batch waits so record
     order is preserved exactly).
+    The batches are pre-marshaled at ``capture_end`` (M2.6): replay loops
+    the ready-made native payload segments — no per-record Python marshaling
+    on the hot path.
+    Pending eager dispatches flush at the boundary first: the replay batch
+    runs on its own command queue, so draining the eager pipeline is what
+    preserves global order.
     ``WARP_METAL_BATCH=0`` replays record-by-record (one commit+wait per
-    dispatch, the pre-batching path) for fault triage.
+    dispatch through the synchronous entries, the pre-M2.6 path) for fault
+    triage; it bypasses the pre-marshaled segments entirely.
     """
     if isinstance(graph, Graph):
+        _mm.flush()
         records = getattr(graph, "_records", [])
-        batch: list = []
-        batch_base = 0
-        for index, record in enumerate(records):
+        total = len(records)
+        if _batching_enabled():
+            if graph._segments is None or graph._segments_len != total:
+                graph._prebuild_replay()  # lazy path: graphs made before capture_end wiring
+            for entry in graph._segments:
+                if entry[0] == "batch":
+                    _replay_batch(entry[1], entry[2], total)
+                else:
+                    _replay_host_record(entry[1])
+            return
+        # escape hatch: the pre-batching path, one commit+wait per record
+        for record in records:
             kind = record[0]
-            if _batching_enabled():
-                if kind == "metal":
-                    _, pso, handles, threads, block_dim, _owned, _refs, tiled = record
-                    # compute record: (pso, handles, threads, tg, require_tg) —
-                    # plain launches keep the auto threadgroup size (tg 0), tiled
-                    # launches pin block_dim and require it exactly
-                    batch.append(("compute", pso, handles, threads,
-                                  block_dim if tiled else 0, 1 if tiled else 0))
-                    continue
-                if kind in ("copy", "fill"):
-                    blit = _blit_payload(record)
-                    if blit is not None:
-                        batch.append(blit)
-                        continue
-            if batch:
-                _replay_batch(batch, batch_base, len(records))
-                batch = []
             if kind == "metal":
-                # escape hatch: the pre-batching path, one commit+wait per record
                 _, pso, handles, threads, block_dim, _owned, _refs, tiled = record
                 if tiled:
-                    _mm.dispatch_tiled(pso, handles, threads, block_dim)
+                    _mm.dispatch_tiled_sync(pso, handles, threads, block_dim)
                 else:
-                    _mm.dispatch(pso, handles, threads, 0)
-            elif kind == "fill":
-                _, arr, value = record
-                arr.numpy[...] = value
-            elif kind == "copy":
-                _, dest, src, dest_offset, src_offset, count = record
-                n = src.n - src_offset if count is None else int(count)
-                dest.numpy[dest_offset : dest_offset + n] = src.numpy[src_offset : src_offset + n]
-            elif kind == "fallback":
-                _, kernel, dim, merged, fb = record
-                fb(kernel, dim, merged)
+                    _mm.dispatch_sync(pso, handles, threads, 0)
             else:
-                raise RuntimeError(f"capture_launch: unknown record kind {kind!r}")
-            batch_base = index + 1
-        if batch:
-            _replay_batch(batch, batch_base, len(records))
+                _replay_host_record(record)
         return
     raise RuntimeError(f"capture_launch: cannot replay {type(graph).__name__}")
 
@@ -2097,7 +2420,8 @@ def capture_if(condition, on_true=None, on_false=None, stream=None, **kwargs):
 
     Outside capture (upstream's own defined non-CUDA behavior): read the
     condition element and invoke the chosen callback eagerly with
-    ``**kwargs``. Inside an active capture, upstream CUDA builds a
+    ``**kwargs``. The condition read is a host-visible read of shared
+    storage, so pending eager dispatches flush before it (M2.6 flush-on-read). Inside an active capture, upstream CUDA builds a
     conditional graph node, but warp-metal's record/replay capture cannot
     express one — recording the eager read would silently pin the branch to
     its record-time value for every replay — so this raises

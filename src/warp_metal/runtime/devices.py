@@ -19,9 +19,10 @@ from __future__ import annotations
 class Stream:
     """Minimal stream token.
 
-    warp-metal dispatches kernels synchronously per launch (graph replay
-    batches records into one command buffer, but each call still waits), so
-    a Stream is an ordering handle only: it records its device and name,
+    warp-metal eager launches encode into one per-process command pipeline
+    and execute at the next host-visible flush (graph replay runs one
+    batched command buffer per ``capture_launch``), so a Stream is an
+    ordering handle only: it records its device and name,
     carries the device's capture state for parity (:attr:`is_capturing`),
     and is accepted wherever upstream would take one. Each device owns one
     stable implicit stream — ``Device.stream`` and :func:`get_stream` return
@@ -53,8 +54,8 @@ class Stream:
 class Event:
     """Minimal event handle for host-side timing.
 
-    Upstream events are device queue fences; warp-metal dispatches
-    synchronously, so recording an event is a timestamp and elapsed time is
+    Upstream events are device queue fences; warp-metal records host
+    timestamps, so recording an event is a timestamp and elapsed time is
     the wall-clock difference.
     """
 
@@ -99,10 +100,10 @@ class Device:
         self.arch = arch
         self.context = None
         # One stable implicit stream per device. Upstream ``Device.stream``
-        # is a cudaStream handle; warp-metal dispatches synchronously, so the
-        # token is a Stream object whose role is the stable hashable key
-        # Newton's ``captures.get(device.stream)`` guards read (documented
-        # divergence).
+        # is a cudaStream handle; warp-metal has one implicit stream per
+        # device, so the token is a Stream object whose role is the stable
+        # hashable key Newton's ``captures.get(device.stream)`` guards read
+        # (documented divergence).
         self._stream = Stream(self, name=f"{name}_default")
         # Upstream Device.is_mempool_enabled is a plain bool Newton reads
         # directly (kamino device info). Mempool allocation is a KEP-0001
@@ -290,24 +291,30 @@ def get_devices() -> list[Device]:
 def get_stream(device=None) -> Stream:
     """Return the (single, implicit) stream for a device.
 
-    warp-metal dispatches synchronously; each device owns one stable
-    implicit stream token, and this is the same object as ``Device.stream``
-    (upstream likewise returns the device's current stream), so the
-    ``captures`` key and ``wp.get_stream`` handles stay identical.
+    warp-metal has one implicit stream per device; this returns the same
+    object as ``Device.stream`` (upstream likewise returns the device's
+    current stream), so the ``captures`` key and ``wp.get_stream`` handles
+    stay identical.
     """
     return get_device(device).stream
 
 
 def set_stream(stream) -> Stream:
-    """Accepted for API parity; synchronous dispatch makes it a no-op."""
+    """Accepted for API parity; the single implicit pipeline makes it a no-op."""
     if isinstance(stream, Device) or isinstance(stream, str):
         get_device(stream)  # validate
     return stream
 
 
 def synchronize_device(device=None) -> None:
-    """Wait for outstanding work on a device (synchronous runtime: no-op)."""
+    """Wait for outstanding work on a device (upstream ``wp.synchronize_device``).
+
+    Flushes the pending eager command pipeline (commit + watchdog-bounded
+    wait); no-op when nothing is pending."""
     get_device(device)
+    from . import host as _host
+
+    _host.flush()
 
 
 def synchronize_stream(stream_or_device=None) -> None:
