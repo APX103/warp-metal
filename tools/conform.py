@@ -841,11 +841,19 @@ def run_corpus(golden_npz: Path) -> str:
 TRAJECTORY_CASES = {
     # name -> (n_steps, drift cap on per-step max |Δbody_q| component; None = strict only)
     "basic_pendulum": (120, None),  # contact-free: strict everywhere
-    "basic_shapes": (100, 0.10),  # primitives strict pre-contact; mesh contacts → cap
+    # cap recalibrated 0.10 -> 0.15 (user-ratified 2026-11-15, ROADMAP decision log):
+    # 3 same-day crossings of the old cap (1.010e-1 / 1.149e-1 / 1.064e-1) sit inside
+    # the atomic-order drift envelope (+0-15% over cap), with a clean WARP_METAL_BATCH=0
+    # control — chaotic tail, not divergence. p50/p95 drift stats are now reported per
+    # run (see TRAJECTORY_DRIFT_HISTORY) so future recalibration is evidence-based.
+    "basic_shapes": (100, 0.15),  # primitives strict pre-contact; mesh contacts → cap
 }
 TRAJECTORY_RTOL = 1e-5
 TRAJECTORY_ATOL = 1e-6
 TRAJECTORY_NPZ = Path(__file__).resolve().parent / "trajectory_golden.npz"
+# Append-only per-run drift records (one JSON line per case per compare run) —
+# the p50/p95 drift monitor's backing store for future cap recalibration.
+TRAJECTORY_DRIFT_HISTORY = Path(__file__).resolve().parent / "trajectory_drift_history.jsonl"
 
 
 def _traj_example_args(device: str):
@@ -892,6 +900,24 @@ def _traj_collect(device: str) -> dict[str, "np.ndarray"]:
     return cases
 
 
+def _append_drift_history(name, *, max_drift, drift_p50, drift_p95, tail_max, n_strict, n_steps, ok) -> None:
+    """Record one drift-monitoring sample (per case, per compare run)."""
+    record = {
+        "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "case": name,
+        "max": max_drift,
+        "p50": drift_p50,
+        "p95": drift_p95,
+        "tail_max": tail_max,
+        "n_strict": n_strict,
+        "n_steps": n_steps,
+        "ok": ok,
+        "batch_env": os.environ.get("WARP_METAL_BATCH", ""),
+    }
+    with open(TRAJECTORY_DRIFT_HISTORY, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(record, sort_keys=True) + "\n")
+
+
 def run_trajectory() -> str:
     import numpy as np
 
@@ -933,6 +959,14 @@ def run_trajectory() -> str:
         strict_ok = per_step_max <= TRAJECTORY_ATOL + TRAJECTORY_RTOL * np.abs(ref).reshape(n_steps + 1, -1).max(axis=1)
         n_strict = int(strict_ok.sum())
         max_drift = float(per_step_max.max())
+        # Drift-envelope monitoring (user-ratified 2026-11-15 alongside the cap
+        # recalibration): p50/p95 over the per-step drift distribution plus the
+        # contact-phase tail max (max over non-strict steps), logged per run to
+        # TRAJECTORY_DRIFT_HISTORY so cap placement stays evidence-based.
+        drift_p50 = float(np.percentile(per_step_max, 50))
+        drift_p95 = float(np.percentile(per_step_max, 95))
+        tail_steps = per_step_max[~strict_ok]
+        tail_max = float(tail_steps.max()) if tail_steps.size else None
         if cap is None:
             ok = bool(strict_ok.all())
             verdict = "PASS（全步 strict）" if ok else "FAIL"
@@ -943,10 +977,22 @@ def run_trajectory() -> str:
             verdict = "PASS" if ok else "FAIL"
         n_pass += int(ok)
         first_div = int(np.argmax(~strict_ok)) if not strict_ok.all() else "-"
+        tail_txt = f"{tail_max:.3e}" if tail_max is not None else "-"
         lines.append(
             f"- **{name}**: {verdict} — steps {n_steps + 1}, bodies {got.shape[1]}; "
             f"strict {n_strict}/{n_steps + 1}（首个非严格步 {first_div}），"
-            f"max|Δbody_q|={max_drift:.3e}，cap={cap if cap is not None else 'strict-only'}"
+            f"max|Δbody_q|={max_drift:.3e}，cap={cap if cap is not None else 'strict-only'}；"
+            f"drift p50={drift_p50:.3e} p95={drift_p95:.3e} tail-max={tail_txt}"
+        )
+        _append_drift_history(
+            name,
+            max_drift=max_drift,
+            drift_p50=drift_p50,
+            drift_p95=drift_p95,
+            tail_max=tail_max,
+            n_strict=n_strict,
+            n_steps=n_steps + 1,
+            ok=ok,
         )
     total = len(TRAJECTORY_CASES)
     lines.append(f"")
