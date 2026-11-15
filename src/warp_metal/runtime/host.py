@@ -1934,6 +1934,44 @@ def launch(
         _mm.buffer_release(h)
 
 
+def get_suggested_block_size(kernel, device: DeviceLike = None) -> tuple[int, int]:
+    """Suggest launch geometry for ``kernel`` (upstream context.py parity).
+
+    mujoco_warp's collision_driver/collision_convex/solver launch paths call
+    ``wp.get_suggested_block_size(kernel[, device])`` before launching.
+    Upstream queries CUDA occupancy (``cuOccupancyMaxPotentialBlockSize``)
+    and, for any non-CUDA device, returns ``(1, 1)`` — the shim has no CUDA,
+    so every resolved device takes that upstream non-CUDA branch, matching
+    the CPU-golden one-lane block resolution the launch surface already
+    applies (``launch_tiled`` cpu path, context.py
+    ``_resolve_launch_block_dim``). The kernel type check and device
+    resolution still run first so a bad kernel or device identifier fails
+    loud exactly like upstream. Upstream calls ``init()`` before resolving;
+    the shim skips that (device resolution here is lazy), so CPU-only hosts
+    and host-only test processes can call this without creating a Metal
+    device. Upstream's generic-kernel rejection sits behind the non-CUDA
+    return, so generic overloads are accepted here too — same as upstream
+    on a CPU device. There is deliberately no ``get_suggested_block_count``:
+    that name does not exist in upstream warp 1.19 nor in mujoco_warp.
+    """
+    from ..frontend.kernels import Kernel
+
+    if not isinstance(kernel, Kernel):
+        raise TypeError(f"get_suggested_block_size() expected a wp.Kernel, got {type(kernel)}")
+
+    dev = get_device(device)  # ValueError on unknown identifiers, upstream parity
+    if not dev.is_cuda:
+        return (1, 1)
+
+    # Unreachable today: every warp-metal device reports is_cuda False
+    # (runtime/devices.py). If a device ever reports CUDA-capable, fail loud
+    # rather than guess — there is no Metal analogue of the CUDA occupancy
+    # query this function mirrors on CUDA hardware.
+    raise RuntimeError(
+        f"get_suggested_block_size() has no occupancy analogue for device '{dev}' (warp-metal is Metal-only)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # graph capture (record/replay): ops inside capture_begin..capture_end are
 # appended to a record list instead of executing; capture_launch re-executes
