@@ -4097,51 +4097,62 @@ class _BodyTranslator:
             if rhs.startswith("wp::tile_mesh_query_aabb_next("):
                 return self._meshq_next(target, rhs)
             if rhs.startswith("wp::view("):
-                # `v = wp::view(parent, idx);` — an array-prefix slice
-                # (``parent[i]`` on an N-D array yields an (N-1)-D view over
-                # the parent's buffer). A local (data, meta) pair derived
-                # from the parent's runtime meta; the data pointer advances
-                # by one full outer slice of BYTE strides.
+                # `v = wp::view(parent, i0[, i1...]);` — an array-prefix
+                # slice (``parent[i]`` / ``parent[i, j]`` on an N-D array
+                # yields an (N-k)-D view over the parent's buffer). A local
+                # (data, meta) pair derived from the parent's runtime meta;
+                # the data pointer advances by one full outer slice of BYTE
+                # strides per index. mjw _mark_tactile_contacts views
+                # weld_geom_seen_out[worldid, tactile_idx] (array3d → row)
+                # for its atomic_or.
                 vargs = split_args(rhs[len("wp::view(") : -1])
-                if len(vargs) != 2:
-                    raise TranslationError(f"wp::view with {len(vargs)} args: single-index slices only")
+                if len(vargs) < 2:
+                    raise TranslationError(f"wp::view with {len(vargs)} args: needs (parent, indices...)")
+                if len(vargs) > 4:
+                    raise TranslationError(f"wp::view with {len(vargs)} indices: exceeds the 4-slot meta")
                 parent = vargs[0].strip()
                 pspec = self.array_args.get(parent)
                 if pspec is None:
                     raise TranslationError(f"wp::view on non-array {parent!r}")
+                n = len(vargs) - 1
                 elem = array_elem_msl(pspec.ctype)
                 nspec = ArgSpec(target, "array", f"wp::array_t<{elem}>")
                 nspec.local = True
                 self.array_args[target] = nspec
-                idx = self.expr(vargs[1])
                 pref = self._meta_ref(pspec)
-                self.hoisted.extend([
-                    f"wp_arr_meta {target}_m = {{}};",
-                    f"device {elem}* {target}_data = (device {elem}*)0;",
-                ])
                 # Upstream array.h view(): one full outer slice per index —
-                # an i * strides[0] BYTE advance (meta strides mirror
+                # an i * strides[k] BYTE advance (meta strides mirror
                 # array_t's byte strides, the same units wp_address uses),
                 # with negative indices wrapped Python-style. A shape-product
                 # advance is wrong for every ndim that lacks trailing dims: on
                 # a 2-D parent it collapses to shape[1] * 0 == 0 and pins
                 # every slice to row 0.
-                wrapped = f"((int)({idx}) < 0 ? (int)({idx}) + {pref}.shape[0] : (int)({idx}))"
-                return [
+                idx_exprs = [self.expr(v) for v in vargs[1:]]
+                advance = " + ".join(
+                    f"(size_t)(((int)({ie}) < 0 ? (int)({ie}) + {pref}.shape[{k}] : (int)({ie})) * ({pref}.strides[{k}]))"
+                    for k, ie in enumerate(idx_exprs)
+                )
+                self.hoisted.extend([
+                    f"wp_arr_meta {target}_m = {{}};",
+                    f"device {elem}* {target}_data = (device {elem}*)0;",
+                ])
+                lines = [
                     (
-                        f"{target}_data = (device {elem}*)((device char*)({self._data_expr(pspec)}) "
-                        f"+ (size_t)({wrapped} * ({pref}.strides[0])));"
+                        f"{target}_data = (device {elem}*)((device char*)({self._data_expr(pspec)}) + {advance});"
                     ),
-                    f"{target}_m.offset = {pref}.offset; {target}_m.ndim = {pref}.ndim - 1;",
-                    (
-                        f"{target}_m.shape[0] = {pref}.shape[1]; {target}_m.shape[1] = {pref}.shape[2]; "
-                        f"{target}_m.shape[2] = 0; {target}_m.shape[3] = 0;"
-                    ),
-                    (
-                        f"{target}_m.strides[0] = {pref}.strides[1]; {target}_m.strides[1] = {pref}.strides[2]; "
-                        f"{target}_m.strides[2] = 0; {target}_m.strides[3] = 0;"
-                    ),
+                    f"{target}_m.offset = {pref}.offset; {target}_m.ndim = {pref}.ndim - {n};",
                 ]
+                # meta shifts left by n dims; vacated slots zero (the
+                # 4-slot meta is dense from slot 0 for every ndim ≤ 4)
+                for slot in range(4):
+                    src_slot = slot + n
+                    shape_v = f"{pref}.shape[{src_slot}]" if src_slot < 4 else "0"
+                    lines.append(f"{target}_m.shape[{slot}] = {shape_v};")
+                for slot in range(4):
+                    src_slot = slot + n
+                    stride_v = f"{pref}.strides[{src_slot}]" if src_slot < 4 else "0"
+                    lines.append(f"{target}_m.strides[{slot}] = {stride_v};")
+                return lines
             m_cp = re.match(r"^wp::copy\((\w+)\)$", rhs)
             base = m_cp.group(1) if m_cp else (rhs.strip() if re.match(r"^\w+$", rhs.strip()) else None)
             if rhs.startswith("wp::mesh_get(") or (base is not None and base in self.mesh_vars):

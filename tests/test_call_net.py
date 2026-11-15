@@ -159,6 +159,19 @@ def k_tile_scatter_add(x: wp.array(dtype=wp.float32)):
 _TILE_SCATTER_ADD_BD = 4
 
 
+@wp.kernel
+def k_view2d_atomic(x: wp.array3d(dtype=wp.uint32), out: wp.array(dtype=wp.int32)):
+    # mjw _mark_tactile_contacts shape: a 2-index view of an array3d
+    # (weld_geom_seen_out[worldid, tactile_idx]) yields the 1-D row binding
+    # an atomic_or writes through — array.h view(): one strides[k] byte
+    # advance per index, meta shifted left by two dims
+    i = wp.tid()
+    row = x[i, 0]
+    wp.atomic_or(row, 0, wp.uint32(1))
+    if row.shape[0] > 0:
+        out[0] = 1
+
+
 # ---- checker self-tests ----
 
 
@@ -428,6 +441,23 @@ class TestStructCompareRouting(unittest.TestCase):
         )
         self.assertIn("static inline bool wp_equal(spatial_vectorf a, spatial_vectorf b) {", PRELUDE)
         self.assertIn("static inline bool wp_equal(quatf a, quatf b) {", PRELUDE)
+
+
+class TestViewMultiIndex(unittest.TestCase):
+    """array.h view() with N indices: per-index strides[k] byte advance,
+    meta shifted left by N (vacated slots zero). mjw sensor
+    _mark_tactile_contacts views a 2-index row of an array3d for atomic_or."""
+
+    def test_translate_and_checker(self):
+        unit = translate_kernel(k_view2d_atomic)
+        self.assertEqual([f for f in _checker.check_unit(unit) if f.severity == "ERROR"], [])
+
+    def test_meta_shift_emission(self):
+        unit = translate_kernel(k_view2d_atomic)
+        src = "\n".join(unit.kernel.lines)
+        self.assertIn("_m.ndim = _wp_args.x_m.ndim - 2;", src)
+        self.assertIn(".strides[0]))", src)  # per-index byte-advance term
+        self.assertIn("_m.strides[1] = _wp_args.x_m.strides[3];", src)  # vacated -> 0 via slot 3
 
 
 class TestTileScatterAdd(unittest.TestCase):
