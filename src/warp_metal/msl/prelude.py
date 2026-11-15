@@ -1522,6 +1522,195 @@ static inline float wp_determinant(mat33f m) {
 // closure uses 3x3 only.
 """
 
+_EIG3_OPS = """\
+// ---- eig3: symmetric 3x3 eigendecomposition (KEP-0001 M3.2; verbatim
+// port of upstream warp/native/svd.h eig3 — quaternion-Jacobi eigenanalysis).
+// fp32 only: the fp64 overload fails loud at MSL translation (prelude
+// carries no fp64). JACOBI_ITERATIONS = 4 per _svd_config<float> (svd.h:39);
+// recipSqrt uses the CPU branch 1/sqrt(x) (svd.h:53), not the CUDA rsqrt
+// fast approximation — CPU warp is the golden arithmetic. Newton's mujoco
+// glue (update_body_inertia_kernel via _eig_inertia) consumes the contract
+// wp.eig3(A) -> (Q, d) with A = Q*diag(d)*Q^T: columns of Q are paired
+// right-handed eigenvectors, d the eigenvalues; upstream explicitly does
+// not promise an ordering, so consumers must not rely on one (Newton sorts
+// descending itself). eig3 reads only A's lower triangle — symmetric input
+// assumed (svd.h:736-741).
+static inline mat33f wp_eig3_mult_ab(mat33f a, mat33f b) {  // svd.h multAB
+    mat33f m;
+    m.c[0][0] = a.c[0][0] * b.c[0][0] + a.c[0][1] * b.c[1][0] + a.c[0][2] * b.c[2][0];
+    m.c[0][1] = a.c[0][0] * b.c[0][1] + a.c[0][1] * b.c[1][1] + a.c[0][2] * b.c[2][1];
+    m.c[0][2] = a.c[0][0] * b.c[0][2] + a.c[0][1] * b.c[1][2] + a.c[0][2] * b.c[2][2];
+    m.c[1][0] = a.c[1][0] * b.c[0][0] + a.c[1][1] * b.c[1][0] + a.c[1][2] * b.c[2][0];
+    m.c[1][1] = a.c[1][0] * b.c[0][1] + a.c[1][1] * b.c[1][1] + a.c[1][2] * b.c[2][1];
+    m.c[1][2] = a.c[1][0] * b.c[0][2] + a.c[1][1] * b.c[1][2] + a.c[1][2] * b.c[2][2];
+    m.c[2][0] = a.c[2][0] * b.c[0][0] + a.c[2][1] * b.c[1][0] + a.c[2][2] * b.c[2][0];
+    m.c[2][1] = a.c[2][0] * b.c[0][1] + a.c[2][1] * b.c[1][1] + a.c[2][2] * b.c[2][1];
+    m.c[2][2] = a.c[2][0] * b.c[0][2] + a.c[2][1] * b.c[1][2] + a.c[2][2] * b.c[2][2];
+    return m;
+}
+
+static inline mat33f wp_eig3_mult_at_b(mat33f a, mat33f b) {  // svd.h multAtB
+    mat33f m;
+    m.c[0][0] = a.c[0][0] * b.c[0][0] + a.c[1][0] * b.c[1][0] + a.c[2][0] * b.c[2][0];
+    m.c[0][1] = a.c[0][0] * b.c[0][1] + a.c[1][0] * b.c[1][1] + a.c[2][0] * b.c[2][1];
+    m.c[0][2] = a.c[0][0] * b.c[0][2] + a.c[1][0] * b.c[1][2] + a.c[2][0] * b.c[2][2];
+    m.c[1][0] = a.c[0][1] * b.c[0][0] + a.c[1][1] * b.c[1][0] + a.c[2][1] * b.c[2][0];
+    m.c[1][1] = a.c[0][1] * b.c[0][1] + a.c[1][1] * b.c[1][1] + a.c[2][1] * b.c[2][1];
+    m.c[1][2] = a.c[0][1] * b.c[0][2] + a.c[1][1] * b.c[1][2] + a.c[2][1] * b.c[2][2];
+    m.c[2][0] = a.c[0][2] * b.c[0][0] + a.c[1][2] * b.c[1][0] + a.c[2][2] * b.c[2][0];
+    m.c[2][1] = a.c[0][2] * b.c[0][1] + a.c[1][2] * b.c[1][1] + a.c[2][2] * b.c[2][1];
+    m.c[2][2] = a.c[0][2] * b.c[0][2] + a.c[1][2] * b.c[1][2] + a.c[2][2] * b.c[2][2];
+    return m;
+}
+
+static inline void wp_eig3_quat_to_mat3(const thread float* qV, thread mat33f& m) {  // svd.h quatToMat3
+    float w = qV[3];
+    float x = qV[0];
+    float y = qV[1];
+    float z = qV[2];
+
+    float qxx = x * x;
+    float qyy = y * y;
+    float qzz = z * z;
+    float qxz = x * z;
+    float qxy = x * y;
+    float qyz = y * z;
+    float qwx = w * x;
+    float qwy = w * y;
+    float qwz = w * z;
+
+    m.c[0][0] = 1.0f - 2.0f * (qyy + qzz);
+    m.c[0][1] = 2.0f * (qxy - qwz);
+    m.c[0][2] = 2.0f * (qxz + qwy);
+    m.c[1][0] = 2.0f * (qxy + qwz);
+    m.c[1][1] = 1.0f - 2.0f * (qxx + qzz);
+    m.c[1][2] = 2.0f * (qyz - qwx);
+    m.c[2][0] = 2.0f * (qxz - qwy);
+    m.c[2][1] = 2.0f * (qyz + qwx);
+    m.c[2][2] = 1.0f - 2.0f * (qxx + qyy);
+}
+
+static inline void wp_eig3_approx_givens(float a11, float a12, float a22, thread float& ch, thread float& sh) {
+    // svd.h approximateGivensQuaternion: gamma = sqrt(8)+3, cstar = cos(pi/8),
+    // sstar = sin(pi/8) — upstream constexpr fp64 literals, read here at the
+    // same float values the C++ Type() casts produce
+    const float _gamma = 5.82842712474619f;
+    const float _cstar = 0.9238795325112867f;
+    const float _sstar = 0.3826834323650898f;
+
+    ch = 2.0f * (a11 - a22);
+    sh = a12;
+    bool b = _gamma * sh * sh < ch * ch;
+    float w = 1.0f / sqrt(ch * ch + sh * sh);
+    ch = b ? w * ch : _cstar;
+    sh = b ? w * sh : _sstar;
+}
+
+static inline void wp_eig3_jacobi_conjugation(
+    const int x, const int y, const int z,
+    thread float& s11, thread float& s21, thread float& s22,
+    thread float& s31, thread float& s32, thread float& s33,
+    thread float* qV
+) {  // svd.h jacobiConjugation
+    float ch, sh;
+    wp_eig3_approx_givens(s11, s21, s22, ch, sh);
+
+    float scale = ch * ch + sh * sh;
+    float a = (ch * ch - sh * sh) / scale;
+    float b = (2.0f * sh * ch) / scale;
+
+    // make temp copy of S
+    float _s11 = s11;
+    float _s21 = s21;
+    float _s22 = s22;
+    float _s31 = s31;
+    float _s32 = s32;
+    float _s33 = s33;
+
+    // perform conjugation S = Q'*S*Q
+    // Q already implicitly solved from a, b
+    s11 = a * (a * _s11 + b * _s21) + b * (a * _s21 + b * _s22);
+    s21 = a * (-b * _s11 + a * _s21) + b * (-b * _s21 + a * _s22);
+    s22 = -b * (-b * _s11 + a * _s21) + a * (-b * _s21 + a * _s22);
+    s31 = a * _s31 + b * _s32;
+    s32 = -b * _s31 + a * _s32;
+    s33 = _s33;
+
+    // update cumulative rotation qV
+    float tmp[3] = {};
+    tmp[0] = qV[0] * sh;
+    tmp[1] = qV[1] * sh;
+    tmp[2] = qV[2] * sh;
+    sh *= qV[3];
+
+    qV[0] *= ch;
+    qV[1] *= ch;
+    qV[2] *= ch;
+    qV[3] *= ch;
+
+    // (x,y,z) corresponds to ((0,1,2),(1,2,0),(2,0,1))
+    // for (p,q) = ((0,1),(1,2),(0,2))
+    qV[z] += sh;
+    qV[3] -= tmp[z];  // w
+    qV[x] += tmp[y];
+    qV[y] -= tmp[x];
+
+    // re-arrange matrix for next iteration
+    _s11 = s22;
+    _s21 = s32;
+    _s22 = s33;
+    _s31 = s21;
+    _s32 = s31;
+    _s33 = s11;
+    s11 = _s11;
+    s21 = _s21;
+    s22 = _s22;
+    s31 = _s31;
+    s32 = _s32;
+    s33 = _s33;
+}
+
+static inline void wp_eig3_jacobi_eigenanalysis(
+    thread float& s11,
+    thread float& s21, thread float& s22,
+    thread float& s31, thread float& s32, thread float& s33,
+    // quaternion representation of V
+    thread float* qV
+) {  // svd.h jacobiEigenanlysis
+    qV[3] = 1.0f;
+    qV[0] = 0.0f;
+    qV[1] = 0.0f;
+    qV[2] = 0.0f;  // follow same indexing convention as GLM
+    for (int i = 0; i < 4; ++i) {  // JACOBI_ITERATIONS (svd.h _svd_config<float>)
+        // we wish to eliminate the maximum off-diagonal element
+        // on every iteration, but cycling over all 3 possible rotations
+        // in fixed order (p,q) = (1,2) , (2,3), (1,3) still retains
+        //  asymptotic convergence
+        wp_eig3_jacobi_conjugation(0, 1, 2, s11, s21, s22, s31, s32, s33, qV);  // p,q = 0,1
+        wp_eig3_jacobi_conjugation(1, 2, 0, s11, s21, s22, s31, s32, s33, qV);  // p,q = 1,2
+        wp_eig3_jacobi_conjugation(2, 0, 1, s11, s21, s22, s31, s32, s33, qV);  // p,q = 0,2
+    }
+}
+
+// svd.h eig3: Q = eigenbasis (columns), d = eigenvalues; Q built from the
+// cumulative Jacobi rotation quaternion, d from diag(Q^T*A*Q)
+static inline void wp_eig3(mat33f A, thread mat33f& Q, thread vec3f& d) {
+    float qV[4] = {};
+    float s11 = A.c[0][0];
+    float s21 = A.c[1][0];
+    float s22 = A.c[1][1];
+    float s31 = A.c[2][0];
+    float s32 = A.c[2][1];
+    float s33 = A.c[2][2];
+
+    wp_eig3_jacobi_eigenanalysis(s11, s21, s22, s31, s32, s33, qV);
+    wp_eig3_quat_to_mat3(qV, Q);
+    mat33f t = wp_eig3_mult_at_b(Q, A);
+    mat33f u = wp_eig3_mult_ab(t, Q);
+    d = make_vec3f(u.c[0][0], u.c[1][1], u.c[2][2]);
+}
+"""
+
 _BVH_OPS = """
 // ---- BVH (upstream warp/native/bvh.h layout; runtime/bvh.py builds it) ----
 // BVHPackedNodeHalf packs child/payload in i:31 + leaf flag in b:1; clang
@@ -2699,6 +2888,8 @@ _PRELUDE = (
     + _SCALAR_OPS
     + "\n"
     + _MAT_FACTORY_OPS
+    + "\n"
+    + _EIG3_OPS
     + "\n"
     + _BVH_OPS
     + "\n"

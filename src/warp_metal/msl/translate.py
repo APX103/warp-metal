@@ -3280,6 +3280,24 @@ class _BodyTranslator:
             # matrix trace (sum of diagonal): fixed sizes via the prelude,
             # generic square mats via ensure_mat_def's overload
             return f"wp_trace({self.expr(args[0])})"
+        if key == "wp::eig3":
+            # symmetric 3x3 eigendecomposition (KEP-0001 M3.2; prelude
+            # _EIG3_OPS — upstream svd.h eig3 port). The vendored codegen
+            # emits BOTH overloads (the (Q, d)-returning one and the
+            # caller-output mutating one) identically: a statement call
+            # carrying the outputs as trailing ref args
+            # (`wp::eig3(A, Q, d);`), so one routing covers both and the
+            # argument order pins the output contract (Q first, d second).
+            # fp32 only — fp64 fails loud (B1: Metal has no fp64).
+            if len(args) != 3:
+                raise TranslationError(f"wp::eig3 with {len(args)} args (needs A, Q, d)")
+            if any("float64" in a for a in args):
+                raise TranslationError(
+                    "wp::eig3: the fp64 overload has no MSL translation "
+                    "(Metal has no fp64; decompose in float32 — see Newton "
+                    "inertia.py B2 note)"
+                )
+            return f"wp_eig3({', '.join(self.expr(a) for a in args)})"
         if key == "wp::store":
             if len(args) == 2:
                 # store through an element pointer (wp::indexref result or a
