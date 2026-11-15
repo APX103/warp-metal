@@ -31,12 +31,13 @@ work; here we pin the emitted MSL shape so regressions surface host-side.
 """
 
 import importlib.util
+import re
 import unittest
 from pathlib import Path
 
 import warp_metal as wp
 from warp_metal.msl.prelude import PRELUDE
-from warp_metal.msl.translate import translate_kernel
+from warp_metal.msl.translate import _shr_elem_bytes, translate_kernel
 
 # tools/ is not a package; load the checker module by path
 _TOOLS = Path(__file__).resolve().parent.parent / "tools"
@@ -170,6 +171,37 @@ def k_view2d_atomic(x: wp.array3d(dtype=wp.uint32), out: wp.array(dtype=wp.int32
     wp.atomic_or(row, 0, wp.uint32(1))
     if row.shape[0] > 0:
         out[0] = 1
+
+
+@wp.kernel
+def k_tile_jtdaj_ops(v_in: wp.array2d(dtype=wp.float32), x: wp.array2d(dtype=wp.float32)):
+    # mini mjw _update_gradient_JTDAJ_dense_tiled (solver.py:2729-2739):
+    # arange index tile, ones*scalar threshold fold (the adjoint codegen's
+    # tile⊗scalar mul), transpose alias + stride-0 broadcast, elementwise
+    # map, matmul accumulated back through the `acc +=` tile_add_inplace form
+    j = wp.tile_load(v_in, shape=(4, 2))
+    jt = wp.tile_transpose(j)
+    tid_tile = wp.tile_arange(4, dtype=float)
+    threshold = wp.tile_ones(shape=(4,), dtype=float) * 2.0
+    active = wp.tile_map(wp.mul, tid_tile, threshold)
+    b = wp.tile_broadcast(active, shape=(2, 4))
+    prod = wp.tile_map(wp.mul, jt, b)
+    acc = wp.tile_zeros(shape=(2, 2), dtype=float, storage="shared")
+    acc += wp.tile_matmul(prod, j)
+    wp.tile_store(x, acc)
+
+
+_JTDAJ_OPS_BD = 8
+
+
+@wp.kernel
+def k_tile_arange_scalar(x: wp.array(dtype=wp.float32)):
+    # per-thread tier: arange/ones/add collapse to the thread's own element
+    # (plain launches run one-lane blocks — CPU block_dim=1 golden semantics)
+    t = wp.tile_arange(4, dtype=float)
+    o = wp.tile_ones(shape=(4,), dtype=float)
+    s = t + o
+    wp.tile_store(x, s)
 
 
 # ---- checker self-tests ----
@@ -491,6 +523,56 @@ class TestTileScatterAdd(unittest.TestCase):
         add_lines = [l for l in unit.kernel.lines if "+=" in l and "_wp_tile_shr_" not in l]
         self.assertEqual(len(add_lines), 1)
         self.assertIn("== 0", add_lines[0])
+
+
+class TestTileArangeOnesBroadcast(unittest.TestCase):
+    """tile.h:2887 arange / :2734 ones / :5488 broadcast alias — the JTDAJ
+    producer chain (mjw solver.py:2729-2737): index tile, ones*scalar
+    threshold fold, stride-0 broadcast over a transpose view, and the
+    ``acc += tile_matmul`` tile_add_inplace accumulate. Shared tiles fill
+    with strided lane loops + trailing barrier; the broadcast binds the
+    target's pending ``= nullptr`` alias decl to the source's storage
+    (upstream owner=False, zero-copy, zero barrier)."""
+
+    def test_tiled_emission(self):
+        unit = translate_kernel(k_tile_jtdaj_ops, options={"block_dim": _JTDAJ_OPS_BD})
+        lines = unit.kernel.lines
+        arange = [l for l in lines if "= 0f + _wp_t * 1f;" in l]
+        self.assertEqual(len(arange), 1)
+        ones_mul = [l for l in lines if re.search(r"_wp_tile_shr_\d+\[.*\] = \(.* \* .*\);", l)]
+        self.assertTrue(ones_mul)
+        addi = [l for l in lines if "+= _wp_tile_shr_" in l]
+        self.assertEqual(len(addi), 1)
+        idx = lines.index(addi[0])
+        # the accumulate loop closes before the barrier orders the writes
+        self.assertIn("threadgroup_barrier", lines[idx + 2])
+
+    def test_tiled_checker_clean(self):
+        unit = translate_kernel(k_tile_jtdaj_ops, options={"block_dim": _JTDAJ_OPS_BD})
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+    def test_broadcast_alias_borrows_storage(self):
+        # the broadcast target (and the transpose view) claim no threadgroup
+        # slot of their own — upstream owner=False aliases. Owners: the
+        # (4,2) load, the arange tile, the ones tile, the ones*scalar result,
+        # the map result, the (2,4) map result, the (2,2) zeros accumulator,
+        # the matmul result.
+        unit = translate_kernel(k_tile_jtdaj_ops, options={"block_dim": _JTDAJ_OPS_BD})
+        self.assertEqual(len(unit.shr_arrays), 8)
+        total = sum(_shr_elem_bytes(elem, unit) * size for elem, size in unit.shr_arrays)
+        self.assertEqual(total, 160)
+
+    def test_plain_launch_scalar_tier(self):
+        # plain launch: arange is the thread's element (index 0), ones is 1,
+        # tile+tile folds to the scalar core — per-thread scalar degradation
+        unit = translate_kernel(k_tile_arange_scalar)
+        lines = unit.kernel.lines
+        self.assertTrue(any(re.match(r"^var_\d+ = 0f;$", l.strip()) for l in lines))
+        self.assertTrue(any(re.match(r"^var_\d+ = 1f;$", l.strip()) for l in lines))
+        self.assertTrue(any("wp_add(" in l for l in lines))
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
 
 
 class TestClosureVecOverloads(unittest.TestCase):

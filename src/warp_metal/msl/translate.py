@@ -696,6 +696,16 @@ def split_args(src: str) -> list[str]:
     return parts
 
 
+def _tile_scalar_lit(elem: str, value) -> str:
+    """Format a compile-time scalar as an MSL literal for a tile element type
+    (float/half need the suffix; ints and bools are bare)."""
+    if elem in ("float", "half"):
+        return f"{float(value):.9g}{'f' if elem == 'float' else 'h'}"
+    if elem == "bool":
+        return "true" if value else "false"
+    return str(int(value))
+
+
 # ---------------------------------------------------------------------------
 # parsing helpers for the codegen C++ SSA text
 # ---------------------------------------------------------------------------
@@ -2160,6 +2170,196 @@ class _BodyTranslator:
         """Value expression for a tile operand: the thread's own element."""
         return name  # scalar tiles are plain MSL lvalues
 
+    _TILE_BIN_COPS = {"mul": "*", "add": "+", "sub": "-", "div": "/", "mod": "%"}
+
+    def _tile_binop(self, target: str, rhs: str, op_name: str) -> list[str]:
+        """``var = wp::tile_mul(a, b);`` (also add/sub/div/mod/min/max) —
+        elementwise tile arithmetic. Both-tile operands are the tile_map
+        dispatch's folded binary form; the adjoint codegen also folds
+        tile⊗scalar broadcasts into the same call with a plain register
+        operand (JTDAJ ``wp.tile_ones(...) * (nefc - k)`` → ``tile_mul(var,
+        scalar)``), which lowers as an in-place elementwise map."""
+        open_p = rhs.index("(")
+        close = _find_balanced(rhs, open_p)
+        args = [a.strip() for a in split_args(rhs[open_p + 1 : close])]
+        if len(args) != 2:
+            raise TranslationError(f"tile_{op_name} with {len(args)} args (needs two operands)")
+        a, b = args
+        ta = self.tile_vars.get(a)
+        tb = self.tile_vars.get(b)
+        if ta is not None and tb is not None:
+            return self._tile_map(target, f"wp::tile_binary_map(wp::{op_name}, {a}, {b})")
+        if ta is None and tb is None:
+            raise TranslationError(f"tile_{op_name} in {rhs!r} has no tile operand")
+        t_src_name = a if ta is not None else b
+        t_src = self.tile_vars[t_src_name]
+        tvar = self.tile_vars.get(target)
+        if tvar is None:
+            raise TranslationError(f"tile_{op_name} target {target!r} is not a tile variable")
+        if tvar.elem != t_src.elem:
+            raise TranslationError(f"tile_{op_name} elem mismatch {tvar.elem} != {t_src.elem}")
+        scalar_src = self.expr(b if ta is not None else a)
+        if op_name in self._TILE_BIN_COPS:
+            cop = self._TILE_BIN_COPS[op_name]
+        elif op_name in ("min", "max"):
+            cop = None
+        else:
+            raise TranslationError(f"tile_{op_name} is not an elementwise arithmetic op")
+        combine = (
+            (lambda x, y: f"({x} {cop} {y})")
+            if cop is not None
+            else (lambda x, y: f"wp_{op_name}({x}, {y})")
+        )
+        self.unit.uses_tile_ops = True
+        if tvar.kind == "scalar":
+            # per-thread one-element form: elementwise, no barrier (the tile
+            # operand is the thread's own element lvalue)
+            if t_src.kind != "scalar":
+                raise TranslationError(
+                    f"tile_{op_name}: per-thread target with shared operand {t_src_name!r} is outside the closure"
+                )
+            return [f"{target} = {combine(t_src_name, scalar_src)};"]
+        bd = self._require_block_dim(f"wp::tile_{op_name}")
+        self._check_uniform(f"wp::tile_{op_name}")
+        arr = f"_wp_tile_shr_{tvar.slot}"
+        lines, addr = tvar.lin_addr("_wp_t", prefix="_wp_tb")
+        if t_src.kind != "shr":
+            raise TranslationError(
+                f"tile_{op_name}: shared target with per-thread operand {t_src_name!r} is outside the closure"
+            )
+        if t_src_name != target and t_src.slot != tvar.slot:
+            # the operand tile has its own linear->storage layout (a
+            # view/transpose source reorders coordinates) — read through it
+            slines, saddr = t_src.lin_addr("_wp_t", prefix="_wp_tbs")
+            lines = slines + lines
+            elem_read = f"_wp_tile_shr_{t_src.slot}[{saddr}]"
+        else:
+            elem_read = f"{arr}[{addr}]"
+        return [
+            *lines,
+            f"for (int _wp_t = _wp_lane; _wp_t < {tvar.size}; _wp_t += {bd}) {{",
+            f"    {arr}[{addr}] = {combine(elem_read, scalar_src)};",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _tile_add_inplace(self, stripped: str) -> list[str]:
+        """``wp::tile_add_inplace(dst, src);`` — elementwise ``dst += src``
+        (upstream tile_iadd; the JTDAJ accumulator adds the matmul result into
+        the reshaped m_tile alias). Each tile keeps its own linear->storage
+        mapping; a trailing barrier orders the writes before the next
+        cross-lane consumer (the loop's scatter_add)."""
+        open_p = stripped.index("(")
+        close = _find_balanced(stripped, open_p)
+        args = [a.strip() for a in split_args(stripped[open_p + 1 : close])]
+        if len(args) != 2:
+            raise TranslationError(f"tile_add_inplace with {len(args)} args (needs dst, src)")
+        dst_name, src_name = args
+        dst = self.tile_vars.get(dst_name)
+        src = self.tile_vars.get(src_name)
+        if dst is None or src is None:
+            raise TranslationError(f"tile_add_inplace operand is not a tile variable in {stripped!r}")
+        if dst.size != src.size:
+            raise TranslationError(f"tile_add_inplace size mismatch {dst.size} != {src.size}")
+        self.unit.uses_tile_ops = True
+        if dst.kind == "scalar":
+            return [f"{dst_name} = {dst_name} + {src_name};"]
+        bd = self._require_block_dim("wp::tile_add_inplace")
+        self._check_uniform("wp::tile_add_inplace")
+        dlines, daddr = dst.lin_addr("_wp_t", prefix="_wp_ai_d")
+        slines, saddr = src.lin_addr("_wp_t", prefix="_wp_ai_s")
+        return [
+            *slines,
+            *dlines,
+            f"for (int _wp_t = _wp_lane; _wp_t < {dst.size}; _wp_t += {bd}) {{",
+            f"    _wp_tile_shr_{dst.slot}[{daddr}] += _wp_tile_shr_{src.slot}[{saddr}];",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _tile_arange(self, target: str, rhs: str) -> list[str]:
+        """``var = wp::tile_arange<dtype, N>(start, stop, step);`` —
+        tile.h:2887: ``out[i] = start + i*step`` (stop only sizes the tile
+        upstream-side; the SSA template N is authoritative and must equal the
+        target tile's element count). start/step are compile-time constants
+        (the dispatch folds and dtype-casts them before codegen)."""
+        open_p = rhs.index("(")
+        m_t = re.match(r"^wp::tile_arange<(.+)>$", rhs[:open_p].strip())
+        if m_t is None:
+            raise TranslationError(f"cannot parse tile_arange template {rhs!r}")
+        targs = split_args(m_t.group(1))
+        if len(targs) != 2:
+            raise TranslationError(f"tile_arange template {m_t.group(1)!r} needs (dtype, size)")
+        elem = msl_type(targs[0])
+        n = int(targs[1])
+        aargs = split_args(rhs[open_p + 1 : _find_balanced(rhs, open_p)])
+        if len(aargs) != 3:
+            raise TranslationError(f"tile_arange with {len(aargs)} args (start, stop, step)")
+        start_v = self._const_eval(aargs[0])
+        step_v = self._const_eval(aargs[2])
+        if start_v is None or step_v is None:
+            raise TranslationError(
+                "tile_arange start/step must be compile-time constants in the closure "
+                "(upstream folds them through the dispatch's dtype cast)"
+            )
+        tvar = self.tile_vars.get(target)
+        if tvar is None:
+            raise TranslationError(f"tile_arange target {target!r} is not a tile variable")
+        if tvar.elem != elem:
+            raise TranslationError(f"tile_arange elem {elem} does not match target tile {tvar.elem}")
+        if tvar.kind != "scalar" and tvar.size != n:
+            raise TranslationError(f"tile_arange template size {n} != target tile {tvar.size}")
+        self.unit.uses_tile_ops = True
+        lit = _tile_scalar_lit(elem, start_v)
+        stepl = _tile_scalar_lit(elem, step_v)
+        if tvar.kind == "scalar":
+            # per-thread register form: the thread's element is index
+            # _wp_lane, but the one-element tier pins the tile to element 0
+            return [f"{target} = {lit};"]
+        bd = self._require_block_dim("wp::tile_arange")
+        self._check_uniform("wp::tile_arange")
+        arr = f"_wp_tile_shr_{tvar.slot}"
+        return [
+            f"for (int _wp_t = _wp_lane; _wp_t < {n}; _wp_t += {bd}) {{",
+            f"    {arr}[_wp_t] = {lit} + _wp_t * {stepl};",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
+    def _tile_ones(self, target: str, rhs: str) -> list[str]:
+        """``var = wp::tile_ones<dtype, D0...>();`` — tile.h:2734: every
+        element ``T(1)``."""
+        open_p = rhs.index("(")
+        m_t = re.match(r"^wp::tile_ones<(.+)>$", rhs[:open_p].strip())
+        if m_t is None:
+            raise TranslationError(f"cannot parse tile_ones template {rhs!r}")
+        targs = split_args(m_t.group(1))
+        elem = msl_type(targs[0])
+        tvar = self.tile_vars.get(target)
+        if tvar is None:
+            raise TranslationError(f"tile_ones target {target!r} is not a tile variable")
+        if tvar.elem != elem:
+            raise TranslationError(f"tile_ones elem {elem} does not match target tile {tvar.elem}")
+        dims = [int(a.strip()) for a in targs[1:]]
+        n = 1
+        for d in dims:
+            n *= d
+        if tvar.kind != "scalar" and tvar.size != n:
+            raise TranslationError(f"tile_ones template size {n} != target tile {tvar.size}")
+        self.unit.uses_tile_ops = True
+        lit = _tile_scalar_lit(elem, 1)
+        if tvar.kind == "scalar":
+            return [f"{target} = {lit};"]
+        bd = self._require_block_dim("wp::tile_ones")
+        self._check_uniform("wp::tile_ones")
+        arr = f"_wp_tile_shr_{tvar.slot}"
+        return [
+            f"for (int _wp_t = _wp_lane; _wp_t < {tvar.size}; _wp_t += {bd}) {{",
+            f"    {arr}[_wp_t] = {lit};",
+            "}",
+            "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        ]
+
     def _tile_zeros(self, target: str, rhs: str) -> list[str]:
         open_p = rhs.index("(")
         m_t = re.match(r"^wp::tile_zeros<(.+)>$", rhs[:open_p].strip())
@@ -2434,7 +2634,7 @@ class _BodyTranslator:
         non-zero view offset cannot address the thread's one element and
         fails loud)."""
         self.unit.uses_tile_ops = True
-        with_template = op in ("tile_reshape", "tile_view")
+        with_template = op in ("tile_reshape", "tile_view", "tile_broadcast")
         args, tmpl = self._parse_tile_call(rhs, op, with_template)
         src_name = args[0].strip()
         tgt = self.tile_vars.get(target)
@@ -2460,6 +2660,21 @@ class _BodyTranslator:
                 raise TranslationError("wp::tile_transpose is 2-D only in the closure")
             tgt.dims = list(reversed(src.dims))
             tgt.strides = list(reversed(src.strides))
+            tgt.base = src.base
+        elif op == "tile_broadcast":
+            # ``wp::tile_broadcast<D0, D1, ..., s0, s1, ...>(src)`` — upstream
+            # tile.h:5488 forces the source to shared storage and returns a
+            # pure stride-0 alias: the flat template carries the broadcast
+            # dims then the strides verbatim (stride-0 dims repeat the source
+            # lanes; coord_addr already skips those axes)
+            targs = [int(a) for a in tmpl.replace(" ", "").split(",") if a]
+            if not targs or len(targs) % 2:
+                raise TranslationError(
+                    f"wp::tile_broadcast template {tmpl!r} must be dims-then-strides (even count)"
+                )
+            half = len(targs) // 2
+            tgt.dims = targs[:half]
+            tgt.strides = targs[half:]
             tgt.base = src.base
         else:
             dims = _tile_shape_dims(tmpl)
@@ -4050,17 +4265,27 @@ class _BodyTranslator:
                 return self._tile_load(target, rhs)
             if rhs.startswith(("wp::tile_binary_map(", "wp::tile_unary_map(")):
                 return self._tile_map(target, rhs)
+            if m_tilebin := re.match(r"^wp::tile_(mul|add|sub|div|mod|min|max)\(", rhs):
+                return self._tile_binop(target, rhs, m_tilebin.group(1))
             if rhs.startswith("wp::tile<"):
                 return self._tile_broadcast(target, rhs)
             if rhs.startswith("wp::tile_reduce(") or rhs.startswith("wp::tile_sum(") or rhs.startswith("wp::tile_min(") or rhs.startswith("wp::tile_max(") or rhs.startswith("wp::tile_argmin(") or rhs.startswith("wp::tile_argmax("):
                 return self._tile_reduce(target, rhs)
             if rhs.startswith("wp::tile_zeros<"):
                 return self._tile_zeros(target, rhs)
-            if rhs.startswith(("wp::tile_transpose(", "wp::tile_reshape<", "wp::tile_view<")):
+            if rhs.startswith("wp::tile_arange<"):
+                return self._tile_arange(target, rhs)
+            if rhs.startswith("wp::tile_ones<"):
+                return self._tile_ones(target, rhs)
+            if rhs.startswith(("wp::tile_transpose(", "wp::tile_reshape<", "wp::tile_view<", "wp::tile_broadcast<")):
                 op = (
                     "tile_transpose"
                     if rhs.startswith("wp::tile_transpose(")
-                    else ("tile_reshape" if rhs.startswith("wp::tile_reshape<") else "tile_view")
+                    else (
+                        "tile_reshape"
+                        if rhs.startswith("wp::tile_reshape<")
+                        else ("tile_broadcast" if rhs.startswith("wp::tile_broadcast<") else "tile_view")
+                    )
                 )
                 return self._tile_alias_bind(target, rhs, op)
             if rhs.startswith(("wp::tile_matmul_acc(", "wp::tile_matmul(")):
@@ -4256,6 +4481,8 @@ class _BodyTranslator:
             return self._tile_scatter(stripped)
         if stripped.startswith("wp::tile_scatter_add("):
             return self._tile_scatter_add(stripped)
+        if stripped.startswith("wp::tile_add_inplace("):
+            return self._tile_add_inplace(stripped)
         if stripped.startswith("wp::tile_sort("):
             # in-place key-value sort (the SSA strips the trailing semicolon
             # below; the parser wants the bare call)
