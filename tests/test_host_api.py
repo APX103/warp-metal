@@ -154,6 +154,98 @@ class TestCaptureWhileEager(unittest.TestCase):
             host_mod._CAPTURE_RECORDS = saved
 
 
+def _host_array(shape, dtype, values=None):
+    """A WarpArray hand-built over ctypes host memory — zero Metal objects.
+
+    The reshape path only reads layout fields and shares ``_buffer``; the
+    real dispatch-visible base is exercised end-to-end by the mjw solver.
+    """
+    import ctypes
+
+    from warp_metal.runtime.host import WarpArray, _dtype_layout, _normalize_shape
+
+    a = WarpArray.__new__(WarpArray)
+    a.device = "cpu"
+    a.dtype = dtype
+    a.shape = _normalize_shape(shape)
+    a.n = 1
+    for s in a.shape:
+        a.n *= s
+    a.np_dtype, a.item_bytes, a.is_composite = _dtype_layout(dtype)
+    a.offset_elems = 0
+    a._owns_buffer = False
+    a._buffer = None  # nothing to release; ctypes memory dies with `data`
+    n_bytes = max(a.n, 1) * a.item_bytes
+    data = (ctypes.c_uint8 * n_bytes)()
+    if values is not None:
+        host = a
+        host._ptr = ctypes.addressof(data)
+        host._build_numpy_view()
+        host.numpy[...] = values
+    a._ptr = ctypes.addressof(data)
+    a._build_numpy_view()
+    a._host_keepalive = data
+    return a
+
+
+class TestArrayReshape(unittest.TestCase):
+    """WarpArray.reshape = upstream array.reshape (warp/_src/types.py:4860).
+
+    Zero-copy view semantics: same pointer, new shape, base kept alive
+    through the shared buffer reference; contiguous-only, one -1 inference,
+    exact size match. mjw's _cholesky_factorize_solve calls
+    ``grad.reshape(shape=(d.nworld, n, 1))`` (solver.py:3068/3085).
+    """
+
+    def test_mjw_shape_keyword_form(self):
+        a = _host_array((6,), wp.float32, values=[1.0, 2, 3, 4, 5, 6])
+        v = a.reshape(shape=(2, 3, 1))  # keyword: the mjw solver.py:3085 form
+        self.assertEqual(v.shape, (2, 3, 1))
+        self.assertEqual(v.size, 6)
+        self.assertEqual(v.ptr, a.ptr)  # zero-copy: same storage
+        self.assertEqual(v.numpy.ravel().tolist(), [1.0, 2, 3, 4, 5, 6])
+
+    def test_view_semantics_share_storage(self):
+        a = _host_array((4,), wp.float32)
+        v = a.reshape((2, 2))
+        v.numpy[1, 0] = 7.0
+        self.assertEqual(a.numpy[2], 7.0)  # write through the view hits the base
+
+    def test_int_shape_and_list_shape(self):
+        a = _host_array((6,), wp.float32)
+        self.assertEqual(a.reshape(6).shape, (6,))
+        self.assertEqual(a.reshape([2, 3]).shape, (2, 3))
+
+    def test_minus_one_inference(self):
+        a = _host_array((6,), wp.float32)
+        self.assertEqual(a.reshape((-1, 3)).shape, (2, 3))
+        self.assertEqual(a.reshape((2, -1)).shape, (2, 3))
+
+    def test_error_cases_match_upstream(self):
+        a = _host_array((6,), wp.float32)
+        with self.assertRaises(RuntimeError):
+            a.reshape(None)
+        with self.assertRaises(RuntimeError):
+            a.reshape((2, -1, -1))
+        with self.assertRaises(RuntimeError):
+            a.reshape((5,))
+        with self.assertRaises(RuntimeError):
+            a.reshape((1, 1, 1, 1, 1))
+        # the upstream message carries both shapes for debugging
+        with self.assertRaises(RuntimeError) as ctx:
+            a.reshape((5,))
+        self.assertIn("(6,)", str(ctx.exception))
+        self.assertIn("(5,)", str(ctx.exception))
+
+    def test_composite_dtype_reshapes_by_element_count(self):
+        a = _host_array((4,), wp.vec3f)
+        v = a.reshape((2, 2))
+        self.assertEqual(v.shape, (2, 2))
+        self.assertEqual(v.size, 4)
+        # the host view keeps warp's trailing component axis
+        self.assertEqual(v.numpy.shape, (2, 2, 3))
+
+
 class TestTileSyncPrelude(unittest.TestCase):
     def test_prelude_defines_tile_sync_before_all_sections(self):
         # the prelude is one shared compile unit (ROADMAP M2.2 discipline):

@@ -450,6 +450,77 @@ class WarpArray:
         view._build_numpy_view()
         return view
 
+    def reshape(self, shape):
+        """Return a reshaped zero-copy view (upstream array.reshape semantics,
+        warp/_src/types.py:4860: same pointer, new shape, base buffer kept
+        alive through the shared reference; mjw solver's _cholesky_
+        factorize_solve calls ``grad.reshape(shape=(...))``).
+
+        Contiguous arrays only (upstream check kept for parity — runtime
+        arrays here are always dense row-major). One ``-1`` dimension may be
+        inferred from the element count; the total must match. Upstream also
+        transfers the grad/read flags; this runtime rejects grad allocation,
+        so there is nothing to carry.
+        """
+        if not self.is_contiguous:
+            raise RuntimeError("Reshaping non-contiguous arrays is unsupported.")
+
+        # convert shape to tuple (upstream: int → 1-tuple, other iterables
+        # via tuple(); mjw passes shape=(...) as a keyword)
+        if shape is None:
+            raise RuntimeError("shape parameter is required.")
+        if isinstance(shape, int):
+            shape = (shape,)
+        elif not isinstance(shape, tuple):
+            shape = tuple(shape)
+
+        if len(shape) > 4:
+            # upstream ARRAY_MAX_DIMS
+            raise RuntimeError(
+                f"Arrays may only have 4 dimensions maximum, trying to create array with {len(shape)} dims."
+            )
+
+        # check for -1 dimension and reformat (upstream verbatim)
+        if -1 in shape:
+            idx = self.size
+            denom = 1
+            minus_one_count = 0
+            for i, d in enumerate(shape):
+                if d == -1:
+                    idx = i
+                    minus_one_count += 1
+                else:
+                    denom *= d
+            if minus_one_count > 1:
+                raise RuntimeError("Cannot infer shape if more than one index is -1.")
+            new_shape = list(shape)
+            new_shape[idx] = int(self.size / denom)
+            shape = tuple(new_shape)
+
+        size = 1
+        for d in shape:
+            size *= d
+
+        if size != self.size:
+            raise RuntimeError(
+                f"cannot reshape array of shape {self.shape} (size {self.size}) into shape {shape} (size {size})"
+            )
+
+        view = WarpArray.__new__(WarpArray)
+        view.device = self.device
+        view.dtype = self.dtype
+        view.shape = shape
+        view.n = self.n
+        view.np_dtype = self.np_dtype
+        view.item_bytes = self.item_bytes
+        view.is_composite = self.is_composite
+        view.offset_elems = self.offset_elems
+        view._buffer = self._buffer  # shared: release is owned by the base
+        view._owns_buffer = False
+        view._ptr = self._ptr
+        view._build_numpy_view()
+        return view
+
     def __getitem__(self, key):
         if isinstance(key, slice):
             if len(self.shape) == 0:
