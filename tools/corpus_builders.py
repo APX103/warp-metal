@@ -1377,6 +1377,251 @@ def b_qderiv_ellipsoid_fluid(rng):
     return (args, [])
 
 
+# ---------------------------------------------------------------------------
+# KEP-0001 M3.2 package c: mujoco_warp kernels whose closures use the
+# wp.add_inplace / wp.sub_inplace compound-element builtins (the codegen's
+# `v[i] += x` / `m[i,j] -= x` lowering for LOCAL vec/mat variables) and/or a
+# generic vecN dtype (vec10 cinert/crb). One shared linear-triangle flex
+# element scene (dim=2 → stretch path; the snh cubic path stays
+# runtime-unreachable but its closure still pins the mat6x6/vec10/vec6i
+# translation surface), plus a single 6-dof free body for the implicit-mass
+# multiply.
+#
+# Every array is in-bounds over the kernel's full index domain (the crba
+# fixture rule); single atomic writer per output slot where the kernel
+# scatters per body/edge.
+# ---------------------------------------------------------------------------
+
+
+_FLEX_WORLDS = 2
+
+
+def _flex_elem_layout(rng):
+    """Model+data arrays for one linear-triangle flex element (dim=2).
+
+    3 verts / 3 edges (edges (0,1),(1,2),(2,0)), one flex, one element;
+    flex_stiffness carries the 6 upper-triangle metric entries of
+    stretch_metric at indices 0..5 of the 21-slot dim=2 table. Deformed
+    vertex positions scale the rest triangle per-edge (1.15/0.95/1.05) so
+    every elongation, tension and hessian block is nonzero at O(1).
+    """
+    verts0 = np.array(
+        [[0.0, 0.0, 0.0], [1.0, 0.1, 0.0], [0.2, 1.1, 0.3]], dtype=np.float32
+    )
+    scale = np.array([1.15, 0.95, 1.05], dtype=np.float32)
+    verts_in = np.tile(verts0[None] * scale[None, :, None], (_FLEX_WORLDS, 1, 1))
+    e01, e12, e20 = (
+        np.linalg.norm(verts0[1] - verts0[0]),
+        np.linalg.norm(verts0[2] - verts0[1]),
+        np.linalg.norm(verts0[0] - verts0[2]),
+    )
+    length0 = np.array([e01, e12, e20], dtype=np.float32)
+    length_in = np.tile((length0 * scale)[None], (_FLEX_WORLDS, 1))
+    stiffness = np.zeros(21, dtype=np.float32)
+    # stretch_metric reads the upper triangle (e1<=e2): (0,0),(0,1),(0,2),
+    # (1,1),(1,2),(2,2)
+    stiffness[:6] = np.array([60.0, 12.0, 8.0, 55.0, 10.0, 50.0], dtype=np.float32)
+    model = {
+        "flex_dim": np.array([2], dtype=np.int32),
+        "flex_interp": np.array([0], dtype=np.int32),
+        "flex_vertadr": np.array([0], dtype=np.int32),
+        "flex_edgeadr": np.array([0], dtype=np.int32),
+        "flex_elemadr": np.array([0], dtype=np.int32),
+        "flex_elemdataadr": np.array([0], dtype=np.int32),
+        "flex_stiffnessadr": np.array([0], dtype=np.int32),
+        "flex_elemedgeadr": np.array([0], dtype=np.int32),
+        "flex_elemflexid": np.array([0], dtype=np.int32),
+        "flex_edge": np.array([[0, 1], [1, 2], [2, 0]], dtype=np.int32),
+        "flex_elem": np.array([0, 1, 2], dtype=np.int32),
+        "flex_elemedge": np.array([0, 1, 2], dtype=np.int32),
+        "flex_vert0": verts0,
+        "flexedge_length0": length0,
+        "flex_size": np.full((1, 3), 0.1, dtype=np.float32),
+        "flex_stiffness": stiffness,
+        "flex_rigid": np.array([False], dtype=bool),
+    }
+    data = {
+        "flexvert_xpos_in": verts_in.astype(np.float32),
+        "flexedge_length_in": length_in.astype(np.float32),
+        "flex_hessian_valid_in": np.zeros((_FLEX_WORLDS, 1), dtype=bool),
+    }
+    return model, data
+
+
+_FLEX_ELEM_KEYS = {
+    "flex_dim": "arr:i32",
+    "flex_interp": "arr:i32",
+    "flex_vertadr": "arr:i32",
+    "flex_edgeadr": "arr:i32",
+    "flex_elemadr": "arr:i32",
+    "flex_elemdataadr": "arr:i32",
+    "flex_stiffnessadr": "arr:i32",
+    "flex_elemedgeadr": "arr:i32",
+    "flex_elemflexid": "arr:i32",
+    "flex_vertbodyid": "arr:i32",
+    "flex_edge": "arr:vec2i",
+    "flex_elem": "arr:i32",
+    "flex_elemedge": "arr:i32",
+    "flex_vert0": "arr:vec3",
+    "flexedge_length0": "arr:f32",
+    "flex_size": "arr:vec3",
+    "flex_stiffness": "arr:f32",
+    "flex_damping": "arr:f32",
+    "flex_rigid": "arr:bool",
+}
+
+
+def b_flex_hessian_elem(rng):
+    """mujoco_warp passive._flex_hessian_elem(deterministic=False): per-edge
+    stretch 3x3 hessian blocks — the closure carries wp.add_inplace through
+    stretch_stiffness_block (`blk[r,c] += w * ...` on a local mat33) and
+    _snh_cubic_metric (`metric[i,j] += value` on a local mat66) plus
+    _snh_eigen3 (`B[0,0] -= mean`, sub_inplace mat33). dim=2 walks the
+    stretch path at runtime (snh needs dim=3); one element, one writer per
+    (world, edge) hessian slot."""
+    model, data = _flex_elem_layout(rng)
+    args = [
+        (name, _FLEX_ELEM_KEYS[name], model[name])
+        for name in (
+            "flex_dim", "flex_interp", "flex_vertadr", "flex_edgeadr", "flex_elemadr",
+            "flex_elemdataadr", "flex_stiffnessadr", "flex_elemedgeadr", "flex_edge",
+            "flex_elem", "flex_elemedge", "flex_vert0", "flexedge_length0", "flex_size",
+            "flex_stiffness", "flex_rigid", "flex_elemflexid",
+        )
+    ]
+    args += [
+        ("flexvert_xpos_in", "arr2:vec3", data["flexvert_xpos_in"]),
+        ("flex_hessian_valid_in", "arr2:bool", data["flex_hessian_valid_in"]),
+        ("flexedge_length_in", "arr2:f32", data["flexedge_length_in"]),
+        ("flexedge_hessian_out", "out2:mat33", (_FLEX_WORLDS, 3)),
+        ("__dim__", "", (_FLEX_WORLDS, 1)),
+    ]
+    return (args, [])
+
+
+def b_flex_elasticity(rng):
+    """mujoco_warp passive._flex_elasticity(deterministic=False): flex spring
+    and damper body forces — wp.sub_inplace through the `force_spring[vi,x] -=
+    s_val * g_val` compound assign on a local wp.matrix (6,3). Spring AND
+    damper paths live (dsbl flags False, flex_damping 0.8 / timestep 0.4 →
+    kD 2.0); three verts on three distinct bodies keep one atomic writer per
+    (world, body) force slot."""
+    model, data = _flex_elem_layout(rng)
+    model["flex_vertbodyid"] = np.array([0, 1, 2], dtype=np.int32)
+    model["flex_damping"] = np.array([0.8], dtype=np.float32)
+    args = [("opt_timestep", "arr:f32", np.full(_FLEX_WORLDS, 0.4, dtype=np.float32))]
+    args += [
+        (name, _FLEX_ELEM_KEYS[name], model[name])
+        for name in (
+            "flex_dim", "flex_vertadr", "flex_edgeadr", "flex_elemadr", "flex_elemdataadr",
+            "flex_stiffnessadr", "flex_elemedgeadr", "flex_vertbodyid", "flex_elem",
+            "flex_elemedge", "flexedge_length0", "flex_stiffness", "flex_damping",
+            "flex_elemflexid",
+        )
+    ]
+    args += [
+        ("xipos_in", "arr2:vec3", (rng.standard_normal((_FLEX_WORLDS, 3, 3)) * 0.1).astype(np.float32)),
+        ("flexvert_xpos_in", "arr2:vec3", data["flexvert_xpos_in"]),
+        ("flexedge_length_in", "arr2:f32", data["flexedge_length_in"]),
+        ("flexedge_velocity_in", "arr2:f32", (rng.standard_normal((_FLEX_WORLDS, 3)) * 0.5).astype(np.float32)),
+        ("dsbl_spring", "scalar:bool", False),
+        ("dsbl_damper", "scalar:bool", False),
+        ("flex_spring_body_force_out", "out2:spatial_vector", (_FLEX_WORLDS, 3)),
+        ("flex_damper_body_force_out", "out2:spatial_vector", (_FLEX_WORLDS, 3)),
+        ("__dim__", "", (_FLEX_WORLDS, 1)),
+    ]
+    return (args, [])
+
+
+def b_cinert(rng):
+    """mujoco_warp smooth._cinert(): body cinert 10-vectors — vec10 register
+    vector locals (`res = vec10()` with `res[i] += / -= / =` compound
+    element assigns) and a vec10 composite array store. Three bodies with
+    positive mass/inertia; ximat random rotations; body_rootid 0 keeps the
+    com offset live (dif != 0)."""
+    nworld, nbody = _FLEX_WORLDS, 3
+    mass = np.tile(rng.uniform(0.5, 2.0, nbody)[None], (nworld, 1)).astype(np.float32)
+    inertia = np.tile(rng.uniform(0.05, 0.4, (1, nbody, 3)), (nworld, 1, 1)).astype(np.float32)
+    args = [
+        ("body_rootid", "arr:i32", np.zeros(nbody, dtype=np.int32)),
+        ("body_mass", "arr2:f32", mass),
+        ("body_inertia", "arr2:vec3", inertia),
+        ("xipos_in", "arr2:vec3", (rng.standard_normal((nworld, nbody, 3)) * 0.2).astype(np.float32)),
+        ("ximat_in", "arr2:mat33", (rng.standard_normal((nworld, nbody, 9)) * 0.1).astype(np.float32)),
+        ("subtree_com_in", "arr2:vec3", (rng.standard_normal((nworld, nbody, 3)) * 0.1).astype(np.float32)),
+        ("cinert_out", "out2:vec10", (nworld, nbody)),
+        ("__dim__", "", (nworld, nbody)),
+    ]
+    return (args, [])
+
+
+def b_implicit_free_body(rng):
+    """mujoco_warp forward._implicit_free_body(solve=False): the implicit
+    mass matrix of one standalone 6-dof free body, multiplied by a vector —
+    wp.add_inplace (damping diagonal + gyroscopic blocks) and wp.sub_inplace
+    (box-fluid J'B J subtraction) on a local mat66, plus a vec10 composite
+    array load (crb_in, subtree mass at index 9). Dense 6x6 M CSR
+    (rownnz 6, colind [0..5] per row); DAMPER enabled, SLEEP off, density
+    > 0 with body_fluid_ellipsoid False routes the fluid derivative through
+    the _deriv_box_fluid branch (body 1 mass >= MJ_MINVAL)."""
+    nworld, nbody, nv = _FLEX_WORLDS, 2, 6
+    mass = np.zeros((nworld, nbody), dtype=np.float32)
+    mass[:, 1] = 1.2
+    inertia = np.zeros((nworld, nbody, 3), dtype=np.float32)
+    inertia[:, 1, :] = np.array([0.08, 0.1, 0.12], dtype=np.float32)
+    m_dense = rng.standard_normal((nworld, nv, nv)) * 0.1
+    m_dense = (m_dense + np.transpose(m_dense, (0, 2, 1)) + 4.0 * np.eye(nv)[None]).astype(np.float32)
+    crb = np.zeros((nworld, nbody, 10), dtype=np.float32)
+    crb[:, 1, 0:6] = np.array([0.08, 0.1, 0.12, 0.01, 0.0, 0.02], dtype=np.float32)
+    crb[:, 1, 6:9] = np.array([0.05, -0.03, 0.02], dtype=np.float32)
+    crb[:, 1, 9] = 1.2
+    args = [
+        ("nbody", "scalar:i32", nbody),
+        ("opt_timestep", "arr:f32", np.full(nworld, 0.4, dtype=np.float32)),
+        ("opt_wind", "arr:vec3", np.full((nworld, 3), 0.1, dtype=np.float32)),
+        ("opt_density", "arr:f32", np.full(nworld, 1000.0, dtype=np.float32)),
+        ("opt_viscosity", "arr:f32", np.full(nworld, 1.0, dtype=np.float32)),
+        ("opt_integrator", "scalar:i32", 2),
+        ("opt_disableflags", "scalar:i32", 0),
+        ("opt_enableflags", "scalar:i32", 0),
+        ("body_rootid", "arr:i32", np.array([0, 1], dtype=np.int32)),
+        ("body_dofadr", "arr:i32", np.array([-1, 0], dtype=np.int32)),
+        ("body_geomnum", "arr:i32", np.zeros(nbody, dtype=np.int32)),
+        ("body_geomadr", "arr:i32", np.zeros(nbody, dtype=np.int32)),
+        ("body_mass", "arr2:f32", mass),
+        ("body_inertia", "arr2:vec3", inertia),
+        ("dof_treeid", "arr:i32", np.zeros(nv, dtype=np.int32)),
+        ("dof_damping", "arr2:f32", np.full((nworld, nv), 0.3, dtype=np.float32)),
+        ("dof_dampingpoly", "arr2:vec2", np.zeros((nworld, nv, 2), dtype=np.float32)),
+        ("geom_type", "arr:i32", np.array([4], dtype=np.int32)),
+        ("geom_size", "arr2:vec3", np.full((nworld, 1, 3), 0.2, dtype=np.float32)),
+        ("geom_fluid", "arr2:f32", np.zeros((1, 12), dtype=np.float32)),
+        ("M_rownnz", "arr:i32", np.full(nv, nv, dtype=np.int32)),
+        ("M_rowadr", "arr:i32", np.arange(nv, dtype=np.int32) * nv),
+        ("M_colind", "arr:i32", np.tile(np.arange(nv, dtype=np.int32), nv)),
+        ("body_fluid_ellipsoid", "arr:bool", np.zeros(nbody, dtype=bool)),
+        ("body_freeadr", "arr:i32", np.array([1], dtype=np.int32)),
+        ("qvel_in", "arr2:f32", (rng.standard_normal((nworld, nv)) * 0.3).astype(np.float32)),
+        ("xpos_in", "arr2:vec3", (rng.standard_normal((nworld, nbody, 3)) * 0.1).astype(np.float32)),
+        ("xmat_in", "arr2:mat33", (rng.standard_normal((nworld, nbody, 9)) * 0.1).astype(np.float32)),
+        ("xipos_in", "arr2:vec3", (rng.standard_normal((nworld, nbody, 3)) * 0.1).astype(np.float32)),
+        ("ximat_in", "arr2:mat33", (rng.standard_normal((nworld, nbody, 9)) * 0.1).astype(np.float32)),
+        ("geom_xpos_in", "arr2:vec3", (rng.standard_normal((nworld, 1, 3)) * 0.1).astype(np.float32)),
+        ("geom_xmat_in", "arr2:mat33", (rng.standard_normal((nworld, 1, 9)) * 0.1).astype(np.float32)),
+        ("subtree_com_in", "arr2:vec3", (rng.standard_normal((nworld, nbody, 3)) * 0.1).astype(np.float32)),
+        ("cdof_in", "arr2:spatial_vector", (rng.standard_normal((nworld, nv, 6)) * 0.1).astype(np.float32)),
+        ("crb_in", "arr2:vec10", crb),
+        ("M_in", "arr2:f32", m_dense.reshape(nworld, nv * nv)),
+        ("tree_awake_in", "arr2:i32", np.ones((nworld, 1), dtype=np.int32)),
+        ("cvel_in", "arr2:spatial_vector", (rng.standard_normal((nworld, nbody, 6)) * 0.1).astype(np.float32)),
+        ("solve", "scalar:bool", False),
+        ("vec_in", "arr2:f32", (rng.standard_normal((nworld, nv)) * 0.5).astype(np.float32)),
+        ("vec_out", "out2:f32", (nworld, nv)),
+        ("__dim__", "", (nworld, 1)),
+    ]
+    return (args, [])
+
+
 BUILDERS = {
     name[2:]: fn  # strip leading "b_"
     for name, fn in list(globals().items())

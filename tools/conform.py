@@ -456,41 +456,32 @@ CORPUS_TABLE = [
         "qderiv_ellipsoid_fluid",
         ("_qderiv_ellipsoid_fluid", [False]),
     ),
-    # wp.matrix/wp.diag/wp.identity rows whose closures still carry a second
-    # M3.1 miss beyond the P1 builtins (ratchet: justified builder-None rows)
-    ("mujoco_warp._src.passive", "_flex_hessian_elem", None),
-    ("mujoco_warp._src.passive", "_flex_elasticity", None),
-    ("mujoco_warp._src.smooth", "_cinert", None),
-    ("mujoco_warp._src.forward", "_implicit_free_body", None),
+    # wp.add_inplace / wp.sub_inplace / vec10 rows (KEP-0001 M3.2 package c:
+    # the compound-element builtins and the generic vecN def now lower —
+    # ACTIVE rows over the mujoco_warp 3.17.0 closures that use them)
+    (
+        "mujoco_warp._src.passive",
+        "_flex_hessian_elem",
+        "flex_hessian_elem",
+        ("_flex_hessian_elem", [False]),
+    ),
+    (
+        "mujoco_warp._src.passive",
+        "_flex_elasticity",
+        "flex_elasticity",
+        ("_flex_elasticity", [False]),
+    ),
+    ("mujoco_warp._src.smooth", "_cinert", "cinert"),
+    ("mujoco_warp._src.forward", "_implicit_free_body", "implicit_free_body"),
 ]
 
 _GJK_SKIP = "GJK/MPR factory kernel calls @wp.func_native support functions (Metal translation: Phase 2)"
 _ARTICULATION_SKIP = "articulation FK needs a joint-model fixture (builder pending)"
-# explicit exemptions for builder-None rows (ratchet: each must stay justified)
 _SKIP_BY_KERNEL = {
     "narrow_phase_kernel_gjk_mpr": _GJK_SKIP,
     "narrow_phase_find_mesh_triangle_overlaps_kernel": _GJK_SKIP,
     "mesh_triangle_contacts_to_reducer_kernel": _GJK_SKIP,
     "eval_articulation_fk": _ARTICULATION_SKIP,
-    # KEP-0001 M3.2 P1: the P1 builtins themselves (identity/matrix/diag)
-    # now lower, but these closures carry a SECOND M3.1 matrix miss each —
-    # reported as the next package, not silently expanded here
-    "_flex_hessian_elem": (
-        "closure needs wp::add_inplace (metric[i,j] += value in _snh_cubic_metric) "
-        "MSL lowering — identity/matrix/determinant builtins themselves now lower (M3.2)"
-    ),
-    "_flex_elasticity": (
-        "closure needs wp::sub_inplace (force_spring[vi,x] -= value) MSL lowering — "
-        "the wp.matrix int-table (6x2) + fill (6x3) lowering itself landed in M3.2"
-    ),
-    "_cinert": (
-        "closure needs wp::vec_t<10> register-vector MSL mapping (mujoco_warp vec10 "
-        "cinert_out) — M3.1 matrix miss beyond the P1 diag builtin, which now lowers"
-    ),
-    "_implicit_free_body": (
-        "closure needs wp::add_inplace (element augment on the M block) MSL lowering — "
-        "M3.1 matrix miss beyond the P1 diag builtin, which now lowers"
-    ),
 }
 _DEFAULT_SEED = 20261113
 CORPUS_NPZ = Path(__file__).resolve().parent / "corpus_golden.npz"
@@ -517,6 +508,14 @@ def _resolve_kernel(mod, qualname, factory):
 
 def _corpus_dtype(pkg, key: str):
     """Element dtype object for a corpus dtype key, per side's wp package."""
+    if key == "vec10":
+        # mujoco_warp's 10-component vector (cinert/crb): the kernel
+        # annotations carry this exact type object on both sides, so the
+        # array dtype must be it (a plain vector(10) would fail the launch
+        # dtype check on the golden side)
+        from mujoco_warp._src.types import vec10
+
+        return vec10
     return {
         "f32": pkg.float32, "i32": pkg.int32, "i64": pkg.int64, "u32": pkg.uint32, "u64": pkg.uint64,
         "bool": pkg.bool, "vec2": pkg.vec2, "vec3": pkg.vec3, "vec4": pkg.vec4, "vec2i": pkg.vec2i,
@@ -553,6 +552,7 @@ def _arr_view(arr):
 _COMPOSITE_DTYPE_KEYS = {
     "vec2", "vec3", "vec4", "vec2i", "vec3i", "vec4i",
     "mat33", "transform", "spatial_vector", "spatial_matrix",
+    "vec10",
 }
 
 
