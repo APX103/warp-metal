@@ -1472,6 +1472,17 @@ class _BodyTranslator:
         self.uniform_vars: set[str] = set()
         self.uniform_ranges: set[str] = set()
         self._tid_vars: set[str] = set()
+        # uniformity scope snapshots: the SSA declares each scope's own var
+        # numbers in a decl block (shadowing any outer number), while defs of
+        # function-scope vars inside a branch persist past the close — so on
+        # close only the scope's DECLARED names roll back to the snapshot
+        self._uniform_scopes: list[tuple[frozenset[str], frozenset[str], set[str]]] = []
+        # uniform-address load tracking: ptr var → array arg it addresses
+        # (all indices provably block-uniform), and the array args that
+        # receive a store anywhere in the kernel (those lose the privilege:
+        # a lane could change the value between lanes' loads)
+        self._uniform_addr: dict[str, str] = {}
+        self._stored_arrays: set[str] = set()
         # tiled kernels: SSA tile var -> TileVar (threadgroup-backed shared
         # array or the per-thread one-element register form); plus
         # compile-time SSA constants (const var = literal) for tile_extract
@@ -1687,6 +1698,10 @@ class _BodyTranslator:
         its own token) are skipped; their arguments carry the classification.
         Anything not tracked as uniform — array loads, tid-derived values,
         opaque calls — classifies divergent."""
+        # numeric literals first: their exponent/hex/suffix letters
+        # (`9.5367432e-07`, `0x1F`, `2.0f`) would otherwise tokenize as
+        # untracked identifiers and poison constant-only expressions
+        expr = re.sub(r"\b\d[\w.]*", " ", expr)
         for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", expr):
             tok = m.group(0)
             if expr[max(0, m.start() - 2) : m.start()] == "::":
@@ -1702,37 +1717,85 @@ class _BodyTranslator:
         """Track provable block-uniformity from raw SSA assignment lines
         (before statement routing — the classification is SSA-level, not
         emission-level)."""
+        # scope tracking: the SSA declares each scope's own var numbers in a
+        # decl block (shadowing any outer number), while defs of
+        # function-scope vars inside a branch persist past the close — so on
+        # close only the scope's DECLARED names roll back to the snapshot
+        m_lbl = _RE_LABEL.match(stripped)
+        if _RE_IF_OPEN.match(stripped) or (m_lbl and m_lbl.group(1) == "start"):
+            snap = (frozenset(self.uniform_vars), frozenset(self.uniform_ranges))
+            self._uniform_scopes.append((snap[0], snap[1], set()))
+            return
+        if _RE_ELSE.match(stripped) or _RE_BRACE_CLOSE.match(stripped) or (
+            m_lbl and m_lbl.group(1) == "end"
+        ):
+            if not self._uniform_scopes:
+                return
+            saved_vars, saved_ranges, decls = self._uniform_scopes[-1]
+            # else: the `}` ends the then-scope and `{` opens the else-scope —
+            # restore its decl'd names but keep the frame for the else close
+            pop = not _RE_ELSE.match(stripped)
+            for n in decls:
+                if n in saved_vars:
+                    self.uniform_vars.add(n)
+                else:
+                    self.uniform_vars.discard(n)
+                if n in saved_ranges:
+                    self.uniform_ranges.add(n)
+                else:
+                    self.uniform_ranges.discard(n)
+            if pop:
+                self._uniform_scopes.pop()
+            return
         m = re.match(
             r"^([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)"
             r"\s*=\s*wp::tid\(\);",
             stripped,
         )
-        if m:
-            for t in m.group(1).split(","):
-                self._tid_vars.add(t.strip())
+        m_b = re.match(r"^builtin_tid(\d)d\(([A-Za-z0-9_,\s]+)\)\s*;?$", stripped)
+        if m or m_b:
+            if m_b:
+                names = [t.strip() for t in m_b.group(2).split(",") if t.strip()]
+            else:
+                names = [t.strip() for t in m.group(1).split(",")]
+            for t in names:
+                self._tid_vars.add(t)
+            # launch_tiled (plain launches never pass block_dim — see
+            # _unit_for): the runtime tid helper hands out
+            # (block coords ..., lane) — every coordinate except the LAST is
+            # shared verbatim by every lane of the block, so the mujoco
+            # `worldid, dof_block_id, tid = wp.tid()` heads classify
+            # block-uniform and only the lane stays divergent
+            if self.unit.block_dim is not None and self.unit.block_dim > 1 and len(names) > 1:
+                for t in names[:-1]:
+                    self.uniform_vars.add(t)
             return
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?);?$", stripped)
         if not m:
-            # typed const/scalar decl (`const wp::int32 var_k = 0;`) — the
-            # block_size/border_size constants feeding range bounds arrive
-            # this way; a missed seed would poison the whole chain
+            # typed decl with init (`const wp::int32 var_k = 0;` /
+            # `wp::vec_t<3, wp::float32> var_v = wp::vec_t<...>(...);`) — the
+            # block_size/border_size constants feeding range bounds and the
+            # linesearch's vec-component constants arrive this way; a missed
+            # seed would poison the whole chain
             m = re.match(
-                r"^(?:const\s+)?(?:bool|char|short|int|long|float|double|half"
-                r"|unsigned|signed|wp::(?:int|uint|bool)\d*|uint\d+_t|int\d+_t)"
+                r"^(?:const\s+)?[A-Za-z_][A-Za-z0-9_:]*(?:<[^;=]*>)?"
                 r"\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?);?$",
                 stripped,
             )
         if not m:
-            # bare typed decl (`wp::range_t var_73;`) — a fresh var number:
-            # invalidate any classification from the block that used this
-            # number before (SSA numbers are block-scoped)
+            # bare typed decl (`wp::range_t var_73;` / `wp::float32* var_p;` /
+            # `wp::vec_t<3, wp::float32> var_v;`) — a fresh var number whose
+            # scope owns this name: register it with the open scope (the
+            # close rolls its classification back) and invalidate any
+            # classification from the block that used this number before
             m = re.match(
-                r"^(?:const\s+)?(?:bool|char|short|int|long|float|double|half"
-                r"|unsigned|signed|wp::[A-Za-z_0-9]+|uint\d+_t|int\d+_t)"
-                r"\s+([A-Za-z_][A-Za-z0-9_]*);$",
+                r"^(?:const\s+)?[A-Za-z_][A-Za-z0-9_:]*(?:<[^;]*>)?\s*\**\s*"
+                r"([A-Za-z_][A-Za-z0-9_]*)\s*;\s*$",
                 stripped,
             )
             if m:
+                if self._uniform_scopes:
+                    self._uniform_scopes[-1][2].add(m.group(1))
                 self.uniform_vars.discard(m.group(1))
                 self.uniform_ranges.discard(m.group(1))
             return
@@ -1740,15 +1803,95 @@ class _BodyTranslator:
         # SSA var numbers are block-scoped and get REUSED across basic
         # blocks (var_73 is a range iterator in one loop, a tile load in the
         # next) — every reassignment must invalidate the previous
-        # classification, not just potentially add a new one
+        # classification, not just potentially add a new one. Self-referencing
+        # phis (`flag = flag && cond;`) read the pre-line value, so snapshot
+        # the membership BEFORE the discard
+        self_phi = name in self.uniform_vars
         self.uniform_vars.discard(name)
         self.uniform_ranges.discard(name)
+        # uniform-address load: `var_p = wp::address(var_arr, i0, i1, ...)` —
+        # every lane computing the SAME address reads the same bytes, so a
+        # load through this pointer is block-uniform unless the array is
+        # stored to within this kernel (a lane could change the value
+        # between lanes' loads). This is what admits mujoco's parameter
+        # loads (`opt_tolerance[worldid % shape]`) — worldid is a block
+        # coordinate — while lane-indexed loads (`efc_D_in[worldid, tid]`)
+        # stay divergent.
+        m_ad = re.match(
+            r"^(var_\w+)\s*=\s*wp::address\(var_(\w+)\s*(?:,\s*(.*?))?\)\s*;?$",
+            stripped,
+            re.DOTALL,
+        )
+        if m_ad:
+            arr = "var_" + m_ad.group(2)
+            idxs = split_args(m_ad.group(3)) if m_ad.group(3) else []
+            # a reused SSA number re-addresses: the stale entry must not
+            # survive a divergent re-address
+            self._uniform_addr.pop(m_ad.group(1), None)
+            if arr not in self._stored_arrays and all(self._is_uniform_expr(a) for a in idxs):
+                self._uniform_addr[m_ad.group(1)] = arr
+            return
+        m_ld = re.match(r"^(var_\w+)\s*=\s*wp::load\((var_\w+)\)\s*;?$", stripped)
+        if m_ld:
+            addr = self._uniform_addr.get(m_ld.group(2))
+            if addr is not None and addr not in self._stored_arrays:
+                self.uniform_vars.add(m_ld.group(1))
+            return
+        # shape metadata pointer: `var_p = &(var_arr.shape);` — launch-bound
+        # metadata is identical for every lane, so loads through it
+        # (`var_n = wp::load(var_p)` → the dims vector feeding
+        # `worldid % shape[0]`) are block-uniform
+        m_sp = re.match(r"^(var_\w+)\s*=\s*&\((var_\w+)\.shape\)\s*;?$", stripped)
+        if m_sp:
+            self._uniform_addr[m_sp.group(1)] = "__shape__"
+            return
+        # loop-carried phi move: `wp::assign(var_dst, var_src);` (the 2-arg
+        # scalar form — the 4-arg form is the tile element store) — the dst
+        # takes the src's classification (SSA numbers are reused, so the
+        # stale classification must be replaced, not kept)
+        m_as = re.match(r"^wp::assign\(var_(\w+),\s*var_(\w+)\)\s*;?$", stripped)
+        if m_as:
+            dst = f"var_{m_as.group(1)}"
+            src = f"var_{m_as.group(2)}"
+            self.uniform_vars.discard(dst)
+            if src in self.uniform_vars:
+                self.uniform_vars.add(dst)
+            return
         m_r = re.match(r"^wp::range\((.*)\)$", rhs, re.DOTALL)
         if m_r:
             if self._is_uniform_expr(m_r.group(1)):
                 self.uniform_ranges.add(name)
             return
-        # tile-typed values are never scalar-uniform
+        # a block-reduce result is definitionally block-uniform: the emitted
+        # fold leaves the value in the tile's own one-element scratch and
+        # every lane reads the same broadcast (see _tile_reduce). The mjw
+        # linesearch guards its second reduction with `if not ls_converged`
+        # where ls_converged chains entirely through gauss_sum[0]/p0_sum[0].
+        if re.match(r"^wp::tile_(?:reduce|sum|min|max|argmin|argmax)\(", rhs):
+            self.uniform_vars.add(name)
+            return
+        # component extraction of a tracked-uniform source stays uniform
+        # (tile_extract reads the reduce scratch; extract indexes a uniform
+        # vector/tuple): same address — or an index-selected lane of the same
+        # value — on every thread. The SOURCE must itself be tracked, never
+        # assumed; extraction of a load-derived value stays divergent.
+        m_e = re.match(r"^wp::(?:tile_)?extract\(([A-Za-z_][A-Za-z0-9_]*),\s*(.+)\)$", rhs, re.DOTALL)
+        if m_e and m_e.group(1) in self.uniform_vars and self._is_uniform_expr(m_e.group(2)):
+            self.uniform_vars.add(name)
+            return
+        # a user @wp.func call with every argument uniform is itself uniform:
+        # warp funcs are pure functions of their arguments (a callee that
+        # touches memory must take an array param, and array args are never
+        # tracked uniform, so the call stays divergent above); native
+        # snippets in the closure are void tile-syncs and are never assigned
+        m_u = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\((.*)\)$", rhs, re.DOTALL)
+        if m_u:
+            args = split_args(m_u.group(2)) if m_u.group(2).strip() else []
+            if all(self._is_uniform_expr(a) for a in args):
+                self.uniform_vars.add(name)
+                return
+        # tile-typed values are never scalar-uniform (tile_load/view/store
+        # results — the reduce/extract forms above returned already)
         if "wp::tile_" in rhs:
             return
         # data-dependent loads and opaque calls stay divergent (conservative)
@@ -1763,7 +1906,14 @@ class _BodyTranslator:
             if m_i.group(1) in self.uniform_ranges:
                 self.uniform_vars.add(name)
             return
-        if self._is_uniform_expr(rhs):
+        # self-referencing phi (`flag = flag && cond;`): the rhs reads the
+        # dst's OWN pre-line value, which was classified at its earlier def
+        # — substitute it out before the generic check (the discard above
+        # would otherwise poison every loop-carried uniform flag)
+        gen_rhs = rhs
+        if self_phi and re.search(rf"\b{name}\b", gen_rhs):
+            gen_rhs = re.sub(rf"\b{name}\b", "1", gen_rhs)
+        if self._is_uniform_expr(gen_rhs):
             self.uniform_vars.add(name)
 
     def _check_uniform(self, what: str) -> None:
@@ -5617,6 +5767,32 @@ def _translate_function(
         tr.used_shr.append((slot, elem, "+"))
     section = None
     depth = 0  # emitted-brace depth; 0 → the C++ function's closing brace
+    # store screen for the uniform-address load rule: resolve every store /
+    # atomic / copy target through the kernel's address() sites and mark the
+    # array as written — a written array must not feed a uniformity argument
+    # (a lane could change the value between lanes' loads). array_store names
+    # the array directly; store/copy/atomic go through address() vars.
+    if unit.block_dim is not None and unit.block_dim > 1:
+        addr_of: dict[str, str] = {}
+        for ln in lines[body_start:]:
+            m_a = re.search(r"\b(var_\w+)\s*=\s*wp::address\(var_(\w+)", ln)
+            if m_a:
+                addr_of[m_a.group(1)] = "var_" + m_a.group(2)
+                continue
+            m_d = re.search(r"wp::array_store\(var_(\w+)", ln)
+            if m_d:
+                tr._stored_arrays.add("var_" + m_d.group(1))
+                continue
+            if re.search(r"wp::(?:store|copy|atomic_\w+)\(", ln):
+                m_s = re.search(r"wp::(?:store|copy|atomic_\w+)\(\s*(var_\w+)", ln)
+                arr = None
+                if m_s:
+                    arr = addr_of.get(m_s.group(1))
+                if arr is None:
+                    m_d2 = re.search(r"wp::address\(var_(\w+)", ln)
+                    arr = "var_" + m_d2.group(1) if m_d2 else None
+                if arr:
+                    tr._stored_arrays.add(arr)
     for line in lines[body_start:]:
         if m := _RE_SEC.match(line):
             section = m.group(1)

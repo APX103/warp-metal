@@ -38,6 +38,7 @@ from pathlib import Path
 import warp_metal as wp
 from warp_metal.msl.prelude import PRELUDE
 from warp_metal.msl.translate import _shr_elem_bytes, translate_kernel
+from warp_metal.msl.translate import TranslationError
 
 # tools/ is not a package; load the checker module by path
 _TOOLS = Path(__file__).resolve().parent.parent / "tools"
@@ -317,6 +318,81 @@ def k_tile_template_call(x: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=
 def k_tile_load_nobc(x: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
     t = wp.tile_load(x, shape=(8, 8), storage="shared", bounds_check=False)
     wp.tile_store(out, t)
+
+
+# ---- barrier-uniformity pins (M3.2 fix pass 2) ----
+
+
+@wp.func
+def _uniform_scale(x: float) -> float:
+    return x * 2.0
+
+
+@wp.kernel
+def k_uniform_if_reduce(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    # mujoco linesearch shape: a second reduction guarded by a condition
+    # derived from the FIRST reduction's result — a block reduce is
+    # definitionally block-uniform (every lane reads the same broadcast)
+    t = wp.tile_load(x, shape=(8,), storage="shared")
+    s = wp.tile_reduce(wp.add, t)
+    v = wp.tile_extract(s, 0)
+    g = _uniform_scale(0.5)
+    if v > g:
+        t2 = wp.tile_load(x, shape=(8,), storage="shared")
+        s2 = wp.tile_reduce(wp.add, t2)
+        wp.tile_store(out, s2)
+
+
+@wp.kernel
+def k_uniform_load_if(
+    x: wp.array2d(dtype=wp.float32), out: wp.array(dtype=wp.float32), k: int
+):
+    # worldid (block coordinate) indexed parameter load + scalar param:
+    # every lane computes the same address, reads the same bytes
+    i, lane = wp.tid()
+    thr = x[i, 0] * wp.float(k)
+    if thr > 0.5:
+        t = wp.tile_load(x, shape=(8, 1), storage="shared")
+        s = wp.tile_reduce(wp.add, t)
+        wp.tile_store(out, s)
+
+
+@wp.kernel
+def k_lane_if_tile(x: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    # lane-derived condition: genuinely divergent — must keep failing loud
+    i, lane = wp.tid()
+    if lane == 0:
+        t = wp.tile_load(x, shape=(8,), storage="shared")
+        s = wp.tile_reduce(wp.add, t)
+        wp.tile_store(out, s)
+
+
+@wp.kernel
+def k_lane_load_if(x: wp.array2d(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+    # lane-indexed load: divergent addresses — must keep failing loud
+    i, lane = wp.tid()
+    v = x[i, lane]
+    if v > 0.5:
+        t = wp.tile_load(x, shape=(8, 1), storage="shared")
+        s = wp.tile_reduce(wp.add, t)
+        wp.tile_store(out, s)
+
+
+@wp.func
+def _tile_if_clone(t: wp.tile[float, 8, 1], out: wp.array2d(dtype=wp.float32), flag: int):
+    # uniform if INSIDE a callee clone: the scalar param seeds the clone's
+    # uniform set (callee-clone context propagation)
+    if flag > 0:
+        v = wp.tile_view(t, shape=(8, 1), offset=(0, 0))
+        wp.tile_store(out, wp.tile_map(wp.mul, v, 0.5), bounds_check=False)
+
+
+@wp.kernel
+def k_tile_clone_uniform_if(
+    x: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32), flag: int
+):
+    t = wp.tile_load(x, shape=(8, 1), storage="shared")
+    _tile_if_clone(t, out, flag)
 
 
 # ---- checker self-tests ----
@@ -902,6 +978,52 @@ class TestTileLoadScratchScope(unittest.TestCase):
         unit_bc = translate_kernel(k_tile_jtdaj_ops, options={"block_dim": _JTDAJ_OPS_BD})
         self.assertTrue(any("_wp_z = {};" in l for l in unit_bc.kernel.lines))
         self.assertFalse(any("_wp_z" in l for l in unit.kernel.lines))
+
+
+class TestBarrierUniformityPins(unittest.TestCase):
+    """M3.2 fix-pass-2 pins for the barrier-uniformity checkpoint.
+
+    Coordinator ruling (autonomous mode, recorded for close-out review): a
+    branch whose condition is PROVABLY block-uniform is not a divergent
+    branch — every lane takes the same path, so the cooperative tile
+    lowering (threadgroup barriers) is well-defined and matches upstream
+    observable semantics. Uniformity sources, all conservative dataflow:
+    reduce results (the fold's scratch broadcast), extraction of a tracked
+    source, pure user-func calls over uniform arguments, worldid/block-coord
+    tid components and uniform-address parameter loads (with a store screen),
+    and loop indices over uniform ranges. Lane-derived conditions keep
+    failing loud."""
+
+    BD = 8  # tiled semantics: tid = (block coord, lane)
+
+    def test_reduce_derived_if_accepted(self):
+        unit = translate_kernel(k_uniform_if_reduce, options={"block_dim": self.BD})
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+    def test_uniform_load_if_accepted(self):
+        unit = translate_kernel(k_uniform_load_if, options={"block_dim": self.BD})
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+    def test_callee_clone_uniform_if(self):
+        unit = translate_kernel(k_tile_clone_uniform_if, options={"block_dim": self.BD})
+        clones = [f for f in unit.functions if "__shr" in f.name]
+        self.assertEqual(len(clones), 1)
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+    def test_lane_if_rejected(self):
+        with self.assertRaises(TranslationError):
+            translate_kernel(k_lane_if_tile, options={"block_dim": self.BD})
+
+    def test_lane_load_if_rejected(self):
+        with self.assertRaises(TranslationError):
+            translate_kernel(k_lane_load_if, options={"block_dim": self.BD})
+
+    def test_plain_launch_bypasses_checkpoint(self):
+        # block_dim=1 (the plain-launch convention) cannot diverge
+        translate_kernel(k_lane_if_tile, options={"block_dim": 1})
 
 
 class TestClosureVecOverloads(unittest.TestCase):
