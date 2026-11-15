@@ -2029,6 +2029,81 @@ class _BodyTranslator:
             ]
         return lines
 
+    def _tile_load_indexed(self, target: str, rhs: str) -> list[str]:
+        """``var = wp::tile_load_indexed<D0...>(src, idx_tile, axis, offsets...);``
+        — tile.h:2963 gather along one axis through a 1-D index tile:
+        element ``c`` reads ``src[offset + idx[c[axis]]]`` with BOTH bounds
+        checked — a negative or past-the-end index (the mjw io.py:1224
+        structurally-absent sentinel ``elemid == nC``) reads ``T{}`` zero.
+        Upstream always stages the indices tile in shared storage; the
+        closure form is 1-D sources, axis 0."""
+        open_p = rhs.index("(")
+        m_t = re.match(r"^wp::tile_load_indexed<(.+)>$", rhs[:open_p].strip())
+        if m_t is None:
+            raise TranslationError(f"cannot parse tile_load_indexed template {rhs!r}")
+        dims = [int(a.strip()) for a in split_args(m_t.group(1))]
+        if len(dims) != 1:
+            raise TranslationError(f"tile_load_indexed over {len(dims)} dims: 1-D sources only in the closure")
+        cargs = split_args(rhs[open_p + 1 : _find_balanced(rhs, open_p)])
+        if len(cargs) < 3:
+            raise TranslationError(f"tile_load_indexed needs (src, indices, axis[, offset]): {rhs!r}")
+        spec = self._tile_io_spec(cargs[0], "tile_load_indexed")
+        try:
+            elem = spec.msl_elem
+        except TranslationError as e:
+            raise TranslationError(f"tile_load_indexed source element type unavailable: {e}") from e
+        idx_name = cargs[1].strip()
+        idx_tvar = self.tile_vars.get(idx_name)
+        if idx_tvar is None:
+            raise TranslationError(f"tile_load_indexed indices operand {idx_name!r} is not a tile variable")
+        if idx_tvar.elem != "int":
+            raise TranslationError(f"tile_load_indexed indices tile must be int, got {idx_tvar.elem}")
+        axis = self._const_eval(cargs[2])
+        if axis != 0:
+            raise TranslationError(f"tile_load_indexed axis {axis}: only axis 0 is in the closure")
+        tvar = self.tile_vars.get(target)
+        if tvar is None:
+            raise TranslationError(f"tile_load_indexed target {target!r} is not a tile variable")
+        if tvar.elem != elem:
+            raise TranslationError(f"tile_load_indexed elem {elem} does not match target tile {tvar.elem}")
+        offs = [self.expr(a) for a in cargs[3:]] or ["0"]
+        meta = self._meta_ref(spec)
+        self.unit.uses_tile_ops = True
+        if tvar.kind == "shr":
+            bd = self._require_block_dim("wp::tile_load_indexed")
+            self._check_uniform("wp::tile_load_indexed")
+            if idx_tvar.kind != "shr" or idx_tvar.slot < 0:
+                raise TranslationError(
+                    f"tile_load_indexed indices tile {idx_name!r} must be bound shared storage "
+                    "(upstream promotes register index tiles)"
+                )
+            if tvar.size != dims[0]:
+                raise TranslationError(f"tile_load_indexed template size {dims[0]} != target tile {tvar.size}")
+            arr = f"_wp_tile_shr_{tvar.slot}"
+            idx_arr = f"_wp_tile_shr_{idx_tvar.slot}"
+            return [
+                f"{{ {elem} _wp_z = {{}};",
+                f"for (int _wp_t = _wp_lane; _wp_t < {tvar.size}; _wp_t += {bd}) {{",
+                f"    int _wp_li = {idx_arr}[_wp_t];",
+                f"    int _wp_s0 = ({offs[0]}) + _wp_li;",
+                f"    if (_wp_s0 >= 0 && _wp_s0 < {meta}.shape[0]) {{ {arr}[_wp_t] = *{self._tile_addr(spec, ['_wp_s0'])}; }} else {{ {arr}[_wp_t] = _wp_z; }}",
+                "}",
+                "threadgroup_barrier(mem_flags::mem_threadgroup);",
+                "}",
+            ]
+        # per-thread one-element form: the thread's element gathers through
+        # its own index-tile element (plain-launch one-lane degradation)
+        if idx_tvar.kind != "scalar":
+            raise TranslationError(
+                f"tile_load_indexed: per-thread target with shared indices tile {idx_name!r} is outside the closure"
+            )
+        s = f"({offs[0]}) + {idx_name}"
+        return [
+            f"{{ {elem} _wp_z = {{}};",
+            f"if ({s} >= 0 && {s} < {meta}.shape[0]) {{ {target} = *{self._tile_addr(spec, [s])}; }} else {{ {target} = _wp_z; }}",
+            "}",
+        ]
+
     def _tile_store(self, rhs: str) -> list[str]:
         elem, bc, _tpl_dims, cargs = self._parse_tile_io(rhs, "tile_store", with_shape=False)
         # the template arg arrives as a Python bool; MSL spells it lowercase
@@ -2099,17 +2174,21 @@ class _BodyTranslator:
         ]
 
     def _tile_map(self, target: str, rhs: str) -> list[str]:
-        m = re.match(r"^wp::tile_(binary|unary)_map\(", rhs)
+        # `wp::tile_map(op, a[, b[, c]])` — emit_Call picks the bare tile_map
+        # carrier for ternary user-op maps (mjw constraint._compute_jacp over
+        # cdof/offset/affects tiles) and binary/unary_map for 1-2 operands;
+        # all three lower identically as an elementwise op application
+        m = re.match(r"^wp::tile_(?:(binary|unary)_map|map)\(", rhs)
         if m is None:
             raise TranslationError(f"cannot parse tile_map {rhs!r}")
-        arity = 2 if m.group(1) == "binary" else 1
         open_p = rhs.index("(")
         close = _find_balanced(rhs, open_p)
         args = split_args(rhs[open_p + 1 : close])
+        arity = {"binary": 2, "unary": 1}.get(m.group(1), len(args) - 1)
         if len(args) != 1 + arity:
             raise TranslationError(
-                f"tile_{m.group(1)}_map with {len(args) - 1} operand(s): only unary/binary maps "
-                "are in the closure (ternary maps have no _CALL_TABLE operator)"
+                f"tile_{m.group(1) or 'map'} with {len(args) - 1} operand(s): expected {arity} — "
+                "maps outside the unary/binary/ternary forms are outside the closure"
             )
         op = args[0].strip()
         if op.startswith("wp::"):
@@ -2128,10 +2207,16 @@ class _BodyTranslator:
         tvar = self.tile_vars.get(target)
         if tvar is None:
             raise TranslationError(f"tile_map target {target!r} is not a tile variable")
+        # operands may be tiles (either tier) or plain scalars — upstream
+        # tile_map broadcasts a scalar arg per lane (builtins.py b_is_tile)
         ops = [self.tile_vars.get(a.strip()) for a in args[1:]]
-        if any(o is None for o in ops):
-            raise TranslationError(f"tile_map operand is not a tile variable in {rhs!r}")
-        if any(o.kind == "shr" for o in ops):
+        if all(o is None for o in ops):
+            raise TranslationError(f"tile_map operands are not tile variables in {rhs!r}")
+        scalar_reads: dict[int, str] = {}
+        for oi, a in enumerate(args[1:]):
+            if ops[oi] is None:
+                scalar_reads[oi] = self.expr(a.strip())
+        if any(o is not None and o.kind == "shr" for o in ops):
             if tvar.kind != "shr":
                 raise TranslationError(
                     f"tile_map over a shared tile requires a shared target tile ({target!r} is per-thread)"
@@ -2149,7 +2234,9 @@ class _BodyTranslator:
             unravel += t_lines
             reads = []
             for oi, (a, o) in enumerate(zip([a.strip() for a in args[1:]], ops)):
-                if o.kind == "shr":
+                if o is None:
+                    reads.append(scalar_reads[oi])
+                elif o.kind == "shr":
                     o_lines, o_addr = o.lin_addr("_wp_t", prefix=f"_wp_m{oi}")
                     unravel += o_lines
                     reads.append(f"_wp_tile_shr_{o.slot}[{o_addr}]")
@@ -2163,7 +2250,10 @@ class _BodyTranslator:
                 "threadgroup_barrier(mem_flags::mem_threadgroup);",
             ]
         # per-thread one-element form: element-wise, no barrier
-        exprs = [self._tile_scalar_read(a.strip(), o) for a, o in zip([a.strip() for a in args[1:]], ops)]
+        exprs = [
+            scalar_reads[oi] if o is None else self._tile_scalar_read(a.strip(), o)
+            for oi, (a, o) in enumerate(zip([a.strip() for a in args[1:]], ops))
+        ]
         return [f"{target} = {op_msl}({', '.join(exprs)});"]
 
     def _tile_scalar_read(self, name: str, tvar: TileVar) -> str:
@@ -4263,7 +4353,9 @@ class _BodyTranslator:
                 # direct forms ride the expression path below
             if rhs.startswith("wp::tile_load<"):
                 return self._tile_load(target, rhs)
-            if rhs.startswith(("wp::tile_binary_map(", "wp::tile_unary_map(")):
+            if rhs.startswith("wp::tile_load_indexed<"):
+                return self._tile_load_indexed(target, rhs)
+            if rhs.startswith(("wp::tile_binary_map(", "wp::tile_unary_map(", "wp::tile_map(")):
                 return self._tile_map(target, rhs)
             if m_tilebin := re.match(r"^wp::tile_(mul|add|sub|div|mod|min|max)\(", rhs):
                 return self._tile_binop(target, rhs, m_tilebin.group(1))

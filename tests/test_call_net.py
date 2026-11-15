@@ -204,6 +204,46 @@ def k_tile_arange_scalar(x: wp.array(dtype=wp.float32)):
     wp.tile_store(x, s)
 
 
+@wp.kernel
+def k_tile_load_indexed(
+    x: wp.array(dtype=wp.float32), idx_in: wp.array(dtype=wp.int32), out: wp.array(dtype=wp.float32)
+):
+    # mjw smooth.py:1360-1361 factorize_block shape: a shared int index tile
+    # gathered through tile_load_indexed (1-D source, axis 0); the
+    # structurally-absent sentinel index must read as zero via the
+    # both-ends bounds check (tile.h:2963 compute_index)
+    idx = wp.tile_load(idx_in, shape=(4,), offset=(0,), storage="shared")
+    block = wp.tile_load_indexed(x, idx, shape=(4,), storage="shared")
+    wp.tile_store(out, block)
+
+
+@wp.kernel
+def k_tile_load_indexed_2d(
+    x: wp.array2d(dtype=wp.float32), idx_in: wp.array(dtype=wp.int32), out: wp.array2d(dtype=wp.float32)
+):
+    # outside the closure: a multi-dim gather (no mujoco site gathers 2-D)
+    idx = wp.tile_load(idx_in, shape=(4,), offset=(0,), storage="shared")
+    block = wp.tile_load_indexed(x, idx, shape=(4, 4), axis=0, storage="shared")
+    wp.tile_store(out, block)
+
+
+@wp.func
+def _tile_tern_op(a: float, s: float, b: float):
+    # mjw constraint._compute_jacp shape: a user-op map whose middle operand
+    # is a plain scalar (upstream tile_map broadcasts scalar args per lane)
+    return a * s + b
+
+
+@wp.kernel
+def k_tile_map_ternary(
+    x: wp.array(dtype=wp.float32), y: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)
+):
+    a = wp.tile_load(x, shape=(4,), storage="shared")
+    b = wp.tile_load(y, shape=(4,), storage="shared")
+    c = wp.tile_map(_tile_tern_op, a, 2.0, b)
+    wp.tile_store(out, c)
+
+
 # ---- checker self-tests ----
 
 
@@ -573,6 +613,71 @@ class TestTileArangeOnesBroadcast(unittest.TestCase):
         self.assertTrue(any("wp_add(" in l for l in lines))
         findings = _checker.check_unit(unit)
         self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+
+class TestTileLoadIndexed(unittest.TestCase):
+    """tile.h:2963 gather: element ``c`` reads ``src[offset + idx[c]]`` with
+    BOTH bounds checked — the mjw smooth.py:1361 factorize_block CSR
+    densify, where the structurally-absent sentinel (io.py:1224
+    ``elemid == nC``) must read as zero without a physical row."""
+
+    def test_shared_gather_emission(self):
+        unit = translate_kernel(k_tile_load_indexed, options={"block_dim": 8})
+        lines = unit.kernel.lines
+        gather = [l for l in lines if ">= 0 &&" in l]
+        self.assertEqual(len(gather), 1)
+        idx = lines.index(gather[0])
+        # the index element comes from the shared index tile, the gather is
+        # bounds-checked at both ends against the source, and a barrier
+        # orders the fill before the cross-lane cholesky read
+        self.assertIn("+ _wp_li;", lines[idx - 1])
+        self.assertIn("_wp_tile_shr_0[_wp_t]", lines[idx - 2])
+        self.assertIn("shape[0]", gather[0])
+        self.assertIn("threadgroup_barrier", lines[idx + 2])
+
+    def test_shared_checker_clean(self):
+        unit = translate_kernel(k_tile_load_indexed, options={"block_dim": 8})
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+    def test_negative_axis_rejected(self):
+        # multi-dim gathers have no closure site: fail loud rather than
+        # mis-gather (the closure's only indexed loads are 1-D row views)
+        from warp_metal.msl.translate import TranslationError
+
+        with self.assertRaises(TranslationError):
+            translate_kernel(k_tile_load_indexed_2d, options={"block_dim": 8})
+
+    def test_plain_launch_scalar_tier(self):
+        # plain launch: no shared arrays — the thread's element gathers
+        # through its own index value with the same both-ends check
+        unit = translate_kernel(k_tile_load_indexed)
+        lines = unit.kernel.lines
+        self.assertFalse(any("_wp_tile_shr_" in l for l in lines))
+        self.assertTrue(any(">= 0" in l for l in lines))
+        findings = _checker.check_unit(unit)
+        self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
+
+
+class TestTileMapTernary(unittest.TestCase):
+    """The bare ``wp::tile_map(op, a, b, c)`` carrier — emit_Call picks it
+    for 3-operand maps (mjw constraint._compute_jacp over cdof/offset/
+    affects tiles) where the middle operand is a plain scalar (upstream
+    broadcasts scalar args per lane, builtins.py b_is_tile)."""
+
+    def test_ternary_user_op_emission(self):
+        unit = translate_kernel(k_tile_map_ternary, options={"block_dim": 8})
+        lines = unit.kernel.lines
+        calls = [l for l in lines if re.search(r"_tile_tern_op_\d+\(.*_wp_tile_shr_", l)]
+        self.assertEqual(len(calls), 1)
+        # the scalar operand reaches the call site
+        self.assertRegex(calls[0], r"\b2\.0f\b|var_\d+")
+
+    def test_ternary_checker_clean(self):
+        for bd in (8, None):
+            unit = translate_kernel(k_tile_map_ternary, options=None if bd is None else {"block_dim": bd})
+            findings = _checker.check_unit(unit)
+            self.assertEqual([f for f in findings if f.severity == "ERROR"], [])
 
 
 class TestClosureVecOverloads(unittest.TestCase):
