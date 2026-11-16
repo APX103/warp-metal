@@ -596,6 +596,56 @@ def _arr_view(arr):
     v = getattr(arr, "numpy_view", None)
     return v() if v is not None else arr.numpy()
 
+
+def _bitwise_equal(a, b) -> bool:
+    """Bitwise (byte-level) equality of two numpy views.
+
+    KEP-0001 M3.2 §6-1 (R1 A.2): replay-vs-eager compares BITWISE, floats
+    included — same PSO, same pointers, same order must reproduce every bit;
+    the uint-view criterion dodges -0.0/NaN float reconciliation. uint8 view
+    over contiguous buffers generalizes R1's uint32-view rule to every
+    element width (int8/uint8/bool rows cannot view as uint32); byte
+    equality is the identical semantics.
+    """
+    import numpy as np
+
+    a = np.ascontiguousarray(a)
+    b = np.ascontiguousarray(b)
+    if a.shape != b.shape:
+        return False
+    return bool(np.array_equal(a.view(np.uint8), b.view(np.uint8)))
+
+
+def _kernel_atomic_sites(kern, launch_args, block_dim):
+    """Transitive atomic call sites in a kernel's emitted MSL.
+
+    KEP-0001 M3.2 §6-1 capture-allowlist criterion (R1 A.2: "closure 符号集
+    无 atomic_*"). Scans the kernel body plus every transitively called
+    @wp.func body of the exact unit the eager launch compiled — same
+    ``_PSO_CACHE`` key as the launch (launch_tiled bakes block_dim, plain
+    launches pass None; generic kernels concretize from the same arg list).
+    Every real atomic lowering emits the substring "atomic" into a function
+    body line (scalar-array ``atomic_fetch_*_explicit``, vec-component /
+    2-D ret forms calling the ``wp_atomic_*`` helpers, CAS/exchange). The
+    unconditional per-dtype helper DEFINITIONS ride along inside
+    vector-dtype struct decls (translate.py ensure_vec_def) — struct text is
+    NOT scanned, so a closure that never calls an atomic scans clean.
+    Returns ``[(fn_name, line), ...]`` (empty → allowlist-eligible).
+    """
+    import warp_metal.runtime.host as _wm_host
+
+    k = kern
+    if getattr(k, "is_generic", False):
+        k = _wm_host._concretize_generic_kernel(k, list(launch_args))
+    _pso, unit = _wm_host._unit_for(k, block_dim)
+    sites = []
+    for fn in (unit.kernel, *unit.functions):
+        for ln in fn.lines:
+            if "atomic" in ln:
+                sites.append((fn.name, ln.strip()))
+    return sites
+
+
 # composite element dtype keys: their numpy packing carries one (or two)
 # trailing element axes (vec3 → (..., 3), mat33 → (..., 3, 3)), so the
 # array shape is val.shape minus those axes (KEP-0001 M3.2 P1: first arr2
@@ -799,6 +849,105 @@ def _corpus_launch(wp, kern, args, launch_args, device):
                         inputs=launch_args, outputs=[], device=device, block_dim=bd)
 
 
+def _corpus_row_capture(wp, cb, short, builder, mod, kern, args, launch_args,
+                        out_names, out_arrays, capture_rows, capture_excluded):
+    """Capture replay-equivalence for one corpus row (KEP-0001 M3.2 §6-1, R1 A.2(i)).
+
+    Eligibility = the row's emitted MSL closure (kernel + transitive @wp.func
+    bodies) contains no atomic lowering — see ``_kernel_atomic_sites``. Atomic
+    rows are excluded: replay-vs-eager bit equality is undefined under
+    hardware atomic order (upstream CUDA graph replay gives no atomic-order
+    guarantee either).
+
+    For each eligible row: fresh buffers from the SAME builder + seed, a
+    ``wp.ScopedCapture`` around the identical ``_corpus_launch``, then
+    ``capture_launch`` replay; outputs compare bitwise against the row's
+    eager outputs. Run under BOTH batch modes (default batching and
+    ``WARP_METAL_BATCH=0`` — the per-record replay path must be bit-equal
+    too; guardrail A.4.3). Replay starts immediately after capture_end (no
+    eager code touches the captured buffers in between — guardrail A.4.1);
+    batch segment counts are never asserted, only final outputs (A.4.2).
+    Appends to ``capture_rows`` / ``capture_excluded``; never raises — the
+    corpus layer reports, never aborts.
+    """
+    import numpy as np
+
+    bd = _corpus_block_dim(args)
+    try:
+        sites = _kernel_atomic_sites(kern, launch_args, bd)
+    except Exception as e:  # noqa: BLE001 — eligibility scan reports, never aborts
+        capture_excluded.append((short, f"atomic-scan unavailable: {type(e).__name__}: {str(e)[:80]}"))
+        return
+    if sites:
+        fn_name, ln = sites[0]
+        capture_excluded.append((short, f"atomic closure ({fn_name}): {ln[:90]}"))
+        return
+
+    # eager reference snapshot: the capture pass writes FRESH buffers (same
+    # builder + seed re-roll → identical fixture content), so these copies
+    # are the bit-equality reference
+    ref = [np.ascontiguousarray(_arr_view(a)).copy() for a in out_arrays]
+    modes = {}
+    for mode, env in (("batch", None), ("unbatched", "0")):
+        prev = os.environ.pop("WARP_METAL_BATCH", None)
+        if env is not None:
+            os.environ["WARP_METAL_BATCH"] = env
+        try:
+            args2, _skips = cb.BUILDERS[builder](np.random.default_rng(_DEFAULT_SEED))
+            launch_args2, _dim, out2, _names2 = _pack_args(wp, args2, device="metal", mod=mod)
+            with wp.ScopedCapture() as cap:
+                _corpus_launch(wp, kern, args2, launch_args2, "metal")
+            # guardrail A.4.1: first replay IMMEDIATELY after capture_end
+            wp.capture_launch(cap.graph)
+            wp.synchronize()
+            modes[mode] = [
+                out_names[i]
+                for i in range(len(out_names))
+                if not _bitwise_equal(_arr_view(out2[i]), ref[i])
+            ]
+        except Exception as e:  # noqa: BLE001 — capture sub-mode reports per row/mode
+            modes[mode] = [f"{type(e).__name__}: {str(e)[:100]}"]
+        finally:
+            if prev is None:
+                os.environ.pop("WARP_METAL_BATCH", None)
+            else:
+                os.environ["WARP_METAL_BATCH"] = prev
+    capture_rows.append((short, modes))
+
+
+def _format_corpus_capture(capture_rows, capture_excluded) -> list[str]:
+    """Report lines for the corpus capture replay-equivalence sub-count."""
+    n_ok = sum(
+        1
+        for _short, modes in capture_rows
+        if all(isinstance(v, list) and not v for v in modes.values())
+    )
+    lines = [
+        "",
+        "### capture replay-equivalence（KEP-0001 M3.2 §6-1；metal-only 自比较，golden 侧零改动）",
+        "",
+        "- allowlist 判据：kernel 的 MSL closure（kernel 体 + 传递 @wp.func 体）无 atomic lowering"
+        "（`atomic_fetch_*_explicit` / `wp_atomic_*` 调用点；vector-dtype struct 内的无条件 helper"
+        " 定义不算——只扫函数体行，见 `_kernel_atomic_sites`）。tile_scatter_add 的 shared 无冲突"
+        "累加（无 atomic lowering）在 allowlist 内。原子行不进 allowlist：重放 vs eager 位等无定义。",
+        f"- **capture-replay: {n_ok} rows bitwise == eager (batch + unbatched)**"
+        "（ratchet 子计数，只升不降，前值见 git 历史；corpus 主计数 ratchet 不变）",
+    ]
+    if capture_excluded:
+        lines += ["", "| kernel | allowlist exclusion |", "|---|---|"]
+        for name, why in sorted(capture_excluded):
+            lines.append(f"| {name} | {why} |")
+    if capture_rows:
+        lines += ["", "| kernel | batch | unbatched |", "|---|---|---|"]
+        for name, modes in sorted(capture_rows):
+            cells = []
+            for mode in ("batch", "unbatched"):
+                v = modes.get(mode, "<missing>")
+                cells.append("==" if isinstance(v, list) and not v else "; ".join(map(str, v)))
+            lines.append(f"| {name} | {cells[0]} | {cells[1]} |")
+    return lines
+
+
 def run_corpus_golden(out_npz: Path) -> dict:
     """Golden phase (Newton venv, real warp): CPU reference for every entry."""
     import numpy as np
@@ -883,6 +1032,9 @@ def run_corpus(golden_npz: Path) -> str:
     import corpus_builders as cb
 
     passed, failed, skipped = [], [], []
+    # KEP-0001 M3.2 §6-1: capture replay-equivalence sub-mode state (see
+    # _corpus_row_capture); the headline ratchet below is untouched by it
+    capture_rows, capture_excluded = [], []
     for row in CORPUS_TABLE:
         module, qualname, builder, *rest = row
         factory = rest[0] if rest else None
@@ -914,6 +1066,13 @@ def run_corpus(golden_npz: Path) -> str:
                         ok = False
                         detail.append(name)
             (passed if ok else failed).append((short, ",".join(detail) or "all outputs"))
+            if ok:
+                # capture sub-mode runs only for golden-consistent rows: the
+                # sub-count certifies bitwise replay==eager on rows whose
+                # eager outputs are known-good vs the CPU golden
+                _corpus_row_capture(wp, cb, short, builder, mod, kern, args,
+                                    launch_args, out_names, out_arrays,
+                                    capture_rows, capture_excluded)
         except Exception as e:  # noqa: BLE001 — corpus entries report, never abort
             failed.append((short, f"{type(e).__name__}: {str(e)[:120]}"))
 
@@ -941,6 +1100,7 @@ def run_corpus(golden_npz: Path) -> str:
         lines.append("|---|---|")
         for name, reason in sorted(skipped):
             lines.append(f"| {name} | {reason} |")
+    lines += _format_corpus_capture(capture_rows, capture_excluded)
     return "\n".join(lines)
 
 
@@ -1115,7 +1275,84 @@ def run_trajectory() -> str:
     lines.append(f"")
     lines.append(f"**结果：{n_pass} / {total} 例程通过**（strict rtol={TRAJECTORY_RTOL} / atol={TRAJECTORY_ATOL}；"
                  f"atomic-order 漂移上限见各例程 cap——reducer 原子槽序差异的预期发散类，ROADMAP M1.7(c)）")
+    # KEP-0001 M3.2 §6-1 (ii): capture replay==eager sub-count (R1 A.2) —
+    # the headline 2/2 above is untouched. Fail-loud: any error surfaces as a
+    # visible FAIL line, never a silent skip (guardrail A.4.4).
+    lines.append("")
+    try:
+        lines.append(_run_trajectory_capture())
+    except Exception as e:  # noqa: BLE001 — capture sub-mode fails loud into the section
+        lines.append(f"- capture replay==eager: FAIL — {type(e).__name__}: {str(e)[:160]}")
     return "\n".join(lines)
+
+
+def _traj_capture_frames(inst, n_steps) -> list:
+    """Per-frame ``state_0.body_q`` snapshots kept at raw float32 (bitwise)."""
+    import numpy as np
+
+    frames = [np.asarray(inst.state_0.body_q.numpy(), dtype=np.float32).copy()]
+    for _ in range(n_steps):
+        inst.step()
+        frames.append(np.asarray(inst.state_0.body_q.numpy(), dtype=np.float32).copy())
+    return frames
+
+
+def _run_trajectory_capture() -> str:
+    """basic_pendulum eager-vs-replay, same device, per-frame bitwise.
+
+    KEP-0001 M3.2 §6-1 (ii), R1 A.2: the existing 2/2 proves "metal replay ==
+    CPU replay" (both sides' step() is graph replay); this sub-mode adds the
+    same-device contrast — pass A constructs the Example and clears
+    ``inst.graph`` so ``step()`` walks ``simulate()`` eagerly, pass B is a
+    fresh instance on the default ``capture_launch`` replay path. Contact-free
+    case → strict everywhere, and with no atomic-order divergence class in
+    play the per-frame body_q comparison is BITWISE (R1 A.2 先 strict 位级；
+    cap 机制只在原子序漂移类出现时启用). Runs under both batch modes
+    (guardrail A.4.3). basic_shapes stays deferred: contact-phase atomic
+    order voids bit equality (R1 A.2(ii)).
+    """
+    import numpy as np
+
+    name = "basic_pendulum"
+    n_steps = TRAJECTORY_CASES[name][0]
+    mod = importlib.import_module(f"newton.examples.basic.example_{name}")
+    from newton.viewer import ViewerNull
+
+    prev = os.environ.pop("WARP_METAL_BATCH", None)
+    try:
+        verdicts = {}
+        for mode, env in (("batch", None), ("unbatched", "0")):
+            if env is None:
+                os.environ.pop("WARP_METAL_BATCH", None)
+            else:
+                os.environ["WARP_METAL_BATCH"] = env
+            # pass A: eager — the capture graph built at init stays unused
+            inst_e = mod.Example(ViewerNull(), _traj_example_args("metal"))
+            inst_e.graph = None
+            eager = _traj_capture_frames(inst_e, n_steps)
+            del inst_e  # release the unused graph + its records before pass B
+            # pass B: replay — fresh instance, default capture_launch path
+            # (frame reads between replays are host-visible reads only, so
+            # nothing eager rewrites the captured buffers — guardrail A.4.1)
+            inst_r = mod.Example(ViewerNull(), _traj_example_args("metal"))
+            replay = _traj_capture_frames(inst_r, n_steps)
+            del inst_r
+            verdicts[mode] = len(eager) == len(replay) and all(
+                _bitwise_equal(e, r) for e, r in zip(eager, replay)
+            )
+    finally:
+        if prev is None:
+            os.environ.pop("WARP_METAL_BATCH", None)
+        else:
+            os.environ["WARP_METAL_BATCH"] = prev
+
+    n_ok = 1 if all(verdicts.values()) else 0
+    detail = ", ".join(f"{mode}: {'PASS' if verdicts[mode] else 'FAIL'}" for mode in ("batch", "unbatched"))
+    return (
+        f"- capture replay==eager（{name}，同设备逐帧 body_q 位级：pass A `graph=None` eager vs "
+        f"pass B capture_launch 重放，batch + unbatched 两遍，{n_steps + 1} 帧/遍）: "
+        f"**{n_ok}/1**（{detail}）"
+    )
 
 
 # --------------------------------------------------------------------------
