@@ -1326,6 +1326,38 @@ static inline vec3f wp_atomic_min_ret_at(device vec3f* d, wp_arr_meta m, int i, 
     old.z = wp_atomic_min_ret(c + 2, v.z);
     return old;
 }
+// vec3f 1-D component-wise add/sub (upstream vec.h:1831-1839 lowers
+// wp.atomic_add/wp.atomic_sub on vector dtypes per component through the
+// scalar cores, returning the old vector for the _ret forms; Newton
+// sensor_contact accumulates per-row contact force vectors on array[vec3])
+static inline void wp_atomic_add_at(device vec3f* d, wp_arr_meta m, int i, vec3f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    wp_atomic_add(c + 0, v.x);
+    wp_atomic_add(c + 1, v.y);
+    wp_atomic_add(c + 2, v.z);
+}
+static inline vec3f wp_atomic_add_ret_at(device vec3f* d, wp_arr_meta m, int i, vec3f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    vec3f old;
+    old.x = wp_atomic_add_ret(c + 0, v.x);
+    old.y = wp_atomic_add_ret(c + 1, v.y);
+    old.z = wp_atomic_add_ret(c + 2, v.z);
+    return old;
+}
+static inline void wp_atomic_sub_at(device vec3f* d, wp_arr_meta m, int i, vec3f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    wp_atomic_sub(c + 0, v.x);
+    wp_atomic_sub(c + 1, v.y);
+    wp_atomic_sub(c + 2, v.z);
+}
+static inline vec3f wp_atomic_sub_ret_at(device vec3f* d, wp_arr_meta m, int i, vec3f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    vec3f old;
+    old.x = wp_atomic_sub_ret(c + 0, v.x);
+    old.y = wp_atomic_sub_ret(c + 1, v.y);
+    old.z = wp_atomic_sub_ret(c + 2, v.z);
+    return old;
+}
 static inline vec3f wp_atomic_max_ret_at(device vec3f* d, wp_arr_meta m, int i, vec3f v) {
     device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
     vec3f old;
