@@ -67,6 +67,7 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -365,6 +366,16 @@ def _log_tail(path: str, n: int = TAIL_LINES) -> str:
         return "<no log>"
 
 
+def _watchdog_kill(proc: subprocess.Popen) -> None:
+    """Kill the whole process group: proc is the ``uv`` wrapper; killing only
+    it orphans the example python grandchild, which keeps holding Metal."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        proc.kill()
+    proc.wait()
+
+
 def run_one(name: str, timeout_s: int = TIMEOUT_S) -> dict:
     """Run one example strictly sequentially; returns its result record."""
     log_path = os.path.join(LOG_DIR, f"{name}.log")
@@ -389,12 +400,12 @@ def run_one(name: str, timeout_s: int = TIMEOUT_S) -> dict:
     with open(log_path, "wb") as log:
         proc = subprocess.Popen(
             cmd, cwd=NEWTON_REPO, env=env, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True,  # process group so the watchdog kills uv AND the example python
         )
         try:
             rc = proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            _watchdog_kill(proc)
             rc = 124
             mode = "test-timeout"
     elapsed = time.monotonic() - t0
@@ -411,12 +422,12 @@ def run_one(name: str, timeout_s: int = TIMEOUT_S) -> dict:
         with open(log_path, "wb") as log:
             proc = subprocess.Popen(
                 cmd, cwd=NEWTON_REPO, env=env, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True,
             )
             try:
                 rc = proc.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                _watchdog_kill(proc)
                 rc = 124
                 mode = "no-test-criteria-timeout"
         elapsed = time.monotonic() - t0
