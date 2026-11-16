@@ -476,3 +476,15 @@ def __getattr__(name):
         f"wp.utils.{name} is not implemented in warp-metal "
         "(host scan/sort helpers arrive with the CPU fallback routing, M1.3+)"
     )
+
+
+# Graph coloring utilities (upstream wp.utils.graph_coloring_*; Newton's
+# ModelBuilder.color calls all three through wp.utils). Pure host algorithms
+# ported from warp/_src/coloring.py + native/coloring.cpp — see the module
+# docstring for the porting note.
+from .graph_coloring import (  # noqa: E402, F401
+    GraphColoringAlgorithm,
+    graph_coloring_assign,
+    graph_coloring_balance,
+    graph_coloring_get_groups,
+)
