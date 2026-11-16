@@ -110,7 +110,7 @@ from ..frontend.types import (
 )
 from .. import native as _mm
 from ..msl.emitter import MSLEmitter
-from .devices import get_device
+from .devices import Device, get_device
 
 _SCALAR_NP = {
     float32: np.float32,
@@ -308,7 +308,12 @@ class WarpArray:
                 "warp-metal does not support requires_grad/pinned/retain_grad allocation flags "
                 "(adjoint codegen is a KEP-0001 Non-Goal)"
             )
-        self.device = get_device(device).name
+        # upstream array.device IS the Device object (warp/_src/types.py
+        # stores the resolved device; Newton reads e.g.
+        # graph_edge_indices.device.is_cpu in graph_coloring.py:284) — the
+        # Device compares equal to its name string and hashes by name, so
+        # string comparisons/dict keys keep working.
+        self.device = get_device(device)
         # canonicalize dtype (upstream array.__init__ canonicalize block,
         # warp/_src/types.py:3559-3565: the Python builtins map to their
         # 32-bit warp types, e.g. Newton's `wp.full(..., dtype=float)`)
@@ -442,6 +447,33 @@ class WarpArray:
             arr = arr.reshape(self.shape) if self.n else arr.reshape(0)
         self.numpy = arr.view(_CallableArray)
 
+    def _leading_index_view(self, idx: int) -> "WarpArray":
+        """Upstream ``arr[i]`` on ndim>1 (warp/_src/types.py __getitem__):
+        the int key occupies the leading dim and the remaining dims keep
+        full slices — the view drops the leading dim entirely, i.e. shape
+        ``shape[1:]`` and strides ``strides[1:]``, sharing the base buffer
+        at the element offset. Newton's per-world rows
+        (``_row_dropped_all[0]``, VBD ``_body_contact_scratch[0]``) read
+        kernels with 1-D annotations, so the view shape MUST match
+        upstream or the kernel's stride math reads wrong elements."""
+        lead = 1
+        for s in self.shape[1:]:
+            lead *= s
+        view = WarpArray.__new__(WarpArray)
+        view.device = self.device
+        view.dtype = self.dtype
+        view.shape = tuple(self.shape[1:])
+        view.n = lead
+        view.np_dtype = self.np_dtype
+        view.item_bytes = self.item_bytes
+        view.is_composite = self.is_composite
+        view.offset_elems = self.offset_elems + idx * lead
+        view._buffer = self._buffer  # shared: release is owned by the base
+        view._owns_buffer = False
+        view._ptr = self._ptr + idx * lead * self.item_bytes
+        view._build_numpy_view()
+        return view
+
     def _slice_view(self, start: int, length: int) -> "WarpArray":
         """Host-side array view (warp slicing): shares the base buffer at an
         element offset; the offset reaches device code via wp_arr_meta.offset."""
@@ -483,7 +515,7 @@ class WarpArray:
         elif dtype is bool:
             dtype = warp_bool
         view = WarpArray.__new__(WarpArray)
-        view.device = get_device(device).name if device is not None else src.device
+        view.device = get_device(device) if device is not None else src.device
         if view.device != src.device:
             raise ValueError(
                 f"wp.array(ptr=...) aliasing: device {view.device!r} does not match the "
@@ -587,6 +619,98 @@ class WarpArray:
         view._build_numpy_view()
         return view
 
+    def to(self, device, requires_grad=None):
+        """Return a Warp array with this array's data moved to the specified
+        device, no-op if already on device (upstream array.to,
+        warp/_src/types.py:4828). All warp-metal arrays live in shared
+        unified memory, so the cross-device path is a clone onto the target
+        device's allocator; the same-device path returns ``self`` exactly
+        like upstream. ``requires_grad`` keeps upstream's clone argument —
+        the clone fails loud on grad flags (KEP-0001 Non-Goal)."""
+        device = get_device(device)
+        if self.device == device:
+            return self
+        return clone(self, device=device, requires_grad=requires_grad)
+
+    def flatten(self):
+        """Return a zero-copy view of the array collapsed to 1-D (upstream
+        array.flatten, warp/_src/types.py:4835). Only supported for
+        contiguous arrays; runtime arrays here are always dense row-major.
+        Upstream also transfers the read flag and grad — this runtime
+        rejects grad allocation, so there is nothing to carry; the shared
+        ``_buffer`` reference keeps the base allocation alive exactly like
+        upstream's ``_ref`` back-ref."""
+        if self.ndim == 1:
+            return self
+        if not self.is_contiguous:
+            raise RuntimeError("Flattening non-contiguous arrays is unsupported.")
+        # reshape gives the exact (size,) 1-D zero-copy view (upstream builds
+        # array(ptr=self.ptr, shape=(self.size,)) — same shared buffer)
+        return self.reshape(self.size)
+
+    def view(self, dtype):
+        """Return a zero-copy view of this array's memory with a different
+        data type (upstream array.view, warp/_src/types.py:4925).
+
+        Upstream branches on same-byte-size reinterpret, vec/mat→scalar and
+        scalar→vec/mat conversions, carrying explicit strides. This runtime
+        is dense row-major only, so every representable case reduces to a
+        dense view with the new dtype and the upstream-adjusted shape; the
+        upstream stride-compatibility checks are vacuous here and the
+        non-representable (strided) cases fall out of the byte-span capacity
+        check in ``_ptr_alias_view``. Grad flags have nothing to carry (this
+        runtime rejects grad allocation)."""
+        from ..frontend.types import type_is_scalar, type_size_in_bytes
+
+        if type_size_in_bytes(dtype) == type_size_in_bytes(self.dtype):
+            # a simple "reinterpret cast"
+            result_shape = self.shape
+        elif type_is_scalar(dtype) and hasattr(self.dtype, "_wp_scalar_type_"):
+            # cast from vec/mat type to scalar type
+            if type_size_in_bytes(dtype) == type_size_in_bytes(self.dtype._wp_scalar_type_):
+                result_shape = (*self.shape, *self.dtype._shape_)
+            else:
+                raise TypeError(
+                    f"cannot create an array view with dtype {type_repr(dtype)} "
+                    f"from source dtype {type_repr(self.dtype)}: source scalar dtype "
+                    f"{type_repr(self.dtype._wp_scalar_type_)} has size "
+                    f"{type_size_in_bytes(self.dtype._wp_scalar_type_)} bytes, "
+                    f"but target dtype has size {type_size_in_bytes(dtype)} bytes"
+                )
+        elif type_is_scalar(self.dtype) and hasattr(dtype, "_wp_scalar_type_"):
+            # cast from scalar type to vec/mat type
+            if type_size_in_bytes(self.dtype) == type_size_in_bytes(dtype._wp_scalar_type_):
+                # ensure that the shape is compatible with the requested
+                # vec/mat type (the inner-strides check is vacuous — dense
+                # row-major storage makes matching trailing dims dense)
+                dtype_ndim = len(dtype._shape_)
+                if self.ndim < dtype_ndim or self.shape[-dtype_ndim:] != dtype._shape_:
+                    raise RuntimeError(
+                        f"The shape of the source array {self.shape} is not compatible with the requested data type {type_repr(dtype)}"
+                    )
+                # Corner case: if the array contains a single vector or
+                # matrix, the result would be a 0-dimensional array, which
+                # is not supported in Warp currently. In this case, we return
+                # a 1D array with one element. (upstream verbatim)
+                result_shape = self.shape[:-dtype_ndim] or (1,)
+            else:
+                raise TypeError(
+                    f"cannot create an array view with dtype {type_repr(dtype)} "
+                    f"from source dtype {type_repr(self.dtype)}: source dtype has size "
+                    f"{type_size_in_bytes(self.dtype)} bytes, but target scalar dtype "
+                    f"{type_repr(dtype._wp_scalar_type_)} has size "
+                    f"{type_size_in_bytes(dtype._wp_scalar_type_)} bytes"
+                )
+        else:
+            raise TypeError(
+                f"cannot create an array view with dtype {type_repr(dtype)} "
+                f"from source dtype {type_repr(self.dtype)}: source dtype has size "
+                f"{type_size_in_bytes(self.dtype)} bytes, but target dtype has size "
+                f"{type_size_in_bytes(dtype)} bytes"
+            )
+
+        return WarpArray._ptr_alias_view(self, self._ptr, dtype, result_shape, self.device)
+
     def __getitem__(self, key):
         if isinstance(key, slice):
             if len(self.shape) == 0:
@@ -603,16 +727,18 @@ class WarpArray:
         if isinstance(key, (int, np.integer)):
             if len(self.shape) == 0:
                 raise TypeError("scalar array is not indexable")
-            if len(self.shape) > 1:
-                # leading-index view: upstream arr[i] returns a wp.array view
-                # of one leading slice sharing the buffer (Newton steel takes
-                # per-world rows: row_dropped_all[0]); only 1-D indexing
-                # yields the element value
-                lead = 1
-                for s in self.shape[1:]:
-                    lead *= s
-                return self._slice_view(int(key) * lead, lead)
-            return self.numpy[key]
+            if len(self.shape) == 1:
+                return self.numpy[key]
+            # leading-index view: upstream arr[i] on ndim>1 drops the
+            # leading dim (key=[i] padded with full slices) — a view of one
+            # leading slice sharing the buffer (Newton steel per-world rows,
+            # VBD scratch rows); only 1-D indexing yields the element value
+            idx = int(key)
+            if idx < 0:
+                idx += self.shape[0]
+            if idx < 0 or idx >= self.shape[0]:
+                raise IndexError(f"array index {key} out of range for shape {self.shape}")
+            return self._leading_index_view(idx)
         raise TypeError(f"unsupported array index {key!r}")
 
     def __setitem__(self, key, value):
@@ -740,9 +866,10 @@ class WarpArray:
         return self.n
 
     def __repr__(self):
+        device = self.device.name if isinstance(self.device, Device) else self.device
         return (
             f"warp_metal.WarpArray(shape={self.shape}, dtype={getattr(self.dtype, '__name__', self.dtype)}, "
-            f"device={self.device!r})"
+            f"device={device!r})"
         )
 
 
