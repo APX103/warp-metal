@@ -21,6 +21,9 @@ venv/
 tools/corpus_golden.npz
 tools/corpus_golden_meta.json
 
+# machine-local checkout paths (see tools/paths.py)
+tools/local_paths.py
+
 # uv lockfile (repo activates via `uv pip install --editable`, not locked syncs)
 uv.lock
 # per-run trajectory drift monitor log (append-only, regenerable)

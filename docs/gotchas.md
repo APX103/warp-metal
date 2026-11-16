@@ -99,7 +99,7 @@ before trusting a green run — several of these fail **silently**.
 
   ```bash
   env -u NEWTON_WARP_BACKEND CORPUS_FORCE_GOLDEN=1 \
-    /Volumes/ssd/main_link/work/newton/.venv/bin/python -I \
+    <newton-checkout>/.venv/bin/python -I \
     ~/work/warp-metal/tools/conform.py --layer corpus
   ```
 

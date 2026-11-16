@@ -29,7 +29,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-REPO = Path("/Volumes/ssd/main_link/work/newton")
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # for paths.py
+import paths  # noqa: E402
+
+REPO = paths.newton_repo()
 KEP_DIR = REPO / "keps/0001-standalone-warp-metal-library-with-msl-backend-for-newton-on-apple-silicon"
 OUT_PATH = KEP_DIR / "phase1-closure.json"
 

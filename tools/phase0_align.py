@@ -23,10 +23,12 @@ from pathlib import Path
 
 import numpy as np
 
+import paths
+
 REPO = Path(__file__).resolve().parent.parent
 GOLDEN_PATH = Path(__file__).parent / "phase0_golden.npz"
 # plan-of-record lives in the newton keps dir; fall back to the repo root
-_KEP_DIR = Path("/Volumes/ssd/main_link/work/newton/keps/0001-standalone-warp-metal-library-with-msl-backend-for-newton-on-apple-silicon")
+_KEP_DIR = paths.newton_repo() / "keps/0001-standalone-warp-metal-library-with-msl-backend-for-newton-on-apple-silicon"
 REPORT_PATH = _KEP_DIR / "phase0-report.md" if _KEP_DIR.exists() else REPO / "phase0-report.md"
 
 SEED = 0

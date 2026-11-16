@@ -41,18 +41,18 @@ Scenes
 GPU exclusivity law: one process = one device.  Run each measurement as its
 own solo invocation, then regenerate the report::
 
-    cd /Volumes/ssd/main_link/work/newton
+    cd $NEWTON_REPO
     # CPU baseline (all three scenes may share one process: CPU-only)
-    uv run python /Users/apx103/work/warp-metal/tools/bench_phase2.py --device cpu
+    uv run python $WARP_METAL_REPO/tools/bench_phase2.py --device cpu
     # Metal runs: one solo process per scene, backend env set by the caller
     NEWTON_WARP_BACKEND=metal uv run python \
-        /Users/apx103/work/warp-metal/tools/bench_phase2.py --device metal --scene basic_pendulum
+        $WARP_METAL_REPO/tools/bench_phase2.py --device metal --scene basic_pendulum
     NEWTON_WARP_BACKEND=metal uv run python \
-        /Users/apx103/work/warp-metal/tools/bench_phase2.py --device metal --scene basic_shapes
+        $WARP_METAL_REPO/tools/bench_phase2.py --device metal --scene basic_shapes
     NEWTON_WARP_BACKEND=metal uv run python \
-        /Users/apx103/work/warp-metal/tools/bench_phase2.py --device metal --scene basic_conveyor
+        $WARP_METAL_REPO/tools/bench_phase2.py --device metal --scene basic_conveyor
     # Afterward, regenerate the markdown report from the saved measurements
-    uv run python /Users/apx103/work/warp-metal/tools/bench_phase2.py --report-only
+    uv run python $WARP_METAL_REPO/tools/bench_phase2.py --report-only
 
 What is timed
 -------------
@@ -112,12 +112,15 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # for paths.py
+import paths  # noqa: E402
+
 DEFAULT_OUT = (
-    "/Volumes/ssd/main_link/work/newton/keps/"
-    "0001-standalone-warp-metal-library-with-msl-backend-for-newton-on-apple-silicon/phase2-bench.md"
+    str(paths.newton_repo() / "keps/")
+    + "0001-standalone-warp-metal-library-with-msl-backend-for-newton-on-apple-silicon/phase2-bench.md"
 )
 
-WARP_METAL_REPO = "/Users/apx103/work/warp-metal"
+WARP_METAL_REPO = str(Path(__file__).resolve().parent.parent)
 
 # Measured-step defaults: warmup absorbs compile/first-touch; 100 timed frames
 # matches the CI example test runner's num-frames for these scenes.
@@ -552,7 +555,7 @@ def build_report(measurements: dict[tuple[str, str], Measurement]) -> str:
     lines.append("## Reproduction")
     lines.append("")
     lines.append("```bash")
-    lines.append("cd /Volumes/ssd/main_link/work/newton")
+    lines.append(f"cd {paths.newton_repo()}")
     lines.append(f"uv run python {WARP_METAL_REPO}/tools/bench_phase2.py --device cpu")
     for scene in SCENES:
         lines.append(

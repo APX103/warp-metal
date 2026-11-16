@@ -46,8 +46,12 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
-NEWTON_REPO = "/Volumes/ssd/main_link/work/newton"
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # for paths.py
+import paths  # noqa: E402
+
+NEWTON_REPO = str(paths.newton_repo())
 LOG_DIR = "/tmp/phase4_smoke_logs"
 RESULTS_PATH = os.path.join(LOG_DIR, "results.json")
 

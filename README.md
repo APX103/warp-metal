@@ -47,7 +47,7 @@ dependency:
    metal = ["warp-metal"]
 
    [tool.uv.sources]
-   warp-metal = { path = "/Users/apx103/work/warp-metal", editable = true }
+   warp-metal = { path = "<path-to-your-warp-metal-checkout>", editable = true }
    ```
 
 3. Sync and activate:
@@ -121,7 +121,7 @@ NEWTON_WARP_BACKEND=metal uv run python ~/work/warp-metal/tools/conform.py --lay
 Golden references regenerate CPU-side (real warp in the Newton venv, no GPU):
 
 ```bash
-env -u NEWTON_WARP_BACKEND CORPUS_FORCE_GOLDEN=1 /Volumes/ssd/main_link/work/newton/.venv/bin/python \
+env -u NEWTON_WARP_BACKEND CORPUS_FORCE_GOLDEN=1 <newton-checkout>/.venv/bin/python \
     -I ~/work/warp-metal/tools/conform.py --layer corpus
 ```
 

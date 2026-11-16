@@ -23,7 +23,7 @@ compare side checks, all paths absolute):
 Usage:
 
     # Golden pass (Newton venv — needs warp-lang 1.19.0):
-    /Volumes/ssd/main_link/work/newton/.venv/bin/python -I \
+    $NEWTON_REPO/.venv/bin/python -I \
         ~/work/warp-metal/tools/conform.py --dump-golden GOLDEN.json
 
     # Compare pass (warp-metal venv):
@@ -53,7 +53,10 @@ from pathlib import Path
 
 # --- Absolute paths (uv run --directory resets cwd; never rely on cwd) ----
 
-NEWTON_REPO = Path("/Volumes/ssd/main_link/work/newton")
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # for paths.py
+import paths  # noqa: E402
+
+NEWTON_REPO = paths.newton_repo()
 KEP_DIR = (
     NEWTON_REPO
     / "keps/0001-standalone-warp-metal-library-with-msl-backend-for-newton-on-apple-silicon"
@@ -62,7 +65,7 @@ SYMBOLS_PATH = KEP_DIR / "wp-symbols-frequency.txt"
 DEFAULT_REPORT = KEP_DIR / "conform-report.md"
 DEFAULT_GOLDEN = Path(__file__).resolve().parent / "golden_surface.json"
 NEWTON_PYTHON = NEWTON_REPO / ".venv/bin/python"
-WARP_METAL_REPO = Path.home() / "work/warp-metal"
+WARP_METAL_REPO = Path(__file__).resolve().parent.parent
 
 
 # --------------------------------------------------------------------------
