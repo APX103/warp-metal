@@ -524,15 +524,30 @@ class TestTileModelPins(unittest.TestCase):
         self.assertIn("threadgroup tile storage budget exceeded", str(ctx.exception))
 
     def test_barrier_uniformity_rejection(self):
+        # fix-pass-2 doctrine (coordinator ruling): a PROVABLY block-uniform
+        # condition admits tile ops (1-D `wp.tid()` in a tiled launch IS the
+        # block index — uniform per the wp_tid1 routing; reduce results and
+        # uniform-address loads likewise). Only genuinely lane-derived
+        # conditions keep the fail-loud rejection.
         @wp.kernel
         def k_uniform(a: wp.array(dtype=wp.float32)):
+            i, lane = wp.tid()
             t = wp.tile_load(a, shape=(BD,), storage="shared")
-            if wp.tid() == 0:
+            if lane == 0:
                 s = wp.tile_sum(t)[0]
 
         with self.assertRaises(NotImplementedError) as ctx:
             self._translate(k_uniform, BD)
         self.assertIn("non-uniform control flow", str(ctx.exception))
+
+        @wp.kernel
+        def k_block_index(a: wp.array(dtype=wp.float32)):
+            blk = wp.tid()
+            t = wp.tile_load(a, shape=(BD,), storage="shared")
+            if blk == 0:
+                s = wp.tile_sum(t)[0]
+
+        self._translate(k_block_index, BD)  # block index: uniform, admitted
 
     def test_uniformity_compile_time_condition_exempt(self):
         # steel hinv_jt's `if COMPUTE_DIAG != 0:` — wp.constant folds to a
@@ -560,8 +575,9 @@ class TestTileModelPins(unittest.TestCase):
 
         @wp.kernel
         def k_runtime_if(a: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
+            i, lane = wp.tid()
             t = wp.tile_load(a, shape=(BD,), storage="shared")
-            if wp.tid() == 0:
+            if lane != 0:
                 wp.tile_store(out, wp.tile_sum(t))
 
         with self.assertRaises(NotImplementedError) as ctx:
@@ -1456,10 +1472,10 @@ class TestTileP5Pins(unittest.TestCase):
     def test_sort_uniformity_rejection(self):
         @wp.kernel
         def k_bad(a: wp.array(dtype=wp.float32), b: wp.array(dtype=wp.int32)):
-            blk = wp.tid()
+            blk, lane = wp.tid()
             keys = wp.tile_load(a, shape=(8,), offset=(blk * 8,), storage="shared")
             vals = wp.tile_load(b, shape=(8,), offset=(blk * 8,), storage="shared")
-            if blk == 0:
+            if lane == 0:
                 wp.tile_sort(keys, vals)
 
         with self.assertRaises(NotImplementedError) as ctx:
@@ -1497,11 +1513,15 @@ class TestTileP5Pins(unittest.TestCase):
         self.assertEqual(len(u.shr_arrays), 2)
 
     def test_stack_uniformity_rejection(self):
+        # genuinely lane-derived condition: `flag[0] > 0` is a uniform-address
+        # load (every lane reads the same bytes) and is ADMITTED under the
+        # fix-pass-2 doctrine — the fail-loud rejection belongs to conditions
+        # that vary across the block
         @wp.kernel
         def k_bad_push(a: wp.array(dtype=wp.int32), flag: wp.array(dtype=wp.int32)):
             blk, lane = wp.tid()
             s = wp.tile_stack(capacity=4, dtype=wp.int32)
-            if flag[0] > 0:
+            if lane == 2:
                 wp.tile_stack_push(s, lane, True)
 
         with self.assertRaises(NotImplementedError) as ctx:
@@ -1526,9 +1546,12 @@ class TestTileP5Pins(unittest.TestCase):
         self.assertIn("_wp_tile_shr_1[0]", src)  # count slot read survives
 
     def test_mesh_query_uniformity_rejection(self):
+        # lane-derived condition keeps the rejection (a uniform-address load
+        # condition like `flag[0] > 0` is admitted by the fix-pass-2 doctrine)
         @wp.kernel
-        def k_bad_mesh(mesh_id: wp.uint64, lo: wp.vec3, hi: wp.vec3, counts: wp.array(dtype=wp.int32), flag: wp.array(dtype=wp.int32)):
-            if flag[0] > 0:
+        def k_bad_mesh(mesh_id: wp.uint64, lo: wp.vec3, hi: wp.vec3, counts: wp.array(dtype=wp.int32)):
+            blk, lane = wp.tid()
+            if lane == 0:
                 query = wp.tile_mesh_query_aabb(mesh_id, lo, hi)
                 while wp.tile_query_valid(query):
                     result_tile = wp.tile_mesh_query_aabb_next(query)

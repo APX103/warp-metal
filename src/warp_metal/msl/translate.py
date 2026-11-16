@@ -1753,9 +1753,12 @@ class _BodyTranslator:
             stripped,
         )
         m_b = re.match(r"^builtin_tid(\d)d\(([A-Za-z0-9_,\s]+)\)\s*;?$", stripped)
-        if m or m_b:
+        m_ba = re.match(r"^(var_\w+)\s*=\s*builtin_tid(\d)d\(\)\s*;?$", stripped)
+        if m or m_b or m_ba:
             if m_b:
                 names = [t.strip() for t in m_b.group(2).split(",") if t.strip()]
+            elif m_ba:
+                names = [m_ba.group(1)]
             else:
                 names = [t.strip() for t in m.group(1).split(",")]
             for t in names:
@@ -1765,9 +1768,13 @@ class _BodyTranslator:
             # (block coords ..., lane) — every coordinate except the LAST is
             # shared verbatim by every lane of the block, so the mujoco
             # `worldid, dof_block_id, tid = wp.tid()` heads classify
-            # block-uniform and only the lane stays divergent
-            if self.unit.block_dim is not None and self.unit.block_dim > 1 and len(names) > 1:
-                for t in names[:-1]:
+            # block-uniform and only the lane stays divergent. The 1-D
+            # assign form is the degenerate tiled read of the BLOCK index
+            # (wp_tid1: `_idx / block_dim`) — uniform by the same token.
+            if self.unit.block_dim is not None and self.unit.block_dim > 1 and (
+                len(names) > 1 or m_ba
+            ):
+                for t in names[:-1] if len(names) > 1 else names:
                     self.uniform_vars.add(t)
             return
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+?);?$", stripped)
@@ -1883,9 +1890,12 @@ class _BodyTranslator:
         # warp funcs are pure functions of their arguments (a callee that
         # touches memory must take an array param, and array args are never
         # tracked uniform, so the call stays divergent above); native
-        # snippets in the closure are void tile-syncs and are never assigned
+        # snippets in the closure are void tile-syncs and are never assigned.
+        # Runtime intrinsics (builtin_tidNd() — the thread index — and any
+        # wp_ helper) are NOT pure functions of their (often empty) argument
+        # list and never take this path
         m_u = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\((.*)\)$", rhs, re.DOTALL)
-        if m_u:
+        if m_u and not m_u.group(1).startswith(("builtin_", "wp_")):
             args = split_args(m_u.group(2)) if m_u.group(2).strip() else []
             if all(self._is_uniform_expr(a) for a in args):
                 self.uniform_vars.add(name)
@@ -2182,7 +2192,13 @@ class _BodyTranslator:
                 )
             elif combine == "+":
                 lines.append(stage)
-                lines.append(f"    else {{ _wp_acc_{j} = _wp_acc_{j} + {arr}[{r_addr}]; }}")
+                if elem in _SCALAR_IDENT:
+                    lines.append(f"    else {{ _wp_acc_{j} = _wp_acc_{j} + {arr}[{r_addr}]; }}")
+                else:
+                    # struct elements have no operator+ on threadgroup
+                    # lvalues — route through the same prelude helper the
+                    # builtin mat add lowers to (componentwise wp_add)
+                    lines.append(f"    else {{ _wp_acc_{j} = wp_add(_wp_acc_{j}, {arr}[{r_addr}]); }}")
             elif combine == "|":
                 lines.append(stage)
                 lines.append(f"    else {{ _wp_acc_{j} = _wp_acc_{j} | {arr}[{r_addr}]; }}")
@@ -2191,10 +2207,23 @@ class _BodyTranslator:
                 lines.append(f"    else {{ _wp_acc_{j} = {combine}(_wp_acc_{j}, {arr}[{r_addr}]); }}")
             lines += [
                 "}",
-                f"_wp_tile_shr_{j}[_wp_lane] = _wp_has_{j} ? _wp_acc_{j} : _wp_ident_{j};",
             ]
             if arg_op:
+                # BOTH trees stage: the value scratch feeds the comparison
+                # tree, the index scratch the tie-break — staging only the
+                # index leaves the value tree reading uninitialized
+                # threadgroup memory (the argmin/argmax elem is scalar —
+                # non-scalar was rejected above — so the ternary is exact)
+                lines.append(f"_wp_tile_shr_{j}[_wp_lane] = _wp_has_{j} ? _wp_acc_{j} : _wp_ident_{j};")
                 lines.append(f"_wp_tile_shr_{j_idx}[_wp_lane] = _wp_has_{j} ? _wp_first_{j} : 2147483647;")
+            elif elem in _SCALAR_IDENT:
+                lines.append(f"_wp_tile_shr_{j}[_wp_lane] = _wp_has_{j} ? _wp_acc_{j} : _wp_ident_{j};")
+            else:
+                # the ternary operator has no struct form in MSL — branch
+                lines += [
+                    f"if (_wp_has_{j}) {{ _wp_tile_shr_{j}[_wp_lane] = _wp_acc_{j}; }}",
+                    f"else {{ _wp_tile_shr_{j}[_wp_lane] = _wp_ident_{j}; }}",
+                ]
         else:
             # scalar broadcast tile: each lane stages its own element
             lines += [
@@ -2232,9 +2261,15 @@ class _BodyTranslator:
         else:
             shr_lhs = f"_wp_tile_shr_{j}[_wp_lane]"
             shr_rhs = f"_wp_tile_shr_{j}[_wp_lane + _wp_s]"
-            combined = (
-                f"({shr_lhs} {combine} {shr_rhs})" if combine in ("+", "|") else f"{combine}({shr_lhs}, {shr_rhs})"
-            )
+            if combine == "+" and elem not in _SCALAR_IDENT:
+                # struct elements: no operator+ on threadgroup lvalues — the
+                # prelude's componentwise helper (same form the builtin mat
+                # add lowers to)
+                combined = f"wp_add({shr_lhs}, {shr_rhs})"
+            elif combine in ("+", "|"):
+                combined = f"({shr_lhs} {combine} {shr_rhs})"
+            else:
+                combined = f"{combine}({shr_lhs}, {shr_rhs})"
             lines += [
                 f"for (int _wp_s = {bd} >> 1; _wp_s > 0; _wp_s >>= 1) {{",
                 "    if (_wp_lane < _wp_s && _wp_lane + _wp_s < _wp_live) {",
@@ -4786,12 +4821,22 @@ class _BodyTranslator:
                 return self._tile_load_indexed(target, rhs)
             if rhs.startswith(("wp::tile_binary_map(", "wp::tile_unary_map(", "wp::tile_map(")):
                 return self._tile_map(target, rhs)
-            if m_tilebin := re.match(r"^wp::tile_(mul|add|sub|div|mod|min|max)\(", rhs):
+            if rhs.startswith(("wp::tile_reduce(", "wp::tile_sum(", "wp::tile_argmin(", "wp::tile_argmax(")):
+                return self._tile_reduce(target, rhs)
+            if m_mmx := re.match(r"^wp::tile_(min|max)\(", rhs):
+                # two homonyms: the 1-arg convenience reduce form and the
+                # adjoint's folded binary map (tile⊗tile/tile⊗scalar) —
+                # dispatch on arity, the reduce branch first (it must win
+                # over the binop matcher below for the 1-arg shape)
+                open_p = rhs.index("(")
+                close = _find_balanced(rhs, open_p)
+                if len(split_args(rhs[open_p + 1 : close])) == 1:
+                    return self._tile_reduce(target, rhs)
+                return self._tile_binop(target, rhs, m_mmx.group(1))
+            if m_tilebin := re.match(r"^wp::tile_(mul|add|sub|div|mod)\(", rhs):
                 return self._tile_binop(target, rhs, m_tilebin.group(1))
             if rhs.startswith("wp::tile<"):
                 return self._tile_broadcast(target, rhs)
-            if rhs.startswith("wp::tile_reduce(") or rhs.startswith("wp::tile_sum(") or rhs.startswith("wp::tile_min(") or rhs.startswith("wp::tile_max(") or rhs.startswith("wp::tile_argmin(") or rhs.startswith("wp::tile_argmax("):
-                return self._tile_reduce(target, rhs)
             if rhs.startswith("wp::tile_zeros<"):
                 return self._tile_zeros(target, rhs)
             if rhs.startswith("wp::tile_arange<"):

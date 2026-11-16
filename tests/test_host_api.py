@@ -33,7 +33,7 @@ import warp_metal as wp
 from warp_metal.msl.prelude import prelude_source
 from warp_metal.msl.translate import translate_kernel
 
-_TILE_SYNC_MSL_DEF = "#define WP_TILE_SYNC threadgroup_barrier(mem_flags::mem_threadgroup)"
+_TILE_SYNC_MSL_DEF = "#define WP_TILE_SYNC() threadgroup_barrier(mem_flags::mem_threadgroup)"
 
 
 @wp.func_native(snippet="WP_TILE_SYNC();")

@@ -3181,15 +3181,18 @@ static inline int wp_mesh_get_index(wp_mesh mesh, int face_vertex_index) {
 # mujoco_warp embeds @wp.func_native snippets calling WP_TILE_SYNC() verbatim
 # (smooth.py:3591, solver.py:903); M1.4 inlines those snippets into this
 # compile unit, so the macro must exist here. Upstream defines it as
-# __syncthreads on CUDA; the MSL equivalent is the threadgroup barrier.
-# Object-like (matching upstream) so both WP_TILE_SYNC(); and a bare
-# WP_TILE_SYNC; statement expand; emitted before every other section so all
+# __syncthreads on CUDA — a function NAME, so both WP_TILE_SYNC(); and a bare
+# WP_TILE_SYNC; resolve; the MSL equivalent is the threadgroup_barrier CALL
+# expression, which only works under a function-like macro (an object-like
+# body would expand WP_TILE_SYNC() to `threadgroup_barrier(...)()` — "called
+# object type 'void'"). Nothing in the closure or the emitter mentions the
+# bare form. Function-like, emitted before every other section so all
 # kernels share it (prelude discipline: one shared compile unit, so the
 # definition must be inert for kernels that never call it — an unused
 # preprocessor define is).
 _TILE_SYNC = """\
 // ---- WP_TILE_SYNC (upstream warp/native/tile.h:66) ----
-#define WP_TILE_SYNC threadgroup_barrier(mem_flags::mem_threadgroup)
+#define WP_TILE_SYNC() threadgroup_barrier(mem_flags::mem_threadgroup)
 """
 
 _PRELUDE = (
