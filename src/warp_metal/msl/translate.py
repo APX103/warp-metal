@@ -5627,11 +5627,21 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
 
     # ---- transitive user functions, callees first ----
     user_funcs: dict[str, MSLFunction] = {}
+    visited: set[int] = set()
 
     def visit(f):
-        fname = f.native_func
-        if fname in user_funcs:
+        # dedup on the Function OBJECT: generic (@wp.func with Any params)
+        # instantiations share the parent's native_func, so the float and
+        # vec3 instances of _alm_relaxed_ascent both arrive as
+        # `_alm_relaxed_ascent_0`. Upstream emits both C++ definitions under
+        # the shared name and lets C++ overload resolution dispatch the
+        # identical call-site text (update_duals_joint) — MSL is C++14, so
+        # the same works here: every distinct instance gets its definition,
+        # and only _call_user's wiring needs a representative.
+        if id(f) in visited:
             return
+        visited.add(id(f))
+        fname = f.native_func
         snippet = getattr(f, "native_snippet", None)
         if snippet:
             fn = _translate_native_function(f, snippet, unit, _codegen)
@@ -5641,7 +5651,19 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
         for callee in f.adj.called_user_functions:
             visit(callee)
         fn = _translate_function(f, unit, user_funcs, _codegen)
-        user_funcs[fname] = fn
+        existing = user_funcs.get(fname)
+        if existing is not None:
+            # kind divergence would mis-wire array/struct args at call sites
+            # resolved through the first-registered instance — fail loud
+            kinds = [p.kind for p in fn.params]
+            if kinds != [p.kind for p in existing.params]:
+                raise TranslationError(
+                    f"function {fname}: generic instances share this native name with "
+                    f"incompatible parameter kinds {kinds} vs "
+                    f"{[p.kind for p in existing.params]} — the shim cannot wire both"
+                )
+        else:
+            user_funcs[fname] = fn
         if not getattr(fn, "is_template", False):
             unit.functions.append(fn)
 
