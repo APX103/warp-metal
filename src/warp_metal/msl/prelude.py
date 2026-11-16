@@ -616,6 +616,9 @@ static inline float wp_min(vec4f a) { return min(min(a.x, a.y), min(a.z, a.w)); 
 static inline float wp_max(vec2f a) { return max(a.x, a.y); }
 static inline float wp_max(vec3f a) { return max(max(a.x, a.y), a.z); }
 static inline float wp_max(vec4f a) { return max(max(a.x, a.y), max(a.z, a.w)); }
+// spatial reduce (vec.h reduce over vec_t<6>: max of the w/v halves)
+static inline float wp_max(spatial_vectorf a) { return max(wp_max(a.w), wp_max(a.v)); }
+static inline float wp_min(spatial_vectorf a) { return min(wp_min(a.w), wp_min(a.v)); }
 static inline vec2f wp_abs(vec2f a) { return make_vec2f(abs(a.x), abs(a.y)); }
 static inline vec3f wp_abs(vec3f a) { return make_vec3f(abs(a.x), abs(a.y), abs(a.z)); }
 static inline vec4f wp_abs(vec4f a) { return make_vec4f(abs(a.x), abs(a.y), abs(a.z), abs(a.w)); }
@@ -1875,6 +1878,21 @@ static inline spatial_vectorf wp_mul(spatial_vectorf a, float s) {
     spatial_vectorf r; r.w = a.w * s; r.v = a.v * s; return r;
 }
 static inline spatial_vectorf operator*(spatial_vectorf a, float s) { return wp_mul(a, s); }
+// div (vec.h:251/270 — elementwise scalar division, both operand orders;
+// spatial_vector_t is vec_t<6>, same ops)
+static inline spatial_vectorf wp_div(spatial_vectorf a, float s) {
+    spatial_vectorf r; r.w = wp_div(a.w, s); r.v = wp_div(a.v, s); return r;
+}
+static inline vec2f wp_div(float s, vec2f a) { return make_vec2f(s / a.x, s / a.y); }
+static inline vec3f wp_div(float s, vec3f a) { return make_vec3f(s / a.x, s / a.y, s / a.z); }
+static inline vec4f wp_div(float s, vec4f a) { return make_vec4f(s / a.x, s / a.y, s / a.z, s / a.w); }
+static inline spatial_vectorf wp_div(float s, spatial_vectorf a) {
+    spatial_vectorf r; r.w = wp_div(s, a.w); r.v = wp_div(s, a.v); return r;
+}
+// abs (vec.h:1246 — elementwise; spatial_vector_t is vec_t<6>)
+static inline spatial_vectorf wp_abs(spatial_vectorf a) {
+    spatial_vectorf r; r.w = wp_abs(a.w); r.v = wp_abs(a.v); return r;
+}
 // quat arithmetic (quat.h add/sub/mul scale)
 static inline quatf operator+(quatf a, quatf b) { return make_quatf(a.x+b.x, a.y+b.y, a.z+b.z, a.w+b.w); }
 static inline quatf operator-(quatf a, quatf b) { return make_quatf(a.x-b.x, a.y-b.y, a.z-b.z, a.w-b.w); }
