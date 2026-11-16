@@ -4313,6 +4313,14 @@ class _BodyTranslator:
             return f"({tgt} = wp_vec_insert({tgt}, {self.expr(args[1])}, {self.expr(args[2])}))"
         if key == "wp::load":
             return self._load(args[0])
+        if key == "wp::len":
+            # array.h:2297 len(const A<T>& a) → a.shape[0]. Only the array
+            # overload survives to codegen (vec/matrix/tile forms are folded
+            # by static_len_value_func at adjoint build).
+            spec = self.array_args.get(args[0].strip())
+            if spec is None:
+                raise TranslationError(f"wp::len on non-array arg {args[0]!r}")
+            return f"{self._meta_ref(spec)}.shape[0]"
         if key == "wp::address":
             raise TranslationError("wp::address outside assignment (aliasing context)")
         if key == "wp::range":
