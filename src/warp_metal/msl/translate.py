@@ -697,6 +697,21 @@ _CTOR_TABLE = {
     "wp::transform_t<wp::float32>": "make_transformf",
 }
 
+# multi-output builtins: upstream codegen appends the SSA output vars as
+# trailing call arguments (codegen.py forward call = func(fwd_args +
+# output_list)), so the SSA statement has more args than the builtin's
+# inputs and no return value. Each entry: number of leading input args,
+# the output vars' MSL types in order, and the prelude out-param function.
+# Statement-context only — a value-context tuple use still fails loud
+# through the generic no-translation path.
+_MULTI_OUT_BUILTINS = {
+    "wp::quat_to_axis_angle": {
+        "inputs": 1,
+        "outputs": ("vec3f", "float"),
+        "msl": "wp_quat_to_axis_angle",
+    },
+}
+
 # zero-arg template constructors: wp::x<wp::float32>() → <msl>
 _ZEROARG_TABLE = {
     "wp::quat_identity<wp::float32>": "wp_quat_identity()",
@@ -5284,8 +5299,40 @@ class _BodyTranslator:
             return f"*wp_address({self._data_expr(spec)}, {self._meta_ref(spec)}{', ' + idx if idx else ''}) = {value}"
         if key and key[4:].startswith("atomic_"):
             return self._atomic(key[4:], args)
+        if key in _MULTI_OUT_BUILTINS:
+            return self._multi_out_call(key, args)
         # value-producing builtins as statements: emit as expression statement
         return self._call(src)
+
+    def _multi_out_call(self, key: str, args: list[str]) -> str:
+        """Multi-output builtin statement (upstream codegen emits
+        ``func(fwd_args + output_list)`` — the SSA output vars ride as
+        trailing call arguments, cf. the native exports
+        ``wp_builtin_quat_to_axis_angle_quatf(q, ret_0, ret_1)``).
+
+        Lowered through per-output thread temps aliased to the SSA vars:
+        the decls + call land on one statement line, so the temps are in
+        scope exactly where upstream declares its output vars (the call
+        site's block); the following SSA loads resolve through the alias
+        table."""
+        spec = _MULTI_OUT_BUILTINS[key]
+        n_in = spec["inputs"]
+        out_types = spec["outputs"]
+        out_vars = [a.strip() for a in args[n_in:]]
+        if len(out_vars) != len(out_types):
+            raise TranslationError(
+                f"{key}: expected {n_in} input + {len(out_types)} output args, got {len(args)} args"
+            )
+        in_exprs = [self.expr(a) for a in args[:n_in]]
+        parts: list[str] = []
+        call_args = list(in_exprs)
+        for var, msl_t in zip(out_vars, out_types):
+            temp = f"_wp_out_{var}"
+            parts.append(f"{msl_t} {temp};")
+            self.aliases[var] = (False, temp)
+            call_args.append(temp)
+        parts.append(f"{spec['msl']}({', '.join(call_args)})")
+        return " ".join(parts)
 
     def _atomic(self, op: str, args: list[str], ret: bool = False) -> str:
         arr_var = args[0].strip()

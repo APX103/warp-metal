@@ -906,6 +906,21 @@ static inline quatf wp_quat_from_axis_angle(vec3f axis, float angle) {
     return make_quatf(axis.x*s, axis.y*s, axis.z*s, w);
 }
 
+// quat.h quat_to_axis_angle (exact port): axis sign follows q.w so that
+// quat_from_axis_angle(axis, angle) == normalize(q) or -normalize(q);
+// angle = 2*atan2(|v|, |w|) in [0, pi]. Multi-output builtin: the translator
+// appends the SSA output vars as thread-ref out-params (upstream codegen
+// emits func(fwd_args + output_list) → native quat_to_axis_angle(q, axis&, angle&)).
+static inline void wp_quat_to_axis_angle(quatf q, thread vec3f& axis, thread float& angle) {
+    vec3f v = make_vec3f(q.x, q.y, q.z);
+    vec3f n = normalize(v);
+    if (q.w < 0.0f) {
+        n = make_vec3f(-n.x, -n.y, -n.z);
+    }
+    axis = n;
+    angle = 2.0f * atan2(length(v), fabs(q.w));
+}
+
 // ---- transform ops (spatial.h, exact ports) ----
 static inline transformf wp_transform_identity() { transformf t; t.p = make_vec3f(); t.q = wp_quat_identity(); return t; }
 static inline vec3f wp_transform_get_translation(transformf t) { return t.p; }
@@ -1521,6 +1536,38 @@ static inline mat33f wp_atomic_add_ret_at(device mat33f* d, wp_arr_meta m, int i
     for (int r = 0; r < 3; ++r)
         for (int q = 0; q < 3; ++q)
             old.c[r][q] = wp_atomic_add_ret(c + r * 3 + q, v.c[r][q]);
+    return old;
+}
+// 1D mat33f component-wise add/sub (VBD rigid-contact kernels accumulate
+// per-body hessian blocks with wp.atomic_add on array[mat33]; the .c[3][3]
+// row-major float components are independently atomic, upstream
+// vec.h/mat.h lower vector/matrix atomics per component)
+static inline void wp_atomic_add_at(device mat33f* d, wp_arr_meta m, int i, mat33f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    for (int r = 0; r < 3; ++r)
+        for (int q = 0; q < 3; ++q)
+            wp_atomic_add(c + r * 3 + q, v.c[r][q]);
+}
+static inline mat33f wp_atomic_add_ret_at(device mat33f* d, wp_arr_meta m, int i, mat33f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    mat33f old;
+    for (int r = 0; r < 3; ++r)
+        for (int q = 0; q < 3; ++q)
+            old.c[r][q] = wp_atomic_add_ret(c + r * 3 + q, v.c[r][q]);
+    return old;
+}
+static inline void wp_atomic_sub_at(device mat33f* d, wp_arr_meta m, int i, mat33f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    for (int r = 0; r < 3; ++r)
+        for (int q = 0; q < 3; ++q)
+            wp_atomic_sub(c + r * 3 + q, v.c[r][q]);
+}
+static inline mat33f wp_atomic_sub_ret_at(device mat33f* d, wp_arr_meta m, int i, mat33f v) {
+    device atomic_float* c = (device atomic_float*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    mat33f old;
+    for (int r = 0; r < 3; ++r)
+        for (int q = 0; q < 3; ++q)
+            old.c[r][q] = wp_atomic_sub_ret(c + r * 3 + q, v.c[r][q]);
     return old;
 }
 // spatial component index write (same index map as wp_extract: i<3 -> w,
