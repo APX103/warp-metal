@@ -13,6 +13,20 @@ shim's own inner bound (WARP_METAL_DISPATCH_TIMEOUT_S default 120 s) and is
 NEVER set here. Runs are strictly sequential: exactly one Metal process at a
 time (solo-GPU discipline).
 
+Pacing (mandatory, default-on — Apple Silicon shares the GPU with the
+display, and sustained max-duty Metal work starves WindowServer and makes
+the whole machine unusable):
+
+- ``SMOKE_PACING_S`` — seconds to sleep after EVERY example completes
+  (default 10). Set to ``0`` only when the user explicitly asks for an
+  unpaced run.
+- A 30 s cooldown fires after every 10 examples on top of the per-example
+  pacing.
+- ``--test`` runs always use the example's default frame count: the
+  ``test_final`` success criteria are calibrated to those defaults, so
+  shrinking the frame budget would change test semantics rather than load.
+  The no-test-criteria fallback already runs a reduced plain 50-frame pass.
+
 Results are appended to <log-dir>/results.json after every example so a
 partial run is still a usable state. ``--resume`` (default) skips examples
 already recorded there. Logs land at <log-dir>/<name>.log (gitignored path).
@@ -39,6 +53,12 @@ RESULTS_PATH = os.path.join(LOG_DIR, "results.json")
 
 TIMEOUT_S = 240
 TAIL_LINES = 60
+
+# Display-shared-GPU pacing (see module docstring): sleep after every example,
+# plus a longer cooldown every N examples.
+PACING_S = int(os.environ.get("SMOKE_PACING_S", "10"))
+COOLDOWN_EVERY = 10
+COOLDOWN_S = 30
 
 # The canonical run list: every name printed by `uv run -m newton.examples
 # --list` at S1 start (124 entries). Regenerate with --refresh-list if the
@@ -302,6 +322,7 @@ def main() -> int:
         results = {}
 
     n_pass = n_fail = n_skip = 0
+    ran_since_cooldown = 0
     for i, name in enumerate(names):
         if name in results and not args.fresh:
             n_skip += 1
@@ -319,6 +340,15 @@ def main() -> int:
             print("    tail:", flush=True)
             for ln in rec["tail"].splitlines()[-12:]:
                 print(f"      {ln}", flush=True)
+        ran_since_cooldown += 1
+        # Display-shared-GPU pacing: never run examples back-to-back.
+        if PACING_S > 0:
+            time.sleep(PACING_S)
+        if ran_since_cooldown >= COOLDOWN_EVERY:
+            ran_since_cooldown = 0
+            if COOLDOWN_S > 0:
+                print(f"    (cooldown {COOLDOWN_S}s after {COOLDOWN_EVERY} examples)", flush=True)
+                time.sleep(COOLDOWN_S)
 
     print(f"\ndone: pass={n_pass} fail={n_fail} skipped-already-recorded={n_skip}")
     return 0 if n_fail == 0 else 1
