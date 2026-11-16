@@ -397,7 +397,8 @@ class Texture:
                 can be used.
             cuda_array: CUDA array handle to wrap an external texture (``cudaArray_t``).
         """
-        import _pkg.context  # noqa: PLC0415
+        from . import context as _context_init  # noqa: F401, PLC0415
+        from . import _pkg  # noqa: PLC0415 -- lazy cross-module namespace (upstream: import warp._src.context)
 
         if ndim < 1 or ndim > 3:
             raise ValueError(f"Texture dimensionality must be 1, 2, or 3, got {ndim}")
@@ -818,7 +819,8 @@ class Texture:
             if not result:
                 raise RuntimeError(f"Failed to copy to texture: {self._runtime.get_error_string()}")
         else:
-            import _pkg.context  # noqa: PLC0415
+            from . import context as _context_init  # noqa: F401, PLC0415
+            from . import _pkg  # noqa: PLC0415 -- lazy cross-module namespace (upstream: import warp._src.context)
 
             # CPU textures can be copied as contiguous arrays, but copying to a CUDA texture is a special case.
             if isinstance(src, Texture):
@@ -925,7 +927,8 @@ class Texture:
             if not result:
                 raise RuntimeError(f"Failed to copy to texture: {self._runtime.get_error_string()}")
         else:
-            import _pkg.context  # noqa: PLC0415
+            from . import context as _context_init  # noqa: F401, PLC0415
+            from . import _pkg  # noqa: PLC0415 -- lazy cross-module namespace (upstream: import warp._src.context)
 
             # CPU textures can be copied as contiguous arrays, but copying to a CUDA texture is a special case.
             if isinstance(dst, Texture):
@@ -1643,7 +1646,8 @@ class GLTextureResource:
         """
         from pyglet import gl  # noqa: PLC0415
 
-        import _pkg.context  # noqa: PLC0415
+        from . import context as _context_init  # noqa: F401, PLC0415
+        from . import _pkg  # noqa: PLC0415 -- lazy cross-module namespace (upstream: import warp._src.context)
 
         if gl_tex_target == gl.GL_TEXTURE_1D:
             self._TextureClass = Texture1D

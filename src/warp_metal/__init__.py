@@ -161,6 +161,20 @@ from .frontend import types as types  # noqa: F401  (upstream: wp.types.vector(.
 from .frontend.config import DeterministicMode  # noqa: F401  (newton module_options)
 from .frontend.builtins import static as static  # noqa: F401  (upstream: plain identity fn, wp.static(expr))
 
+# Texture API surface (upstream warp/__init__.py:81-88 — Newton's sensor
+# camera render context builds wp.Texture2D objects and reads
+# wp.TextureFilterMode / wp.TextureAddressMode at host level)
+from .frontend.texture import (  # noqa: F401
+    GLTextureResource,
+    Texture,
+    Texture1D,
+    Texture2D,
+    Texture3D,
+    TextureAddressMode,
+    TextureFilterMode,
+    TextureResourceFlags,
+)
+
 _src = _sys.modules["warp_metal.frontend"]  # upstream: warp._src
 _src.__name__ = "warp_metal._src"  # display parity with the upstream alias
 
