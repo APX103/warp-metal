@@ -80,7 +80,7 @@ NEWTON_REPO = str(paths.newton_repo())
 LOG_DIR = "/tmp/phase4_smoke_logs"
 RESULTS_PATH = os.path.join(LOG_DIR, "results.json")
 
-TIMEOUT_S = 240
+TIMEOUT_S = int(os.environ.get("SMOKE_TIMEOUT_S", "240"))
 TAIL_LINES = 60
 
 # Display-shared-GPU pacing (see module docstring): sleep after every example,
