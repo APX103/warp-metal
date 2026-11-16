@@ -994,7 +994,36 @@ def copy(dest, src, dest_offset=0, src_offset=0, count=None, stream=None):
     launches around it. Ineligible copies keep the host path under the knob
     too, as does ``WARP_METAL_SYNC_EAGER=1``.
     """
-    if not isinstance(src, WarpArray) or not isinstance(dest, WarpArray):
+    src_is_warp = isinstance(src, WarpArray)
+    dest_is_warp = isinstance(dest, WarpArray)
+    if not (src_is_warp and dest_is_warp):
+        if not src_is_warp and not dest_is_warp:
+            # vendored frontend arrays (texture staging: array(data,
+            # device="cpu") in Texture.__init__ → _init_from_data → this
+            # copy) are host-side ptr-backed arrays, not runtime WarpArrays.
+            # Upstream copy() copies between two array objects with a raw
+            # memcpy — do the same on the host when both sides are
+            # contiguous and element-size compatible; anything else fails
+            # loud rather than silently corrupting.
+            from ..frontend.types import type_size_in_bytes
+
+            if (
+                getattr(dest, "ptr", None) is not None
+                and getattr(src, "ptr", None) is not None
+                and getattr(dest, "is_contiguous", False)
+                and getattr(src, "is_contiguous", False)
+                and type_size_in_bytes(dest.dtype) == type_size_in_bytes(src.dtype)
+                and dest.size == src.size
+            ):
+                if dest_offset or src_offset or count is not None:
+                    raise NotImplementedError(
+                        "vendored-array host copy supports full-range copies only "
+                        "(the texture staging path passes no offsets)"
+                    )
+                import ctypes as _ctypes
+
+                _ctypes.memmove(dest.ptr, src.ptr, dest.capacity)
+                return
         # upstream: "Copy source and destination must be arrays" (context.py:15197)
         raise RuntimeError("Copy source and destination must be arrays")
     if src.item_bytes != dest.item_bytes:

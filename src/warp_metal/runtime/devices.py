@@ -79,6 +79,42 @@ class Event:
         return f"Event(name={self.name!r}, device={self.device.name!r})"
 
 
+class _DeviceAllocator:
+    """Shared-memory allocator for the vendored frontend array path
+    (upstream ``Device.get_allocator`` semantics).
+
+    Every warp-metal allocation lives in shared unified memory
+    (MTLBuffer-backed, CPU-accessible pointer), so the upstream
+    host/device allocator split collapses to one implementation. The
+    vendored ``array._init_new`` allocates through ``allocate(capacity)`` /
+    ``deallocate(ptr, capacity)`` raw pointers; this allocator maps those
+    pointers to their MTLBuffer handles for release."""
+
+    # ptr -> native MTLBuffer handle (strong refs: the handle must outlive
+    # the raw pointer handed out to the vendored array until deallocate)
+    _HANDLES: dict[int, object] = {}
+
+    def allocate(self, capacity: int) -> int:
+        from .. import native as _mm
+
+        handle = _mm.buffer_create(int(capacity))
+        ptr = _mm.buffer_ptr(handle)
+        self._HANDLES[ptr] = handle
+        return ptr
+
+    def deallocate(self, ptr: int, capacity: int) -> None:
+        from .. import native as _mm
+
+        handle = self._HANDLES.pop(int(ptr), None)
+        if handle is not None:
+            _mm.buffer_release(handle)
+
+    # the runtime Device has no CUDA context; __del__ must call the deleter
+    # directly instead of taking the (AttributeError-suppressed) guard path,
+    # which would leak every allocation
+    deallocate_requires_context_guard = False
+
+
 class Device:
     """A compute device.
 
@@ -176,6 +212,16 @@ class Device:
     def __exit__(self, exc_type, exc, tb):
         set_device(self._prev)
         return False
+
+    def get_allocator(self, pinned: bool = False):
+        """Host allocator for the vendored frontend array path (upstream
+        ``Device.get_allocator``). Pinned allocation is a KEP-0001 Non-Goal
+        (the runtime WarpArray rejects it too)."""
+        if pinned:
+            raise RuntimeError(
+                "warp-metal does not support pinned allocation flags (KEP-0001 Non-Goal)"
+            )
+        return _DeviceAllocator()
 
 
 def _query_metal_arch() -> int:

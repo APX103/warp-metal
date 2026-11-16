@@ -757,10 +757,20 @@ class Device:
 
 
 def get_device(device=None):
-    """Placeholder device resolution (M1.2 replaces this)."""
-    if device is None or isinstance(device, str) and device == "cpu":
+    """Placeholder device resolution (M1.2 replaces this).
+
+    Resolves None and the "cpu" string locally; everything else (Device
+    objects, "metal", aliases) delegates to the host runtime device
+    registry so vendored callers (``Texture.__init__``, the array data-init
+    fallbacks) get exactly the upstream runtime-backed resolution — Newton
+    threads Device objects (e.g. ``arr.device``) into these paths."""
+    if device is None:
         return device
-    raise RuntimeError(f"get_device({device!r}) requires the host runtime (M1.2)")
+    if isinstance(device, str) and device == "cpu":
+        return device
+    from ..runtime.devices import get_device as _rt_get_device
+
+    return _rt_get_device(device)
 
 
 def call_builtin_from_desc(desc, args, *rest):
@@ -775,7 +785,12 @@ def _get_array_memory_kind(arr):
 
 
 def _get_apic_capture_for_device(device):
-    raise RuntimeError("apic capture is not supported by warp-metal (KEP-0001 Non-Goal)")
+    """Upstream returns the device's in-progress APIC capture (or None).
+    warp-metal has no APIC captures at all, so the answer is always None —
+    the vendored array path calls this unconditionally on EVERY allocation
+    (types.py:4104) to tag graph-scoped memory, which upstream treats as
+    absent on non-APIC devices. APIC capture requests fail loud elsewhere."""
+    return None
 
 
 class CudaDefaultAllocator:
