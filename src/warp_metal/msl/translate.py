@@ -3477,9 +3477,17 @@ class _BodyTranslator:
         bd = self.unit.block_dim
 
         def ai(r: str, c: str) -> str:
-            # A diagonal/reads use tile_coord(j, j); row updates read
-            # A(j, i) when upper else A(i, j) — through A's own mapping
-            return a_t.coord_addr([c, r] if upper else [r, c])
+            # A is read in ORIGINAL coordinates — upstream reads the fill-mode
+            # triangle literally: A.data(tile_coord(j, i)) for upper, A.data(
+            # tile_coord(i, j)) for lower (tile_cholesky.h:116); only the OUT
+            # mapping (oi) is transposed. The call sites pass the upstream
+            # order already, so this is the identity — transposing here (or at
+            # the call site) double-swaps onto the opposite triangle and
+            # silently drops the coupling entries of a triangle-filled input
+            # (the mjw Hessian stores J^T D A J fill-in in the upper triangle
+            # only), which perturbs the factor and NaNs the augmented border
+            # block downstream.
+            return a_t.coord_addr([r, c])
 
         def oi(r: str, c: str) -> str:
             return o_t.coord_addr([c, r] if upper else [r, c])

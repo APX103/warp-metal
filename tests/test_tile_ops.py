@@ -879,6 +879,14 @@ def k_chol_inplace(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.flo
 
 
 @wp.kernel
+def k_chol_inplace_upper(a: wp.array2d(dtype=wp.float32), out: wp.array2d(dtype=wp.float32)):
+    blk = wp.tid()
+    t = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
+    wp.tile_cholesky_inplace(t, fill_mode="upper")
+    wp.tile_store(out, t, offset=(blk * 4, 0))
+
+
+@wp.kernel
 def k_lower_solve(a: wp.array2d(dtype=wp.float32), y: wp.array(dtype=wp.float32), out: wp.array(dtype=wp.float32)):
     blk = wp.tid()
     l = wp.tile_load(a, shape=(4, 4), offset=(blk * 4, 0), storage="shared")
@@ -1848,6 +1856,38 @@ class TestTileCholeskySolve(unittest.TestCase):
         wp.launch_tiled(k_chol_inplace, dim=n_blocks, inputs=[aa, out], block_dim=BD, device="metal")
         wp.synchronize()
         want = np.concatenate([np.linalg.cholesky(h[b].astype(np.float64))[None] for b in range(n_blocks)])
+        np.testing.assert_allclose(out.numpy_view().reshape(n_blocks, 4, 4), want, rtol=1e-4, atol=1e-5)
+
+    def test_cholesky_upper_triangle_filled(self):
+        # regression (KEP-0001 M3.2, mjw _update_gradient_cholesky_blocked
+        # NaN): the mjw Hessian stores J^T D A J fill-in in the UPPER triangle
+        # only (the lower is pure diagonal), and upstream's upper fill mode
+        # reads A(j, i) — that same triangle (tile_cholesky.h:116). The
+        # tile_cholesky_inplace A-read must NOT be transposed: a double swap
+        # (transposing helper + swapped call site) silently read the zero
+        # lower triangle, dropped every coupling term from the factor, and
+        # NaN'd the augmented border block downstream. The _spd fixtures are
+        # symmetric and mask the triangle choice — this fixture is not.
+        n_blocks = 2
+        rng = np.random.default_rng(39)
+        hs = []
+        for _ in range(n_blocks):
+            a = rng.standard_normal((4, 4)).astype(np.float32)
+            upper = np.triu(a @ a.T, 1).astype(np.float32)
+            diag = (np.eye(4, dtype=np.float32) * 4.0 + rng.uniform(0.5, 1.5, (4, 1)).astype(np.float32)).astype(
+                np.float32
+            )
+            h = (upper + diag).astype(np.float32)  # upper fill-in, diagonal rest
+            hs.append(h[None])
+        h = np.concatenate(hs, axis=0)
+        aa = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        aa.numpy_view()[:] = h.reshape(n_blocks * 4, 4)
+        out = wp.zeros((n_blocks * 4, 4), dtype=wp.float32, device="metal")
+        wp.launch_tiled(k_chol_inplace_upper, dim=n_blocks, inputs=[aa, out], block_dim=BD, device="metal")
+        wp.synchronize()
+        # numpy chol reads the LOWER triangle: feed A.T so the upper-filled
+        # triangle is the one read, then transpose back to the upper factor
+        want = np.concatenate([np.linalg.cholesky(h[b].T.astype(np.float64)).T[None] for b in range(n_blocks)])
         np.testing.assert_allclose(out.numpy_view().reshape(n_blocks, 4, 4), want, rtol=1e-4, atol=1e-5)
 
     def test_lower_solve_vector_and_matrix(self):
