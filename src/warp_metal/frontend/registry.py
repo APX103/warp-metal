@@ -664,6 +664,12 @@ class _CoreShim:
         cls._as_f32(out_ref, 4)[:] = (m44 @ cls._as_f32(v, 4)).astype(np.float32)
 
     @classmethod
+    def wp_builtin_mul_mat44f_mat44f(cls, a, b, out_ref) -> None:
+        a44 = cls._as_f32(a, 16).reshape(4, 4)
+        b44 = cls._as_f32(b, 16).reshape(4, 4)
+        cls._as_f32(out_ref, 16)[:] = (a44 @ b44).reshape(-1).astype(np.float32)
+
+    @classmethod
     def wp_builtin_transpose_mat33f(cls, m, out_ref) -> None:
         cls._as_f32(out_ref, 9)[:] = cls._as_f32(m, 9).reshape(3, 3).T.reshape(-1).astype(np.float32)
 
@@ -691,6 +697,21 @@ class _CoreShim:
     def wp_builtin_determinant_mat33f(cls, m, out_ref) -> None:
         m33 = cls._as_f32(m, 9).reshape(3, 3)
         cls._as_f32(out_ref, 1)[:] = np.float32(np.linalg.det(m33))
+
+    @classmethod
+    def wp_builtin_inverse_mat44f(cls, m, out_ref) -> None:
+        m44 = cls._as_f32(m, 16).reshape(4, 4)
+        cls._as_f32(out_ref, 16)[:] = np.linalg.inv(m44).astype(np.float32).reshape(-1)
+
+    @classmethod
+    def wp_builtin_determinant_mat44f(cls, m, out_ref) -> None:
+        m44 = cls._as_f32(m, 16).reshape(4, 4)
+        cls._as_f32(out_ref, 1)[:] = np.float32(np.linalg.det(m44))
+
+    @classmethod
+    def wp_builtin_trace_mat44f(cls, m, out_ref) -> None:
+        m44 = cls._as_f32(m, 16).reshape(4, 4)
+        cls._as_f32(out_ref, 1)[:] = np.float32(m44[0, 0] + m44[1, 1] + m44[2, 2] + m44[3, 3])
 
     @classmethod
     def wp_builtin_trace_mat33f(cls, m, out_ref) -> None:
