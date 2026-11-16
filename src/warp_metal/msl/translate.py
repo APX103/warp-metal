@@ -3027,10 +3027,20 @@ class _BodyTranslator:
         open_p = rhs.index("(")
         close = _find_balanced(rhs, open_p)
         args = split_args(rhs[open_p + 1 : close])
-        if len(args) != 2:
+        if len(args) < 2:
             raise TranslationError(f"tile_extract with {len(args)} args")
         src = args[0].strip()
         tvar = self._tvar(src, "tile_extract")
+        if len(args) > 2:
+            # per-coordinate form tile_extract(t, i, j, ...): the element
+            # address is coords·strides directly (tile.h:4743-4747 overloads)
+            coords = [self.expr(a) for a in args[1:]]
+            if tvar.kind != "shr" or len(coords) != len(tvar.dims):
+                raise TranslationError(
+                    f"wp::tile_extract with {len(coords)} coordinate indices needs a "
+                    f"shared-storage rank-{len(tvar.dims)} tile"
+                )
+            return [f"{target} = _wp_tile_shr_{tvar.slot}[{tvar.coord_addr(coords)}];"]
         idx_var = args[1].strip()
         idx_const = self.const_vars.get(idx_var)
         if tvar.kind == "shr":
@@ -4409,6 +4419,17 @@ class _BodyTranslator:
             idx_const = self.const_vars.get(idx_var)
             src = args[0].strip()
             tvar = self._tvar(src, "tile_extract")
+            if len(args) > 2:
+                # per-coordinate form tile_extract(t, i, j, ...): coords·strides
+                # is a pure expression (strides are compile-time), unlike the
+                # linear unravel in lin_addr
+                coords = [self.expr(a) for a in args[1:]]
+                if tvar.kind != "shr" or len(coords) != len(tvar.dims):
+                    raise TranslationError(
+                        f"wp::tile_extract with {len(coords)} coordinate indices needs a "
+                        f"shared-storage rank-{len(tvar.dims)} tile"
+                    )
+                return f"_wp_tile_shr_{tvar.slot}[{tvar.coord_addr(coords)}]"
             if tvar.kind == "shr":
                 arr = f"_wp_tile_shr_{tvar.slot}"
                 if idx_const is not None:
