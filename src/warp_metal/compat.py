@@ -18,7 +18,7 @@ Design (KEP-0001):
 
 from __future__ import annotations
 
-__version__ = "0.0.1"
+__version__ = "0.1.0"
 
 # Frozen upstream version the vendored frontend must declare. KEP-0001 pins
 # warp-lang 1.19.x (matches the version Newton currently depends on).

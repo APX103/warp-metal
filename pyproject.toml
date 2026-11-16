@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "warp-metal"
-version = "0.0.1"
+version = "0.1.0"
 description = "Warp-compatible DSL frontend with a native Apple Metal (MSL) backend for Newton on Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.10"
