@@ -1211,6 +1211,25 @@ static inline uint64_t wp_atomic_min_ret_at(device uint64_t* d, wp_arr_meta m, i
     wp_atomic_min_u64(halves, v);
     return wp_atomic_u64_load(halves);
 }
+// signed 64-bit min/max ride the same emulated-u64 halves: XOR the sign bit
+// to map signed order onto unsigned order (classic bias trick), so the
+// unsigned compare loops order the signed values correctly.
+static inline void wp_atomic_min_at(device int64_t* d, wp_arr_meta m, int i, int64_t v) {
+    wp_atomic_min_u64((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), (uint64_t)v ^ 0x8000000000000000ull);
+}
+static inline void wp_atomic_max_at(device int64_t* d, wp_arr_meta m, int i, int64_t v) {
+    wp_atomic_max_u64((device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0])), (uint64_t)v ^ 0x8000000000000000ull);
+}
+static inline int64_t wp_atomic_min_ret_at(device int64_t* d, wp_arr_meta m, int i, int64_t v) {
+    device atomic_uint* halves = (device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    wp_atomic_min_u64(halves, (uint64_t)v ^ 0x8000000000000000ull);
+    return (int64_t)(wp_atomic_u64_load(halves) ^ 0x8000000000000000ull);
+}
+static inline int64_t wp_atomic_max_ret_at(device int64_t* d, wp_arr_meta m, int i, int64_t v) {
+    device atomic_uint* halves = (device atomic_uint*)((device char*)d + (size_t)(m.offset + i * m.strides[0]));
+    wp_atomic_max_u64(halves, (uint64_t)v ^ 0x8000000000000000ull);
+    return (int64_t)(wp_atomic_u64_load(halves) ^ 0x8000000000000000ull);
+}
 // ---- wp_*_at: array-indexed atomic entry points (translator emits these) ----
 // exact-match overloads only: calling on an unsupported element type is a
 // compile error (fail loud), never a silent non-atomic path.
