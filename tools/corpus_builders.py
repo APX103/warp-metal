@@ -94,6 +94,14 @@ def b_update_effective_inv_mass_inertia(rng):
 
 
 def b_compute_body_inverses_kernel(rng):
+    """newton._src.geometry.inertia.compute_body_inverses_kernel (KEP-0001
+    Phase 4 F1 flip: the stale "uses float64" skip predates B2 — fork commits
+    557239bb/3da7b947 downgraded the inertia path to float32, so the kernel
+    translates and runs on the shim).
+
+    Diagonal eye-scaled inertias keep wp.inverse well-conditioned; the
+    kernel's only outputs are the two inverse arrays (body_mass is read-only
+    here, so it stays an ``arr:`` input)."""
     n = 5
     mass = rng.uniform(0.5, 5.0, n).astype(np.float32)
     inertia = _eye_inertia(rng, n)
@@ -104,21 +112,37 @@ def b_compute_body_inverses_kernel(rng):
             ("body_inv_mass", "out:f32", n),
             ("body_inv_inertia", "out:mat33", n),
         ],
-        # kernel internally promotes inertia math to float64 (wp.mat64);
-        # Apple GPUs expose no fp64 in Metal — KEP-0001 capability boundary
-        ["kernel body uses float64 (wp::mat_t<3,3,wp::float64> in SSA) — Metal has no fp64 on Apple GPUs"],
+        [],
     )
 
 
 def b_validate_and_correct_inertia_kernel(rng):
+    """newton._src.geometry.inertia.validate_and_correct_inertia_kernel
+    (KEP-0001 Phase 4 F1 flip: same stale-fp64-skip history as
+    compute_body_inverses_kernel — fp32 since B2).
+
+    body_mass / body_inertia are IN-PLACE outputs (the kernel writes the
+    bounded mass and the corrected tensor back), so they use the ``outinit:``
+    key: deterministic initial content AND registered for comparison — the
+    corrected inertia is the row's real output, not just the atomic counter.
+    ``__dim__`` is pinned explicitly because outinit values carry fixture
+    data, not launch extents (same reason estimate_world_extents pins it).
+    Branch coverage: every body trips the bound_mass branch (0.5..5.0 <
+    1000), body 1 carries the 1e6 inertia scale, body 3 a negative diagonal
+    (eigenvalue-threshold + bound-inertia corrections); the balance-inertia
+    branch stays off (diagonal fixtures satisfy I1+I2 >= I3). All eigen
+    decisions sit far from their thresholds (no knife-edge branches) and the
+    kernel discards the eigenvectors, so only the few-ulp eigenvalue spread
+    reaches the compared outputs — inside corpus rtol."""
     n = 5
     inertia = _eye_inertia(rng, n)
-    inertia[1] *= 1e6  # trigger the balance branch
+    inertia[1] *= 1e6  # large-scale body: bound/threshold branches stay off
     inertia[3, 0] = -0.5  # negative diagonal → correction branch
     return (
         [
-            ("body_mass", "arr:f32", rng.uniform(0.5, 5.0, n).astype(np.float32)),
-            ("body_inertia", "arr:mat33", inertia),
+            ("__dim__", "", n),
+            ("body_mass", "outinit:f32", rng.uniform(0.5, 5.0, n).astype(np.float32)),
+            ("body_inertia", "outinit:mat33", inertia),
             ("balance_inertia", "scalar:bool", True),
             ("bound_mass", "scalar:f32", 1000.0),
             ("bound_inertia", "scalar:f32", 1000.0),
@@ -127,8 +151,7 @@ def b_validate_and_correct_inertia_kernel(rng):
             ("correction", "scalar:f32", 1.0),
             ("correction_count", "out:i32", 1),
         ],
-        # float64 inertia promotion inside the kernel — same boundary as above
-        ["kernel body uses float64 (wp::mat_t<3,3,wp::float64> in SSA) — Metal has no fp64 on Apple GPUs"],
+        [],
     )
 
 
