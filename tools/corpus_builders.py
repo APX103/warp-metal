@@ -1505,7 +1505,18 @@ def b_flex_elasticity(rng):
     s_val * g_val` compound assign on a local wp.matrix (6,3). Spring AND
     damper paths live (dsbl flags False, flex_damping 0.8 / timestep 0.4 →
     kD 2.0); three verts on three distinct bodies keep one atomic writer per
-    (world, body) force slot."""
+    (world, body) force slot.
+
+    The xipos draw is de-conditioned (scale 0.45 + fixed per-body offset,
+    grid-searched for worst-case cancellation ratio): each torque component
+    is the difference of two O(|f|·|offset|) cross terms, and the seed-20261113
+    draw at the original O(0.1) scale landed body-1 damper torque-y on a
+    300x cancellation (r = |a-b|/(|a|+|b|) = 0.0033), amplifying the two
+    fp32 evaluations' few-ulp spread (CPU golden codegen vs Metal codegen —
+    neither side wrong: Metal measured CLOSER to the fp64 reference, 0.7 vs
+    3.6 ulps of the pre-cancellation terms) to 4.7e-5 relative, past corpus
+    rtol. min-r is now 0.22 (≤4.6x amplification).
+    """
     model, data = _flex_elem_layout(rng)
     model["flex_vertbodyid"] = np.array([0, 1, 2], dtype=np.int32)
     model["flex_damping"] = np.array([0.8], dtype=np.float32)
@@ -1520,7 +1531,9 @@ def b_flex_elasticity(rng):
         )
     ]
     args += [
-        ("xipos_in", "arr2:vec3", (rng.standard_normal((_FLEX_WORLDS, 3, 3)) * 0.1).astype(np.float32)),
+        ("xipos_in", "arr2:vec3",
+         (rng.standard_normal((_FLEX_WORLDS, 3, 3)) * 0.45
+          + np.array([[0.11, -0.09, 0.13], [0.05, 0.07, -0.11], [-0.08, 0.12, 0.06]])[None]).astype(np.float32)),
         ("flexvert_xpos_in", "arr2:vec3", data["flexvert_xpos_in"]),
         ("flexedge_length_in", "arr2:f32", data["flexedge_length_in"]),
         ("flexedge_velocity_in", "arr2:f32", (rng.standard_normal((_FLEX_WORLDS, 3)) * 0.5).astype(np.float32)),
