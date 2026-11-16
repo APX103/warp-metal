@@ -78,6 +78,7 @@ import ctypes
 import functools
 import os
 import threading
+import weakref
 
 import numpy as np
 
@@ -289,6 +290,16 @@ class WarpArray:
     allocation is device-independent (storageModeShared unified memory).
     """
 
+    # Base-allocation ptr registry for ``wp.array(ptr=...)`` reinterpret
+    # views (KEP-0001 M3.3): the shared-storage pointer IS the unified
+    # device address, so mjw's efc staging (constraint.py:5356 — contact
+    # frame (n,9)f32 reinterpreted as (n,3)vec3) can share the source
+    # MTLBuffer without a native buffer_from_ptr. Weak values: a dead
+    # allocation's ptr stops resolving (its buffer is released), while an
+    # alive alias keeps the source — and the buffer — alive through a
+    # strong reference of its own.
+    _PTR_ALIASES: "weakref.WeakValueDictionary[int, WarpArray]" = weakref.WeakValueDictionary()
+
     def __init__(self, n, dtype=float32, shape=None, device=None, pinned=False, requires_grad=False, retain_grad=False):
         if requires_grad or retain_grad or pinned:
             # Adjoint/pinned allocation is a KEP-0001 Non-Goal: fail loud
@@ -317,6 +328,7 @@ class WarpArray:
         self._owns_buffer = True
         self._buffer = _mm.buffer_create(self.n * self.item_bytes)
         self._ptr = _mm.buffer_ptr(self._buffer)
+        self._PTR_ALIASES[self._ptr] = self
         self._build_numpy_view()
 
     @property
@@ -447,6 +459,60 @@ class WarpArray:
         view._buffer = self._buffer  # shared: release is owned by the base
         view._owns_buffer = False
         view._ptr = self._ptr + start * self.item_bytes
+        view._build_numpy_view()
+        return view
+
+    @classmethod
+    def _ptr_alias_view(cls, src: "WarpArray", ptr: int, dtype, shape, device, capacity=None) -> "WarpArray":
+        """Zero-copy reinterpret view over a live allocation's buffer.
+
+        KEP-0001 M3.3 (mjw constraint.py:5356): the efc contact staging
+        reinterprets ``(naconmax, 9)f32`` as ``(naconmax, 3)vec3`` — the same
+        byte span under a different element type. Under unified memory the
+        shared-storage pointer IS the device address, so the view shares the
+        source MTLBuffer (never releases it — ``_owns_buffer`` False plus a
+        strong source reference) and rebuilds the numpy host view over the
+        same pointer range. Upstream ``wp.array(ptr=...)`` semantics: the view
+        starts at ``ptr`` with the requested dtype/shape; the byte span must
+        fit inside the source allocation.
+        """
+        if dtype is int:
+            dtype = int32
+        elif dtype is float:
+            dtype = float32
+        elif dtype is bool:
+            dtype = warp_bool
+        view = WarpArray.__new__(WarpArray)
+        view.device = get_device(device).name if device is not None else src.device
+        if view.device != src.device:
+            raise ValueError(
+                f"wp.array(ptr=...) aliasing: device {view.device!r} does not match the "
+                f"source allocation's {src.device!r}"
+            )
+        view.dtype = dtype
+        view.shape = _normalize_shape(shape) if shape is not None else _normalize_shape(src.n)
+        view.n = 1
+        for s in view.shape:
+            view.n *= s
+        view.np_dtype, view.item_bytes, view.is_composite = _dtype_layout(dtype)
+        view.offset_elems = 0
+        if capacity is not None and int(capacity) < view.n:
+            raise ValueError(
+                f"wp.array(ptr=...) aliasing: capacity {capacity} < element count {view.n}"
+            )
+        need = view.n * view.item_bytes
+        base = int(ptr) - src._ptr  # byte offset of the alias inside the source span
+        have = src.n * src.item_bytes - base
+        if base < 0 or need > have:
+            raise ValueError(
+                f"wp.array(ptr=...) aliasing: {need} bytes needed at byte offset {base}, "
+                f"source allocation has {have} available (upstream reinterpret semantics "
+                "require the same byte span)"
+            )
+        view._buffer = src._buffer  # shared: release is owned by the source
+        view._owns_buffer = False
+        view._alias_src = src  # strong ref: the shared buffer must outlive the view
+        view._ptr = int(ptr)
         view._build_numpy_view()
         return view
 
@@ -984,9 +1050,24 @@ class array(metaclass=_ArrayMeta):
                 "(adjoint codegen is a KEP-0001 Non-Goal)"
             )
         if ptr is not None or capacity is not None or deleter is not None:
-            raise NotImplementedError(
-                "wp.array ptr/capacity/deleter aliasing needs native buffer_from_ptr (Phase 2)"
-            )
+            if ptr is None or deleter is not None:
+                # foreign-memory wrap (deleter-owned storage) is unbuildable
+                # without the native entry point — keep the Phase-2 boundary
+                raise NotImplementedError(
+                    "wp.array capacity/deleter aliasing needs native buffer_from_ptr (Phase 2)"
+                )
+            # KEP-0001 M3.3: reinterpret an existing warp-metal allocation
+            # through its shared-storage pointer (mjw constraint.py:5356
+            # reinterprets contact.frame (n,9)f32 as (n,3)vec3). The ptr IS
+            # the unified device address, so the view shares the same
+            # MTLBuffer; ptrs outside the registry keep the Phase-2 fail-loud.
+            src = WarpArray._PTR_ALIASES.get(int(ptr))
+            if src is None:
+                raise NotImplementedError(
+                    f"wp.array(ptr={hex(int(ptr))}) aliasing: pointer is not a live warp-metal "
+                    "allocation — foreign-memory wrap needs native buffer_from_ptr (Phase 2)"
+                )
+            return WarpArray._ptr_alias_view(src, int(ptr), dtype, shape, device, capacity)
         if not copy:
             # Metal cannot alias arbitrary host memory (newBufferWithBytesNoCopy
             # requires page alignment), so copy=False lands as a copy. Newton's

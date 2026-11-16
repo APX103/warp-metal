@@ -5601,6 +5601,26 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
     for uf in adj.called_user_functions:
         visit(uf)
 
+    # ---- value-context struct defs from SSA locals (KEP-0001 M3.3) ----
+    # A struct type can appear ONLY on locals and function signatures —
+    # built by struct constructors, returned from / passed into @wp.func
+    # callees — with no kernel parameter ever carrying it (mjw
+    # primitive_narrowphase: geom_collision_pair returns two Geom values
+    # that the writer funcs consume by reference). Nothing in the param
+    # paths emits the def, so the body's `Geom_<hash> var = {}` decls name
+    # an undefined type and the library fails to compile. Emit every
+    # struct-typed variable's def in value context (array fields as
+    # wp_val_array_* pairs). Runs AFTER callee translation so the split
+    # forms win their dedup slot: a struct that reaches a callee as a
+    # VALUE param needs its array fields split into per-field bindings
+    # wired from the caller's backing array param (the compute_gaussian_bounds
+    # machine) — the value form cannot serve that signature. _emit_struct_def
+    # dedupes on native_name, so param-split and tile_stack payloads keep
+    # their earlier forms and only never-emitted types land here.
+    for var in adj.variables:
+        if _type_is_struct(var.type):
+            _emit_struct_def(var.type, unit, _codegen, value_arrays=True)
+
     # ---- kernel body ----
     src = _codegen.codegen_func_forward(adj, func_type="kernel", device="cpu")
     tr = _BodyTranslator(unit, array_args, user_funcs, codegen=_codegen)
@@ -5885,14 +5905,41 @@ def _translate_function(
     return fn
 
 
-def _emit_struct_def(s, unit: KernelUnit, _codegen, split_arrays: bool = False) -> list[tuple[str, str]]:
+def _ensure_val_array_def(elem_msl: str, unit: KernelUnit) -> str:
+    """(device ptr, meta) pair struct for an array FIELD inside a
+    value-context struct def (KEP-0001 M3.3) — the wp_mesh_array machine
+    generalized per element type. Zero-initializable (`= {}`), which is all
+    the signature-carriage case needs: mjw's ``Geom`` bundles the mesh
+    topology arrays that primitive-pair closures never touch, and the struct
+    rides function out-params (`thread Geom&`) by reference.
+    """
+    name = f"wp_val_array_{elem_msl}"
+    if name in unit.structs:
+        return name
+    unit.structs[name] = (
+        f"struct {name} {{ device {elem_msl}* data; wp_arr_meta m; }};\n"
+        f"static inline {name} make_{name}() {{\n"
+        f"    {name} v = {{}};\n"
+        f"    return v;\n"
+        f"}}"
+    )
+    return name
+
+
+def _emit_struct_def(s, unit: KernelUnit, _codegen, split_arrays: bool = False, value_arrays: bool = False) -> list[tuple[str, str]]:
     """Emit an MSL struct definition (warp-native layout) + constructors.
 
     With ``split_arrays`` (parameter context), array-typed fields are excluded
     from the MSL struct — Metal cannot store device pointers inside a
     ``constant`` buffer struct — and returned as ``[(field, elem ctype)]`` for
-    per-field buffer binding. Nested struct fields always emit recursively
-    with ``split_arrays=False``: a nested array field has no binding path and
+    per-field buffer binding. With ``value_arrays`` (value context: the type
+    appears only on SSA locals and function signatures, never as a kernel
+    param), array fields emit inline as ``wp_val_array_*`` (device ptr +
+    meta) pairs — the definition must be complete because the MSL body names
+    the type, but arrays are still never MSL values, so any closure that
+    actually moves an array through the field has no lowering and fails loud
+    at translation. Nested struct fields always emit recursively with
+    ``split_arrays=False``: a nested array field has no binding path and
     fails loud.
     """
     from ..frontend.codegen import Var as _Var
@@ -5904,6 +5951,9 @@ def _emit_struct_def(s, unit: KernelUnit, _codegen, split_arrays: bool = False) 
     for label, var in s.vars.items():
         ctype = _Var.type_to_ctype(var.type)
         if _RE_ARRAY_T.match(ctype):
+            if value_arrays:
+                fields.append((label, _ensure_val_array_def(array_elem_msl(ctype), unit)))
+                continue
             if not split_arrays:
                 raise TranslationError(
                     f"struct {s.native_name} field {label!r}: array fields are only supported on "
@@ -5915,7 +5965,14 @@ def _emit_struct_def(s, unit: KernelUnit, _codegen, split_arrays: bool = False) 
             continue
         if isinstance(var.type, type(s)):
             _emit_struct_def(var.type, unit, _codegen)
-        fields.append((label, msl_type(ctype)))
+        msl_t = msl_type(ctype)
+        # generic vec/mat sizes (mjw mat63 polyvert in Geom, Newton vec10)
+        # get their per-unit def ensured right where the field names them
+        if _RE_GEN_VEC.match(msl_t):
+            ensure_vec_def(unit, msl_t)
+        elif _RE_GEN_MAT.match(msl_t):
+            ensure_mat_def(unit, msl_t)
+        fields.append((label, msl_t))
 
     lines = [f"struct {s.native_name} {{"]
     for label, msl_t in fields:
