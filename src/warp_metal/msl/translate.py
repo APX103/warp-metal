@@ -5799,6 +5799,26 @@ def _translate_function(
             ret_msl = ensure_tuple_def(unit, [msl_type(e.strip()) for e in split_args(_RE_TUPLE_T.match(ret_cpp).group(1))])
         else:
             ret_msl = msl_type(ret_cpp)
+            if _classify_ctype(ret_cpp) == "struct":
+                # struct-returning @wp.func: the def must exist in this unit
+                # for the signature, the callee's own return-slot decl
+                # (`T var_4 = {};`) and the caller's result decl. The
+                # kernel-level value-context loop never sees struct types
+                # confined to the function-call chain — a kernel that only
+                # consumes scalar projections of the returned value keeps no
+                # struct-typed SSA var (step_joint_C0_lambda_rho →
+                # compute_geometric_rod_kappa_cached_z →
+                # _measure_rod_bend_twist_z). Value form: the returned struct
+                # is an SSA value; a split-form def from an earlier param use
+                # wins the dedup slot (array-field structs then fail loud at
+                # the caller's field read — same policy as the value-context
+                # loop).
+                from ..frontend.types import type_is_struct as _type_is_struct
+
+                ret_var = f.adj.return_var
+                ret_type = ret_var[0].type if ret_var else f.adj.arg_types.get("return")
+                if ret_type is not None and _type_is_struct(ret_type):
+                    _emit_struct_def(ret_type, unit, _codegen, value_arrays=True)
 
     fn = MSLFunction(inst_name or fn_name, ret_msl)
     array_args: dict[str, ArgSpec] = {}
