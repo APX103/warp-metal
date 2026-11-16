@@ -6,5 +6,9 @@
  "basic_shapes": {
   "n_steps": 100,
   "n_bodies": 7
+ },
+ "robot_cartpole": {
+  "n_steps": 90,
+  "n_bodies": 3
  }
 }

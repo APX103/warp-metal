@@ -1124,6 +1124,23 @@ TRAJECTORY_CASES = {
     # control — chaotic tail, not divergence. p50/p95 drift stats are now reported per
     # run (see TRAJECTORY_DRIFT_HISTORY) so future recalibration is evidence-based.
     "basic_shapes": (100, 0.15),  # primitives strict pre-contact; mesh contacts → cap
+    # KEP-0001 M3.3: SolverMuJoCo(metal) single-robot row (R1 recon D.2). mjw
+    # solver internals carry atomics; cap starts None (strict-only) and follows
+    # the drift-history flow once the drift shape is characterized.
+    "robot_cartpole": (90, None),  # 1 world, solver=mujoco via TRAJECTORY_ARGS
+}
+# R1 recon D.2: the example modules no longer share the basic/ join — cartpole
+# lives under robot/ (and any future case carries its own module path).
+TRAJECTORY_MODULES = {
+    "basic_pendulum": "newton.examples.basic.example_basic_pendulum",
+    "basic_shapes": "newton.examples.basic.example_basic_shapes",
+    "robot_cartpole": "newton.examples.robot.example_robot_cartpole",
+}
+# Per-case Example(args) namespace deltas over the XPBD-facing base
+# (_traj_example_args): cartpole defaults world_count=100 and solver=mujoco —
+# the single-robot row must pass both explicitly (R1 recon D.2).
+TRAJECTORY_ARGS = {
+    "robot_cartpole": {"solver": "mujoco", "world_count": 1},
 }
 TRAJECTORY_RTOL = 1e-5
 TRAJECTORY_ATOL = 1e-6
@@ -1133,10 +1150,10 @@ TRAJECTORY_NPZ = Path(__file__).resolve().parent / "trajectory_golden.npz"
 TRAJECTORY_DRIFT_HISTORY = Path(__file__).resolve().parent / "trajectory_drift_history.jsonl"
 
 
-def _traj_example_args(device: str):
+def _traj_example_args(device: str, extra: dict | None = None):
     import argparse
 
-    return argparse.Namespace(
+    ns = argparse.Namespace(
         test=False,
         viewer="null",
         device=device,
@@ -1148,6 +1165,10 @@ def _traj_example_args(device: str):
         solver="xpbd",
         scale=1.0,
     )
+    if extra:
+        for key, val in extra.items():
+            setattr(ns, key, val)
+    return ns
 
 
 def _traj_collect(device: str) -> dict[str, "np.ndarray"]:
@@ -1165,8 +1186,8 @@ def _traj_collect(device: str) -> dict[str, "np.ndarray"]:
 
     cases = {}
     for name, (n_steps, _cap) in TRAJECTORY_CASES.items():
-        mod = importlib.import_module(f"newton.examples.basic.example_{name}")
-        inst = mod.Example(ViewerNull(), _traj_example_args(device))
+        mod = importlib.import_module(TRAJECTORY_MODULES[name])
+        inst = mod.Example(ViewerNull(), _traj_example_args(device, TRAJECTORY_ARGS.get(name)))
         n_bodies = len(inst.model.body_q)
         frames = [np.asarray(inst.state_0.body_q.numpy(), dtype=np.float64).copy()]
         for _ in range(n_steps):
@@ -1315,7 +1336,7 @@ def _run_trajectory_capture() -> str:
 
     name = "basic_pendulum"
     n_steps = TRAJECTORY_CASES[name][0]
-    mod = importlib.import_module(f"newton.examples.basic.example_{name}")
+    mod = importlib.import_module(TRAJECTORY_MODULES[name])
     from newton.viewer import ViewerNull
 
     prev = os.environ.pop("WARP_METAL_BATCH", None)
