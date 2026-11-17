@@ -126,6 +126,10 @@ _SCALAR_NP = {
     warp_bool: np.bool_,
 }
 
+# inverse map: numpy scalar types → warp scalars (upstream wp.array accepts
+# numpy dtypes, warp/_src/types.py array.__init__ canonicalize block)
+_NP_SCALAR_TO_WARP = {v: k for k, v in _SCALAR_NP.items()}
+
 # composite warp dtypes: contiguous runs of float32
 _COMPOSITE_FLOATS = {
     vec2f: 2,
@@ -298,6 +302,23 @@ class WarpArray:
     # allocation's ptr stops resolving (its buffer is released), while an
     # alive alias keeps the source — and the buffer — alive through a
     # strong reference of its own.
+
+    @staticmethod
+    def _resolve_allocation(addr: int) -> "WarpArray | None":
+        """Find the live base allocation containing byte address ``addr``.
+
+        Newton's selection.py points ``wp.array(ptr=...)`` at INTERIOR
+        addresses (``attrib.ptr + layout.offset * value_stride``), so an
+        exact registry hit is not enough — scan the live allocations' byte
+        spans. The registry holds only base allocations (views never
+        register), so this is a small scan."""
+        if addr in WarpArray._PTR_ALIASES:
+            return WarpArray._PTR_ALIASES[addr]
+        for src in WarpArray._PTR_ALIASES.values():
+            if src._ptr <= addr < src._ptr + src.n * src.item_bytes:
+                return src
+        return None
+
     _PTR_ALIASES: "weakref.WeakValueDictionary[int, WarpArray]" = weakref.WeakValueDictionary()
 
     def __init__(self, n, dtype=float32, shape=None, device=None, pinned=False, requires_grad=False, retain_grad=False):
@@ -316,13 +337,22 @@ class WarpArray:
         self.device = get_device(device)
         # canonicalize dtype (upstream array.__init__ canonicalize block,
         # warp/_src/types.py:3559-3565: the Python builtins map to their
-        # 32-bit warp types, e.g. Newton's `wp.full(..., dtype=float)`)
-        if dtype is int:
+        # 32-bit warp types, e.g. Newton's `wp.full(..., dtype=float)`;
+        # numpy scalar types map the same way — upstream accepts
+        # wp.array(dtype=np.float32) and reports wp.float32 back)
+        if dtype is int or dtype is np.int64:
             dtype = int32
-        elif dtype is float:
+        elif dtype is float or dtype is np.float64:
             dtype = float32
-        elif dtype is bool:
+        elif dtype is bool or dtype is np.bool_:
             dtype = warp_bool
+        elif isinstance(dtype, type) and issubclass(dtype, np.number):
+            mapped = _NP_SCALAR_TO_WARP.get(dtype)
+            if mapped is None:
+                raise NotImplementedError(
+                    f"dtype {dtype} not in spike subset"
+                )
+            dtype = mapped
         self.dtype = dtype
         self.shape = _normalize_shape(shape) if shape is not None else _normalize_shape(n)
         self.n = 1
@@ -346,23 +376,51 @@ class WarpArray:
 
     @property
     def requires_grad(self):
-        return False
+        return getattr(self, "_requires_grad_flag", False)
+
+    @requires_grad.setter
+    def requires_grad(self, value) -> None:
+        # upstream stores the flag and only fails later at grad-mode use
+        # (Tape/grad tape); the shim's ratified Non-Goal boundary fails loud
+        # at the earliest adjoint surface instead — allocation-time
+        # requires_grad=True already raises the same way. Setting False is
+        # the plain-inference path (warp_nn Parameter) and must work.
+        if value:
+            raise RuntimeError(
+                "warp-metal does not support requires_grad=True (adjoint codegen "
+                "is a KEP-0001 Non-Goal)"
+            )
+        self._requires_grad_flag = False
 
     @property
     def strides(self):
-        """Row-major dense element strides (warp convention)."""
+        """Byte strides per dimension (upstream convention — warp
+        _src/types.py ``strides_from_shape``: the last dim's stride is the
+        element size in bytes; Newton's selection.py multiplies these
+        directly). Views store their own strides; dense arrays compute
+        row-major defaults."""
+        stored = getattr(self, "_strides", None)
+        if stored is not None:
+            return stored
         out = []
-        for i in range(len(self.shape)):
-            n = 1
-            for s in self.shape[i + 1 :]:
-                n *= s
-            out.append(n)
-        return tuple(out)
+        acc = self.item_bytes
+        for i in range(len(self.shape) - 1, -1, -1):
+            out.append(acc)
+            acc *= self.shape[i]
+        return tuple(reversed(out))
+
+    def _dense_strides(self) -> tuple[int, ...]:
+        out = []
+        acc = self.item_bytes
+        for i in range(len(self.shape) - 1, -1, -1):
+            out.append(acc)
+            acc *= self.shape[i]
+        return tuple(reversed(out))
 
     @property
     def is_contiguous(self):
-        """Runtime arrays are always dense row-major (no strided views)."""
-        return True
+        """True when the strides match the dense row-major layout."""
+        return getattr(self, "_strides", None) is None or self.strides == self._dense_strides()
 
     @property
     def size(self):
@@ -375,7 +433,21 @@ class WarpArray:
     @property
     def ptr(self):
         """CPU-side shared-storage pointer (unified memory device address)."""
+        if getattr(self, "_ptr_is_none", False):
+            return None
         return self._ptr
+
+    @ptr.setter
+    def ptr(self, value) -> None:
+        # Newton's selection.py nulls the ptr of empty selection results;
+        # downstream code then reads ``attrib.ptr is None`` to skip them.
+        if value is None:
+            self._ptr_is_none = True
+            return
+        raise NotImplementedError(
+            "warp-metal arrays cannot be re-pointed at foreign memory "
+            "(wp.array(ptr=...) aliasing over live allocations is the only path)"
+        )
 
     def __ctype__(self):
         """C-representation for vendored frontend machinery (struct field
@@ -420,7 +492,45 @@ class WarpArray:
 
         Shaped like real warp's host view: ``self.shape`` for scalar dtypes,
         ``self.shape + (comps,)`` for vec/quat/mat, ``(n,)`` for structs.
-        """
+        Strided views (``_strides`` set, non-dense) build an as_strided view
+        over the accessed byte span instead — element strides are already in
+        bytes, exactly numpy's unit."""
+        np_t = np.dtype(self.np_dtype)
+        stored = getattr(self, "_strides", None)
+        if stored is not None and stored != self._dense_strides():
+            if np_t.names:
+                raise NotImplementedError(
+                    "strided views over struct-dtype arrays are outside the "
+                    "warp-metal closure"
+                )
+            span = self.item_bytes
+            for s, st in zip(self.shape, stored):
+                if st % np_t.itemsize != 0:
+                    raise NotImplementedError(
+                        f"strided view: stride {st} bytes is not a multiple of "
+                        f"the {np_t.itemsize}-byte component size"
+                    )
+                span += max(0, s - 1) * st
+            raw = np.ctypeslib.as_array(
+                ctypes.cast(self._ptr, ctypes.POINTER(ctypes.c_uint8)), shape=(span,)
+            )
+            flat = raw.view(np_t)  # component-level view over the span
+            tail_shape, tail_strides = (), ()
+            if self.is_composite:
+                comps = self.item_bytes // np_t.itemsize
+                mshape = _MAT_TRAILING.get(self.dtype)
+                tail_shape = mshape if mshape else (comps,)
+                # element-internal layout stays dense row-major
+                tail_acc = np_t.itemsize
+                tail_strides = []
+                for d in reversed(tail_shape):
+                    tail_strides.append(tail_acc)
+                    tail_acc *= d
+                tail_strides = tuple(reversed(tail_strides))
+            shape = tuple(self.shape) + tail_shape
+            strides = tuple(stored) + tail_strides
+            self.numpy = np.lib.stride_tricks.as_strided(flat, shape=shape, strides=strides).view(_CallableArray)
+            return
         np_t = np.dtype(self.np_dtype)
         total = self.n * self.item_bytes
         if np_t.names:
@@ -456,6 +566,28 @@ class WarpArray:
         (``_row_dropped_all[0]``, VBD ``_body_contact_scratch[0]``) read
         kernels with 1-D annotations, so the view shape MUST match
         upstream or the kernel's stride math reads wrong elements."""
+        parent_strides = getattr(self, "_strides", None)
+        if parent_strides is not None:
+            lead_bytes = parent_strides[0]
+            view = WarpArray.__new__(WarpArray)
+            view.device = self.device
+            view.dtype = self.dtype
+            view.shape = tuple(self.shape[1:])
+            view.n = 1
+            for s in view.shape:
+                view.n *= s
+            view.np_dtype = self.np_dtype
+            view.item_bytes = self.item_bytes
+            view.is_composite = self.is_composite
+            view._strides = parent_strides[1:] if parent_strides[1:] != view._dense_strides_from(view.shape) else None
+            view.offset_elems = 0
+            view._offset_bytes = self._meta_offset_bytes() + idx * lead_bytes
+            view._buffer = self._buffer  # shared: release is owned by the base
+            view._owns_buffer = False
+            view._alias_src = getattr(self, "_alias_src", None) or self
+            view._ptr = self._ptr + idx * lead_bytes
+            view._build_numpy_view()
+            return view
         lead = 1
         for s in self.shape[1:]:
             lead *= s
@@ -477,6 +609,7 @@ class WarpArray:
     def _slice_view(self, start: int, length: int) -> "WarpArray":
         """Host-side array view (warp slicing): shares the base buffer at an
         element offset; the offset reaches device code via wp_arr_meta.offset."""
+        parent_strides = getattr(self, "_strides", None)
         view = WarpArray.__new__(WarpArray)
         view.device = self.device
         view.dtype = self.dtype
@@ -487,15 +620,25 @@ class WarpArray:
         view.np_dtype = self.np_dtype
         view.item_bytes = self.item_bytes
         view.is_composite = self.is_composite
-        view.offset_elems = self.offset_elems + start
+        if parent_strides is not None:
+            # strided parent: slicing dim 0 keeps every stride; the start
+            # offset is a byte offset (element strides, not dense counts)
+            view._strides = parent_strides if parent_strides != view._dense_strides_from(view.shape) else None
+            view.offset_elems = 0
+            view._offset_bytes = self._meta_offset_bytes() + start * parent_strides[0]
+            view._alias_src = getattr(self, "_alias_src", None) or self
+            byte_start = start * parent_strides[0]
+        else:
+            view.offset_elems = self.offset_elems + start
+            byte_start = start * self.item_bytes
         view._buffer = self._buffer  # shared: release is owned by the base
         view._owns_buffer = False
-        view._ptr = self._ptr + start * self.item_bytes
+        view._ptr = self._ptr + byte_start
         view._build_numpy_view()
         return view
 
     @classmethod
-    def _ptr_alias_view(cls, src: "WarpArray", ptr: int, dtype, shape, device, capacity=None) -> "WarpArray":
+    def _ptr_alias_view(cls, src: "WarpArray", ptr: int, dtype, shape, device, capacity=None, strides=None) -> "WarpArray":
         """Zero-copy reinterpret view over a live allocation's buffer.
 
         KEP-0001 M3.3 (mjw constraint.py:5356): the efc contact staging
@@ -505,8 +648,10 @@ class WarpArray:
         source MTLBuffer (never releases it — ``_owns_buffer`` False plus a
         strong source reference) and rebuilds the numpy host view over the
         same pointer range. Upstream ``wp.array(ptr=...)`` semantics: the view
-        starts at ``ptr`` with the requested dtype/shape; the byte span must
-        fit inside the source allocation.
+        starts at ``ptr`` with the requested dtype/shape/strides (bytes);
+        Newton's selection.py points ``ptr`` INSIDE a live allocation and
+        passes byte strides — the interior offset reaches device code through
+        ``_offset_bytes`` (the buffer binding is the whole allocation).
         """
         if dtype is int:
             dtype = int32
@@ -528,22 +673,46 @@ class WarpArray:
             view.n *= s
         view.np_dtype, view.item_bytes, view.is_composite = _dtype_layout(dtype)
         view.offset_elems = 0
+        if strides is not None:
+            if np.dtype(view.np_dtype).names:
+                raise NotImplementedError(
+                    "wp.array(ptr=..., strides=...) over struct dtypes is outside "
+                    "the warp-metal closure"
+                )
+            strides = tuple(int(s) for s in strides)
+            if len(strides) != len(view.shape):
+                raise ValueError(
+                    f"wp.array(strides=...): {len(strides)} strides for a "
+                    f"{len(view.shape)}-dimensional shape {view.shape} (upstream "
+                    "strides are in bytes, one per dimension)"
+                )
+            if strides == view._dense_strides_from(view.shape):
+                view._strides = None
+            else:
+                view._strides = strides
+        else:
+            view._strides = None
         if capacity is not None and int(capacity) < view.n:
             raise ValueError(
                 f"wp.array(ptr=...) aliasing: capacity {capacity} < element count {view.n}"
             )
-        need = view.n * view.item_bytes
         base = int(ptr) - src._ptr  # byte offset of the alias inside the source span
-        have = src.n * src.item_bytes - base
-        if base < 0 or need > have:
+        span = src.n * src.item_bytes - base
+        need = view.item_bytes if view.n else 0
+        if view.n:
+            st = view._strides if view._strides is not None else view._dense_strides()
+            for s, s_bytes in zip(view.shape, st):
+                need += max(0, s - 1) * s_bytes
+        if base < 0 or need > span:
             raise ValueError(
                 f"wp.array(ptr=...) aliasing: {need} bytes needed at byte offset {base}, "
-                f"source allocation has {have} available (upstream reinterpret semantics "
+                f"source allocation has {span} available (upstream reinterpret semantics "
                 "require the same byte span)"
             )
         view._buffer = src._buffer  # shared: release is owned by the source
         view._owns_buffer = False
         view._alias_src = src  # strong ref: the shared buffer must outlive the view
+        view._offset_bytes = base  # device addressing: buffer base + this offset
         view._ptr = int(ptr)
         view._build_numpy_view()
         return view
@@ -711,6 +880,78 @@ class WarpArray:
 
         return WarpArray._ptr_alias_view(self, self._ptr, dtype, result_shape, self.device)
 
+    def _tuple_slice_view(self, key) -> "WarpArray":
+        """Upstream multi-dim slicing (warp/_src/types.py __getitem__): tuple
+        keys containing slices produce a zero-copy view sharing the base
+        buffer — int keys drop their dimension (offset advance), slice keys
+        select a range (stride multiplied by the step), missing trailing
+        keys pad with full slices. Newton's selection.py slices every
+        selected attribute array this way (``attrib[slices]``)."""
+        if len(key) > len(self.shape):
+            raise IndexError(
+                f"too many indices for array of shape {self.shape}: {len(key)} keys"
+            )
+        shape = []
+        strides = []
+        offset_bytes = 0
+        for i, k in enumerate(key):
+            dim = self.shape[i]
+            st = self.strides[i]
+            if isinstance(k, slice):
+                start, stop, step = k.indices(dim)
+                if step == 0:
+                    raise ValueError("slice step cannot be zero")
+                length = len(range(start, stop, step))
+                shape.append(length)
+                strides.append(st * step)
+                offset_bytes += start * st
+            elif isinstance(k, (int, np.integer)):
+                idx = int(k)
+                if idx < 0:
+                    idx += dim
+                if idx < 0 or idx >= dim:
+                    raise IndexError(f"index {key[i]} out of range for dim {dim} of shape {self.shape}")
+                offset_bytes += idx * st  # dim dropped
+            else:
+                raise TypeError(f"unsupported array index {k!r}")
+        # missing trailing keys pad with full slices (upstream semantics)
+        for i in range(len(key), len(self.shape)):
+            shape.append(self.shape[i])
+            strides.append(self.strides[i])
+        view = WarpArray.__new__(WarpArray)
+        view.device = self.device
+        view.dtype = self.dtype
+        view.shape = tuple(shape)
+        view.n = 1
+        for s in view.shape:
+            view.n *= s
+        view.np_dtype = self.np_dtype
+        view.item_bytes = self.item_bytes
+        view.is_composite = self.is_composite
+        view._strides = tuple(strides) if tuple(strides) != self._dense_strides_from(shape) else None
+        view.offset_elems = 0
+        view._offset_bytes = self._meta_offset_bytes() + offset_bytes
+        view._buffer = self._buffer  # shared: release is owned by the base
+        view._owns_buffer = False
+        view._alias_src = getattr(self, "_alias_src", None) or self
+        view._ptr = self._ptr + offset_bytes
+        view._build_numpy_view()
+        return view
+
+    def _meta_offset_bytes(self) -> int:
+        stored = getattr(self, "_offset_bytes", None)
+        if stored is not None:
+            return stored
+        return self.offset_elems * self.item_bytes
+
+    def _dense_strides_from(self, shape) -> tuple[int, ...]:
+        out = []
+        acc = self.item_bytes
+        for i in range(len(shape) - 1, -1, -1):
+            out.append(acc)
+            acc *= shape[i]
+        return tuple(reversed(out))
+
     def __getitem__(self, key):
         if isinstance(key, slice):
             if len(self.shape) == 0:
@@ -722,7 +963,9 @@ class WarpArray:
                 raise IndexError(f"invalid array slice [{start}:{stop}] for shape {self.shape}")
             return self._slice_view(start, stop - start)
         if isinstance(key, tuple):
-            # multi-dim element read (host copy via the numpy view)
+            if any(isinstance(k, slice) for k in key):
+                return self._tuple_slice_view(key)
+            # all-int key: multi-dim element read (host copy via the numpy view)
             return self.numpy_view()[key]
         if isinstance(key, (int, np.integer)):
             if len(self.shape) == 0:
@@ -958,7 +1201,7 @@ def clone(src, device=None, requires_grad=False, pinned=False, retain_grad=False
         # holds both arrays, so neither buffer dies under the graph)
         _CAPTURE_RECORDS.append(("copy", arr, src, 0, 0, None))
         return arr
-    payload = _blit_copy_payload(arr, src, 0, 0, src.n)
+    payload = _blit_copy_payload(arr, src, 0, 0, src.n) if src.is_contiguous else None
     if payload is not None and src.n > 0 and not _sync_eager() and _eager_gpu_fills():
         # GPU-encoded stream memcpy (opt-in knob; same eligibility as the
         # replay path — equal dtype, same device, fresh dest never
@@ -1056,11 +1299,15 @@ def copy(dest, src, dest_offset=0, src_offset=0, count=None, stream=None):
     dest.numpy[dest_offset : dest_offset + n] = src.numpy[src_offset : src_offset + n]
 
 
-def from_numpy(arr, dtype=None, shape=None, device=None, requires_grad=False, retain_grad=False):
+def from_numpy(arr, dtype=None, shape=None, strides=None, device=None, requires_grad=False, retain_grad=False):
     """Create a WarpArray from a numpy array.
 
     Copies the data into a fresh MTLBuffer (shared storage). A zero-copy
     wrap of foreign memory needs a native ``buffer_from_ptr`` (Phase 2).
+    ``strides`` (bytes, upstream convention) reinterprets the copied raw
+    buffer with caller-provided strides — the numpy source's raw memory is
+    copied verbatim, so values land exactly where upstream's alias
+    semantics would read them.
     """
     if requires_grad or retain_grad:
         raise RuntimeError("warp-metal does not support grad flags (adjoint is a KEP-0001 Non-Goal)")
@@ -1088,6 +1335,8 @@ def from_numpy(arr, dtype=None, shape=None, device=None, requires_grad=False, re
                     break
             if product == comps:
                 target_shape = tuple(np_arr.shape[: np_arr.ndim - k])
+    if strides is not None:
+        return _from_numpy_strided(arr, dtype, target_shape, strides, device)
     out = _allocate(target_shape or (1,), dtype, device)
     np_t = np.dtype(out.np_dtype)
     if np_t.names:
@@ -1116,6 +1365,77 @@ def from_numpy(arr, dtype=None, shape=None, device=None, requires_grad=False, re
             f"target {out.shape} of {getattr(dtype, '__name__', dtype)} needs {total_scalars}"
         )
     out._numpy[:total_scalars] = flat.reshape(out._numpy.shape)  # fresh buffer (see zeros)
+    return out
+
+
+def _from_numpy_strided(src_np, dtype, shape, strides, device):
+    """``wp.array(numpy, shape=..., strides=...)`` — upstream aliases the
+    numpy buffer with the given byte strides; Metal cannot alias
+    non-page-aligned host memory, so the raw source bytes are copied into a
+    fresh MTLBuffer and reinterpreted with the same strides (identical
+    values). The strides must mirror the numpy source's own layout — a
+    mismatched reinterpret would silently misread, which fails loud here
+    (black-box principle)."""
+    if not isinstance(src_np, np.ndarray):
+        raise TypeError("wp.array(data=..., strides=...) needs a numpy array source")
+    if dtype is None:
+        for wtype, np_t in _SCALAR_NP.items():
+            if np_t == src_np.dtype:
+                dtype = wtype
+                break
+        else:
+            raise NotImplementedError(f"from_numpy: numpy dtype {src_np.dtype} not mapped")
+    np_t, item_bytes, is_composite = _dtype_layout(dtype)
+    np_t = np.dtype(np_t)
+    if shape is None:
+        target = tuple(src_np.shape)
+        if is_composite:
+            comps = item_bytes // np_t.itemsize
+            product, k = 1, 0
+            for ax in reversed(src_np.shape):
+                product *= int(ax)
+                k += 1
+                if product >= comps:
+                    break
+            if product == comps:
+                target = tuple(src_np.shape[: src_np.ndim - k])
+    else:
+        target = _normalize_shape(shape)
+    strides = tuple(int(s) for s in strides)
+    if len(strides) != len(target):
+        raise ValueError(
+            f"wp.array(strides=...): {len(strides)} strides for a {len(target)}-dim shape {target}"
+        )
+    expect_tail = () if not is_composite else (np_t.itemsize,) * (src_np.ndim - len(target))
+    if tuple(src_np.strides) != tuple(src_np.strides[: len(target)]) + expect_tail:
+        raise NotImplementedError(
+            f"wp.array(strides={strides}): the numpy source layout {src_np.strides} is "
+            "not the plain element layout the strides describe — a mismatched "
+            "reinterpret would silently misread; warp-metal fails loud instead"
+        )
+    span = item_bytes + sum(max(0, s - 1) * st for s, st in zip(target, strides))
+    if span > src_np.nbytes:
+        raise ValueError(
+            f"wp.array(strides=...): strided span {span} bytes exceeds the numpy "
+            f"source's {src_np.nbytes}"
+        )
+    out = WarpArray.__new__(WarpArray)
+    out.device = get_device(device)
+    out.dtype = dtype
+    out.shape = target
+    out.n = 1
+    for s in target:
+        out.n *= s
+    out.np_dtype, out.item_bytes, out.is_composite = _dtype_layout(dtype)
+    out.offset_elems = 0
+    out._strides = strides if strides != out._dense_strides_from(target) else None
+    out._owns_buffer = True
+    out._buffer = _mm.buffer_create(span)
+    out._ptr = _mm.buffer_ptr(out._buffer)
+    WarpArray._PTR_ALIASES[out._ptr] = out
+    src_addr = src_np.__array_interface__["data"][0]
+    ctypes.memmove(out._ptr, src_addr, min(span, src_np.nbytes))
+    out._build_numpy_view()
     return out
 
 
@@ -1187,6 +1507,7 @@ class array(metaclass=_ArrayMeta):
         data=None,
         dtype=None,
         shape=None,
+        strides=None,
         device=None,
         copy=True,
         pinned=False,
@@ -1205,6 +1526,10 @@ class array(metaclass=_ArrayMeta):
                 "warp-metal does not support requires_grad/pinned/retain_grad allocation flags "
                 "(adjoint codegen is a KEP-0001 Non-Goal)"
             )
+        if strides is not None:
+            # upstream strides kwarg is in BYTES (warp/_src/types.py
+            # strides_from_shape; Newton's selection.py passes bytes)
+            strides = tuple(int(s) for s in strides)
         if ptr is not None or capacity is not None or deleter is not None:
             if ptr is None or deleter is not None:
                 # foreign-memory wrap (deleter-owned storage) is unbuildable
@@ -1216,14 +1541,19 @@ class array(metaclass=_ArrayMeta):
             # through its shared-storage pointer (mjw constraint.py:5356
             # reinterprets contact.frame (n,9)f32 as (n,3)vec3). The ptr IS
             # the unified device address, so the view shares the same
-            # MTLBuffer; ptrs outside the registry keep the Phase-2 fail-loud.
-            src = WarpArray._PTR_ALIASES.get(int(ptr))
+            # MTLBuffer; Newton's selection.py points INSIDE a live
+            # allocation — resolve by byte-span containment, exact hits
+            # first. Pointers outside every live allocation keep the
+            # Phase-2 fail-loud.
+            src = WarpArray._resolve_allocation(int(ptr))
             if src is None:
                 raise NotImplementedError(
                     f"wp.array(ptr={hex(int(ptr))}) aliasing: pointer is not a live warp-metal "
                     "allocation — foreign-memory wrap needs native buffer_from_ptr (Phase 2)"
                 )
-            return WarpArray._ptr_alias_view(src, int(ptr), dtype, shape, device, capacity)
+            if shape is None:
+                shape = (src.n,)
+            return WarpArray._ptr_alias_view(src, int(ptr), dtype, shape, device, capacity, strides)
         if not copy:
             # Metal cannot alias arbitrary host memory (newBufferWithBytesNoCopy
             # requires page alignment), so copy=False lands as a copy. Newton's
@@ -1245,7 +1575,12 @@ class array(metaclass=_ArrayMeta):
                 ndim=ndim,
             )
         if data is not None:
-            return from_numpy(data, dtype=dtype, shape=shape, device=device)
+            return from_numpy(data, dtype=dtype, shape=shape, strides=strides, device=device)
+        if strides is not None:
+            raise NotImplementedError(
+                "wp.array(shape=..., strides=...) allocation is outside the "
+                "warp-metal closure (allocate dense and slice instead)"
+            )
         if shape is None:
             raise TypeError("wp.array() needs either data or shape")
         return zeros(shape, dtype=dtype if dtype is not None else float32, device=device)
@@ -1739,18 +2074,14 @@ def _arr_meta(arr: WarpArray | None) -> _ArrMeta:
         return meta
     shape = arr.shape or (1,)
     ndim = len(shape)
-    item = arr.item_bytes
-    strides = [0, 0, 0, 0]
-    acc = item
-    for i in range(ndim - 1, -1, -1):
-        strides[i] = acc
-        acc *= shape[i]
+    strides = arr.strides  # bytes per dim (views carry their own; device
+    # wp_address indexes a char* with these — warp native array.h semantics)
     meta = _ArrMeta()
-    meta.offset = arr.offset_elems * item
+    meta.offset = arr._meta_offset_bytes()
     meta.ndim = ndim
     for i in range(4):
         meta.shape[i] = shape[i] if i < ndim else 0
-        meta.strides[i] = strides[i]
+        meta.strides[i] = int(strides[i]) if i < ndim else 0
     return meta
 
 
