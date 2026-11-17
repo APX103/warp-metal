@@ -562,6 +562,9 @@ _CALL_TABLE = {
     "ceil": "wp_ceil",
     "round": "wp_round",
     "trunc": "wp_trunc",
+    "frac": "wp_frac",
+    "lerp": "wp_lerp",
+    "degrees": "wp_degrees",
     "step": "wp_step",
     "pow": "wp_pow",
     "isinf": "wp_isinf",
@@ -4504,6 +4507,25 @@ class _BodyTranslator:
         if m_ext and len(args) == 1 and self.var_types.get(args[0].strip(), "").startswith("wp_tuple_"):
             # `wp::extract<i>(tuple)` — tuple.h member read, lowered inline
             return f"({self.expr(args[0])}).v{m_ext.group(1)}"
+        if base == "extract" and len(args) == 2 and args[1].strip() in self._slices:
+            # `wp::extract<vecT>(q, slice)` — quat component slicing
+            # (``q[:3]`` / ``q[:4]`` / ``q[1:3]``; upstream quat.h index
+            # lowering). The slice is a compile-time constant range over the
+            # quat's xyzw components; the result is a vecN value (or a bare
+            # component for a single-element range).
+            b, e, s = self._slices[args[1].strip()]
+            if s != 1 or b < 0:
+                raise TranslationError(
+                    f"quat slice ({b}, {e}, {s}): only unit-step non-negative ranges are in the closure"
+                )
+            end = 4 if e in (-1, 4) else e
+            src = self.expr(args[0])
+            comps = ["x", "y", "z", "w"][b:end]
+            if len(comps) == 4:
+                return src  # whole quat: quatf and vec4f are both xyzw value structs
+            if len(comps) == 1:
+                return f"({src}.{comps[0]})"
+            return f"make_vec{len(comps)}f({', '.join(f'{src}.{c}' for c in comps)})"
         if base == "extract" and len(args) == 3 and args[1].strip() in self._slices:
             # `wp::extract<N>(m, slice, j)` — the `m[:, j]` column form
             # (rangefinder depth: cam_xmat[:, 2]); upstream vec.h mat_t
@@ -5975,7 +5997,16 @@ def _translate_function(
             fn.params.append(Param("ref", msl_type(ctype), pname.strip()))
             continue
         ctype, pname = arg_src.rsplit(None, 1)
-        if _classify_ctype(ctype) == "array":
+        m_ptup = _RE_TUPLE_T.match(ctype.strip())
+        if m_ptup:
+            # tuple-typed value param (warp_nn tile_transposed_gemm_2d's
+            # `index: tuple[int, int]`): a tuple_t VALUE struct by value —
+            # same def the kernel-side `wp::tuple(a, b)` ctor uses
+            tname = ensure_tuple_def(
+                unit, [msl_type(e.strip()) for e in split_args(m_ptup.group(1))]
+            )
+            fn.params.append(Param("value", tname, pname))
+        elif _classify_ctype(ctype) == "array":
             fn.params.append(Param("array", array_elem_msl(ctype), pname))
             # C++ SSA function params already carry the var_ prefix
             key = pname if pname.startswith("var_") else f"var_{pname}"
@@ -6030,6 +6061,10 @@ def _translate_function(
         if p.kind == "value":
             bare = p.name.removeprefix("var_")
             tr.uniform_vars.update({p.name, bare, f"var_{bare}"})
+            if p.msl.startswith("wp_tuple_"):
+                # tuple value param: the body's wp::extract<i> reads need the
+                # param's tuple type (params have no decl line to seed it)
+                tr.var_types[p.name] = p.msl
     # bind the template tile params into the body scope: the tile ops inside
     # (tile_view / tile_map / tile_reduce over the param) read the caller's
     # threadgroup array through the hidden shr-slot param

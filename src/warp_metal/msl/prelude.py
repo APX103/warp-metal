@@ -1697,6 +1697,18 @@ static inline float wp_floor(float x) { return floor(x); }
 static inline float wp_ceil(float x) { return ceil(x); }
 static inline float wp_round(float x) { return round(x); }
 static inline float wp_trunc(float x) { return trunc(x); }
+// fractional part (builtin.h:1560 — x - trunc(x), NOT x - floor(x))
+static inline float wp_frac(float x) { return x - trunc(x); }
+// lerp (builtin.h:2707 — a*(1-t) + b*t; scalar + vector overloads, scalar t)
+static inline float wp_lerp(float a, float b, float t) { return a * (1.0f - t) + b * t; }
+static inline vec2f wp_lerp(vec2f a, vec2f b, float t) { return a * (1.0f - t) + b * t; }
+static inline vec3f wp_lerp(vec3f a, vec3f b, float t) { return a * (1.0f - t) + b * t; }
+static inline vec4f wp_lerp(vec4f a, vec4f b, float t) { return a * (1.0f - t) + b * t; }
+// degrees (builtin.h:1538 — x * RAD_TO_DEG, constant verbatim)
+#ifndef WP_RAD_TO_DEG
+#define WP_RAD_TO_DEG 57.29577951308232087679f
+#endif
+static inline float wp_degrees(float x) { return x * WP_RAD_TO_DEG; }
 static inline float wp_step(float x, float y) { return x < y ? 0.0f : 1.0f; }  // builtin.h: y < x ? 0 : 1
 static inline float wp_step(float x) { return x < 0.0f ? 1.0f : 0.0f; }  // 1-arg overload: 1.0 if x < 0
 static inline float wp_pow(float x, float y) { return pow(x, y); }

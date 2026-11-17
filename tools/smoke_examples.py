@@ -82,6 +82,21 @@ LOG_DIR = "/tmp/phase4_smoke_logs"
 RESULTS_PATH = os.path.join(LOG_DIR, "results.json")
 
 TIMEOUT_S = int(os.environ.get("SMOKE_TIMEOUT_S", "240"))
+
+# Per-example launch options mirroring Newton's own CI specs
+# (newton/tests/test_examples.py add_example_test test_options). The
+# examples' test_final() criteria require the CI frame count: with the
+# argparse default of 100 frames at fps=60 the sim reaches only 1.67 s and
+# e.g. robot_omniwheel's "run too short to exercise all drive phases"
+# fires before any real physics is exercised (found 2026-11-17: omniwheel
+# ran its full tile/solver pipeline cleanly and failed ONLY on this).
+TEST_OPTIONS: dict[str, list[str]] = {
+    "robot_omniwheel": ["--num-frames", "500"],
+    "robot_g1": ["--num-frames", "500"],
+    "robot_ur10": ["--num-frames", "500"],
+    "robot_policy": ["--num-frames", "500"],
+    "ik_cube_stacking": ["--num-frames", "2000"],
+}
 TAIL_LINES = 60
 
 # Display-shared-GPU pacing (see module docstring): sleep after every example,
@@ -390,6 +405,7 @@ def run_one(name: str, timeout_s: int = TIMEOUT_S) -> dict:
     cmd = [
         "uv", "run", "-m", "newton.examples", name,
         "--device", "metal", "--viewer", "null", "--test",
+        *TEST_OPTIONS.get(name, []),
     ]
     if TASKPOLICY and shutil.which("taskpolicy"):
         # Darwin background priority: efficiency-core preference, yields to
