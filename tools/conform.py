@@ -233,6 +233,11 @@ TOLERATED_MISMATCHES = {
     # (launch_tiled(kernel, dim, inputs=..., outputs=..., block_dim=...)),
     # adjoint kwargs fail loud per KEP-0001.
     "launch_tiled": "签名等价（上游=*args/**kwargs 解包封装，warp-metal=显式上游参数表；调用面一致，adjoint 实参 fail-loud）",
+    # warp-metal adds an optional `strides` kwarg (byte strides, upstream
+    # strides_from_shape parity — Newton selection.py:1782 constructs
+    # interior-pointer views through it). Superset of the golden signature:
+    # omitting it behaves exactly like upstream from_numpy.
+    "from_numpy": "signature-equivalent superset (optional byte-strides kwarg, upstream strides parity; omitted → upstream behavior)",
 }
 
 
