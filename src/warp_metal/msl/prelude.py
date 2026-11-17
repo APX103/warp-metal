@@ -924,6 +924,30 @@ static inline void wp_quat_to_axis_angle(quatf q, thread vec3f& axis, thread flo
     angle = 2.0f * atan2(length(v), fabs(q.w));
 }
 
+// quat.h quat_slerp (exact port): shortest-arc interpolation through the
+// incremental rotation quat_to_axis_angle(inverse(q0)*q1) scaled by t.
+// The two Hamilton products are spelled inline — wp_mul(quatf, quatf) is
+// defined further down the prelude and MSL needs declarations before use.
+static inline quatf wp_quat_slerp(quatf q0, quatf q1, float t) {
+    quatf qi = wp_quat_inverse(q0);
+    quatf q_inc = make_quatf(
+        qi.w*q1.x + qi.x*q1.w + qi.y*q1.z - qi.z*q1.y,
+        qi.w*q1.y - qi.x*q1.z + qi.y*q1.w + qi.z*q1.x,
+        qi.w*q1.z + qi.x*q1.y - qi.y*q1.x + qi.z*q1.w,
+        qi.w*q1.w - qi.x*q1.x - qi.y*q1.y - qi.z*q1.z
+    );
+    vec3f axis;
+    float angle;
+    wp_quat_to_axis_angle(q_inc, axis, angle);
+    quatf qt = wp_quat_from_axis_angle(axis, t * angle);
+    return make_quatf(
+        q0.w*qt.x + q0.x*qt.w + q0.y*qt.z - q0.z*qt.y,
+        q0.w*qt.y - q0.x*qt.z + q0.y*qt.w + q0.z*qt.x,
+        q0.w*qt.z + q0.x*qt.y - q0.y*qt.x + q0.z*qt.w,
+        q0.w*qt.w - q0.x*qt.x - q0.y*qt.y - q0.z*qt.z
+    );
+}
+
 // ---- transform ops (spatial.h, exact ports) ----
 static inline transformf wp_transform_identity() { transformf t; t.p = make_vec3f(); t.q = wp_quat_identity(); return t; }
 static inline vec3f wp_transform_get_translation(transformf t) { return t.p; }
@@ -1797,6 +1821,67 @@ static inline uint64_t wp_min(uint64_t a, uint64_t b) { return a < b ? a : b; }
 static inline uint64_t wp_max(uint64_t a, uint64_t b) { return a > b ? a : b; }
 static inline bool wp_isfinite(int64_t x) { return true; }
 static inline bool wp_isfinite(uint64_t x) { return true; }
+
+// ---- rand (upstream warp/native/rand.h verbatim PCG port) -----------------
+// Stateless PCG hash (Mark Jarzynski and Marc Olano, Hash Functions for GPU
+// Rendering, JCGT 2020) — same formulas, same constants, same bit-exact
+// sequence as upstream CUDA/CPU. The rand*/sample_* draw functions take the
+// state BY REFERENCE (`thread uint&`): upstream rand.h uses `uint32&` and the
+// native codegen's C++ reference binding advances the caller's variable in
+// place — MSL thread-scope references give the identical semantics, so the
+// SSA call `wp::randf(var_rng)` mutates var_rng exactly like upstream.
+#ifndef WP_RANDN_EPSILON
+#define WP_RANDN_EPSILON 5.96e-8f
+#endif
+
+static inline uint wp_rand_pcg(uint state) {
+    uint b = state * 747796405u + 2891336453u;
+    uint c = ((b >> ((b >> 28u) + 4u)) ^ b) * 277803737u;
+    return (c >> 22u) ^ c;
+}
+
+static inline uint wp_rand_init(int seed) { return wp_rand_pcg(uint(seed)); }
+static inline uint wp_rand_init(int seed, int offset) {
+    return wp_rand_pcg(uint(seed) + wp_rand_pcg(uint(offset)));
+}
+
+static inline int wp_randi(thread uint& state) {
+    state = wp_rand_pcg(state);
+    return int(state);
+}
+static inline int wp_randi(thread uint& state, int min, int max) {
+    state = wp_rand_pcg(state);
+    return state % uint(max - min) + min;
+}
+
+static inline uint wp_randu(thread uint& state) {
+    state = wp_rand_pcg(state);
+    return state;
+}
+static inline uint wp_randu(thread uint& state, uint min, uint max) {
+    state = wp_rand_pcg(state);
+    return state % (max - min) + min;
+}
+
+// [0, 1) in 2^24 equal intervals (rand.h mantissa-uniformity mapping)
+static inline float wp_randf(thread uint& state) {
+    state = wp_rand_pcg(state);
+    return (state >> 8u) * (1.0f / 16777216.0f);
+}
+static inline float wp_randf(thread uint& state, float min, float max) {
+    return (max - min) * wp_randf(state) + min;
+}
+
+// Box-Muller (rand.h): domain (0, 1) via RANDN_EPSILON shift. rand.h spells
+// the two randf draws as operands of one `*` expression — C++ leaves that
+// operand order unspecified, so the draws are sequenced explicitly here
+// (log operand first — the order upstream's own clang builds emit; pinned so
+// the sequence cannot drift with the MSL compiler)
+static inline float wp_randn(thread uint& state) {
+    float u1 = wp_randf(state);
+    float u2 = wp_randf(state);
+    return sqrt(-2.0f * log(u1 + WP_RANDN_EPSILON)) * cos(2.0f * M_PI_F * u2);
+}
 
 // ---- vector bridges for the wp_-prefixed call table ----
 static inline float wp_dot(vec2f a, vec2f b) { return dot(a, b); }

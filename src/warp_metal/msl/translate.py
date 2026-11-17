@@ -566,6 +566,15 @@ _CALL_TABLE = {
     "pow": "wp_pow",
     "isinf": "wp_isinf",
     "isnan": "wp_isnan",
+    # random (upstream rand.h PCG port in the prelude; MSL resolves the 1/2/3
+    # arg overloads like the upstream C++ overloads. The draw family takes
+    # `thread uint& state` — SSA passes the state variable by name and the
+    # reference binding advances it in place, matching upstream semantics)
+    "rand_init": "wp_rand_init",
+    "randi": "wp_randi",
+    "randu": "wp_randu",
+    "randf": "wp_randf",
+    "randn": "wp_randn",
     # matrix
     "skew": "wp_skew",
     "diag": "wp_diag",
@@ -599,6 +608,7 @@ _CALL_TABLE = {
     "quat_to_matrix": "wp_quat_to_matrix",
     "quat_from_matrix": "wp_quat_from_matrix",
     "quat_from_axis_angle": "wp_quat_from_axis_angle",
+    "quat_slerp": "wp_quat_slerp",
     # transform
     "transform_identity": "wp_transform_identity",
     "transform_get_translation": "wp_transform_get_translation",
@@ -1078,6 +1088,10 @@ class MSLFunction:
         self.is_template = False
         self.template_params: list[str] = []  # template param type names
         self.template_func = None  # the original warp func, for instantiation
+        # tile-returning @wp.func: (elem, dims, slot) — the value travels in
+        # the callee's claimed shared slot; callers rebind their result var
+        # to it (the `= nullptr` alias mechanism one step wider)
+        self.tile_return: tuple[str, list[int], int] | None = None
         # tile-using function: takes a hidden trailing ``int _wp_lane``
         # parameter plus one ``threadgroup elem* _wp_tile_shr_{k}`` per
         # reduction slot (fn.params stays SSA-aligned; fn_src/_call_user add
@@ -1226,8 +1240,11 @@ class KernelUnit:
             params.append(f"    device wp_mesh* _wp_mesh_table [[buffer({idx})]]")
             idx += 1
         params.append("    uint3 _gid [[thread_position_in_grid]]")
-        if self.tile_reduces or self.uses_live:
-            # grid extent for the partial-threadgroup fold guard (_wp_live)
+        if self.tile_reduces or self.uses_live or self.callee_needs_live:
+            # grid extent for the partial-threadgroup fold guard (_wp_live);
+            # the guard can also live in a callee's body (JTDAJ_sparse's
+            # hessian_entry template) — the binding must fire whenever the
+            # preamble definition does
             params.append("    uint3 _gsize [[threads_per_grid]]")
         fields = []
         for a in self.args:
@@ -2764,10 +2781,12 @@ class _BodyTranslator:
         self._check_uniform("wp::tile_add_inplace")
         dlines, daddr = dst.lin_addr("_wp_t", prefix="_wp_ai_d")
         slines, saddr = src.lin_addr("_wp_t", prefix="_wp_ai_s")
+        # coordinate decls reference the loop var — emit them INSIDE the
+        # loop (a strided operand, e.g. a tile_broadcast alias with a 0
+        # stride, unravels coordinates per iteration)
         return [
-            *slines,
-            *dlines,
             f"for (int _wp_t = _wp_lane; _wp_t < {dst.size}; _wp_t += {bd}) {{",
+            *(f"    {ln};" for ln in [*slines, *dlines]),
             f"    _wp_tile_shr_{dst.slot}[{daddr}] += _wp_tile_shr_{src.slot}[{saddr}];",
             "}",
             "threadgroup_barrier(mem_flags::mem_threadgroup);",
@@ -4586,6 +4605,11 @@ class _BodyTranslator:
                 self._block_stack.pop()
             return ["}"]
         if m := _RE_RETURN.match(line):
+            tv = self.tile_vars.get(m.group(1).strip())
+            if tv is not None and tv.kind == "shr":
+                # tile-returning @wp.func epilogue: the value lives in the
+                # callee's claimed shared slot — nothing to move by MSL value
+                return ["return;"]
             return [f"return {self.expr(m.group(1))};".replace("return ;", "return;")]
 
         # tile_stack decl (`wp::tile_stack_t<T, C> var = wp::tile_stack_alloc<
@@ -5002,6 +5026,41 @@ class _BodyTranslator:
                 # wp.Mesh value (mesh_get result or a value copy): members
                 # bind as real arrays (see the _alias member path)
                 self.mesh_vars.add(target)
+            m_uc = re.match(r"^([A-Za-z_]\w*)\(", rhs)
+            ufn = self.user_funcs.get(m_uc.group(1)) if m_uc else None
+            if ufn is not None and getattr(ufn, "tile_return", None) is not None:
+                # `var = tile_returning_fn(args);` — the value travels in the
+                # callee's claimed shared slot: emit the bare call and rebind
+                # the target as a shared tile view of that slot (upstream
+                # tile_shared_t by-value copy collapses to slot ownership;
+                # clone-per-site keeps the slot unique per instantiation)
+                elem, dims, slot = ufn.tile_return
+                size = 1
+                for d in dims:
+                    size *= d
+                # owner tile: row-major element strides (upstream
+                # tile_shared_t owner layout)
+                strides = []
+                acc = 1
+                for d in reversed(dims):
+                    strides.append(acc)
+                    acc *= d
+                strides.reverse()
+                tgt = self.tile_vars.get(target)
+                if tgt is None:
+                    self.tile_vars[target] = TileVar(
+                        "shr", elem, slot=slot, size=size, dims=dims, strides=strides
+                    )
+                else:
+                    tgt.kind = "shr"
+                    tgt.elem = elem
+                    tgt.slot = slot
+                    tgt.size = size
+                    tgt.dims = list(dims)
+                    tgt.strides = strides
+                    tgt.base = "0"
+                self.unit.uses_tile_ops = True
+                return [f"{self._call_user(rhs)};"]
             return [f"{target} = {self.expr(rhs)};"]
 
         # alias creation: var_p = wp::address(...) / var_p = &(expr)
@@ -5845,7 +5904,9 @@ def _translate_function(
     ret_cpp, fn_name = ret_and_name.rsplit(None, 1)
     assert fn_name == fname, f"function name mismatch: {fn_name} vs {fname}"
     ret_msl = None
-    if ret_cpp != "void":
+    m_tile_ret = re.match(r"^wp::tile_shared_t<(.+)>$", ret_cpp.strip()) if ret_cpp else None
+    tile_ret: tuple[str, list[int]] | None = None
+    if ret_cpp != "void" and m_tile_ret is None:
         if _RE_TUPLE_T.match(ret_cpp):
             ret_msl = ensure_tuple_def(unit, [msl_type(e.strip()) for e in split_args(_RE_TUPLE_T.match(ret_cpp).group(1))])
         else:
@@ -5870,6 +5931,30 @@ def _translate_function(
                 ret_type = ret_var[0].type if ret_var else f.adj.arg_types.get("return")
                 if ret_type is not None and _type_is_struct(ret_type):
                     _emit_struct_def(ret_type, unit, _codegen, value_arrays=True)
+    else:
+        if m_tile_ret is not None:
+            # tile-returning @wp.func (warp_nn tile_transposed_gemm_2d):
+            # upstream passes tile_shared_t by value; here the value travels
+            # through the callee's own claimed shared slot — the MSL
+            # signature stays void and the caller's result var rebinds to
+            # that slot (the `= nullptr` alias-decl mechanism one step
+            # wider). Owner=true (last template arg) is the only form the
+            # corpus closure produces.
+            if unit.block_dim is None:
+                raise TranslationError(
+                    f"function {fname}: tile_shared_t return outside a tiled launch "
+                    "(plain launches lower tiles per-thread scalar)"
+                )
+            parts = split_args(m_tile_ret.group(1))
+            tile_ret = (msl_type(parts[0].strip()), [])
+            m_shape = re.search(r"wp::tile_shape_t<([\d,\s]+)>", m_tile_ret.group(1))
+            if m_shape:
+                tile_ret = (
+                    tile_ret[0],
+                    [int(d) for d in m_shape.group(1).replace(" ", "").split(",") if d],
+                )
+            if not tile_ret[1]:
+                raise TranslationError(f"function {fname}: tile_shared_t return without tile_shape_t ({ret_cpp})")
 
     fn = MSLFunction(inst_name or fn_name, ret_msl)
     array_args: dict[str, ArgSpec] = {}
@@ -6013,6 +6098,22 @@ def _translate_function(
             raise TranslationError(f"function {fname}: tile ops outside a tiled launch")
         fn.needs_lane = True
         fn.shr_slots = [(k, elem) for k, elem, _combine in tr.used_shr]
+    if tile_ret is not None:
+        # resolve the returned shared slot from the callee's `return var;`
+        # line — the callee's own tile_zeros claim (clone-per-site keeps it
+        # unique to this instantiation)
+        m_rv = re.search(r"\breturn\s+(var_\w+)\s*;", "\n".join(lines[body_start:]))
+        rv = tr.tile_vars.get(m_rv.group(1)) if m_rv else None
+        if rv is None or rv.kind != "shr" or rv.slot < 0:
+            raise TranslationError(
+                f"function {fname}: tile_shared_t return names no shared tile var"
+                + (f" (got {rv!r})" if rv is not None else "")
+            )
+        if list(rv.dims or []) != tile_ret[1]:
+            raise TranslationError(
+                f"function {fname}: tile return shape {rv.dims} != decl shape {tile_ret[1]}"
+            )
+        fn.tile_return = (tile_ret[0], tile_ret[1], rv.slot)
     if getattr(tr, "used_arena", False) or getattr(tr, "callee_needs_arena", False):
         fn.needs_arena = True
     if getattr(tr, "used_mesh", False) or getattr(tr, "callee_needs_mesh", False):
