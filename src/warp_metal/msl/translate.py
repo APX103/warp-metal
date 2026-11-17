@@ -4521,10 +4521,10 @@ class _BodyTranslator:
             end = 4 if e in (-1, 4) else e
             src = self.expr(args[0])
             comps = ["x", "y", "z", "w"][b:end]
-            if len(comps) == 4:
-                return src  # whole quat: quatf and vec4f are both xyzw value structs
             if len(comps) == 1:
                 return f"({src}.{comps[0]})"
+            # quatf and vecNf are distinct MSL structs — always build the
+            # vec value explicitly (a whole-quat slice is NOT an identity)
             return f"make_vec{len(comps)}f({', '.join(f'{src}.{c}' for c in comps)})"
         if base == "extract" and len(args) == 3 and args[1].strip() in self._slices:
             # `wp::extract<N>(m, slice, j)` — the `m[:, j]` column form
