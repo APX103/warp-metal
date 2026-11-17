@@ -1353,6 +1353,17 @@ def from_numpy(arr, dtype=None, shape=None, strides=None, device=None, requires_
         # byte — copy records verbatim (embedded wp.array fields keep their
         # shared-storage pointers, which are the device addresses)
         elements = arr if isinstance(arr, (list, tuple)) else None
+        if elements is None and isinstance(np_arr, np.ndarray) and np_arr.dtype == np_t:
+            # numpy structured source (Newton picking.py: np.empty(1,
+            # dtype=PickingState.numpy_dtype())) — the record layout equals
+            # the struct's byte for byte, so the records copy verbatim, the
+            # same contract as the struct-instance path below. Anything not
+            # exactly the struct's own numpy dtype falls through to the
+            # fail-loud branch (black-box principle).
+            if np_arr.shape[0] != out.n:
+                raise ValueError(f"struct wp.array: numpy has {np_arr.shape[0]} records for shape {out.shape}")
+            ctypes.memmove(out._ptr, np_arr.ctypes.data, out.n * out.item_bytes)
+            return out
         if elements is None:
             raise NotImplementedError("struct-dtype wp.array needs a list of struct instances")
         if len(elements) != out.n:

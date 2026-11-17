@@ -223,6 +223,13 @@ static inline mat33f make_mat33f(float a, float b, float c, float d, float e, fl
     mat33f m; m.c[0][0]=a; m.c[0][1]=b; m.c[0][2]=c; m.c[1][0]=d; m.c[1][1]=e; m.c[1][2]=f;
     m.c[2][0]=g; m.c[2][1]=h; m.c[2][2]=i; return m;
 }
+static inline mat44f make_mat44f(float a, float b, float c, float d, float e, float f, float g, float h,
+                                 float i, float j, float k, float l, float m, float n, float o, float p) {
+    mat44f r; r.c[0][0]=a; r.c[0][1]=b; r.c[0][2]=c; r.c[0][3]=d;
+    r.c[1][0]=e; r.c[1][1]=f; r.c[1][2]=g; r.c[1][3]=h;
+    r.c[2][0]=i; r.c[2][1]=j; r.c[2][2]=k; r.c[2][3]=l;
+    r.c[3][0]=m; r.c[3][1]=n; r.c[3][2]=o; r.c[3][3]=p; return r;
+}
 // ---- copy constructors (C++ mat_t/vec_t/quat_t/transform_t/spatial_vector_t
 // copy ctor: EXACT memberwise copy). The translator cannot type-check SSA
 // ctor args — a single-arg wp.mat33(x) call may be the scalar fill above OR

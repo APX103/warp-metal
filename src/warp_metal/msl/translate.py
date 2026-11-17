@@ -4335,6 +4335,29 @@ class _BodyTranslator:
                         f"(wp_vec_ref(*{self._elem_addr(spec, idx_srcs)}, {k_src})"
                         f" = {self.expr(args[1])})"
                     )
+                # Struct-field store through an array element address:
+                # `wp::store(&(wp::index(arr, i).field), v)` — the lowering of
+                # `arr[i].field = v` on a struct-typed array (viewer GL
+                # fill_vertex_data / fill_line_vertex_data: `vertices[tid].pos =
+                # points[tid]`). The MSL struct keeps the Python member names
+                # (_emit_struct_def), so the element pointer dereferences and
+                # projects the member in place. (The `.component_ref(k)` form
+                # above ends in `)` before the closing paren, so it never
+                # matches this member-name pattern.)
+                m_field = re.match(r"^&\(wp::index\((.*)\)\.([A-Za-z_]\w*)\)$", tgt)
+                if m_field:
+                    iargs = split_args(m_field.group(1))
+                    arr_var = iargs[0].strip()
+                    spec = self.array_args.get(arr_var)
+                    if spec is None:
+                        raise TranslationError(
+                            f"wp::store &(...field) target on non-array arg {arr_var!r}"
+                        )
+                    idx_srcs = [self.expr(a) for a in iargs[1:]]
+                    return (
+                        f"(((*{self._elem_addr(spec, idx_srcs)}).{m_field.group(2)}"
+                        f" = {self.expr(args[1])}))"
+                    )
                 alias = self.aliases.get(tgt)
                 if alias is None or not alias[0]:
                     raise TranslationError(f"wp::store target {tgt!r} is not a pointer alias")
@@ -5703,6 +5726,9 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
             _emit_struct_def(var.type.dtype, unit, _codegen)
 
     array_args: dict[str, ArgSpec] = {}
+    # struct-typed array element types waiting for their MSL def (see the
+    # array-arg classification below and the tail emission before return)
+    pending_elem_structs: list[tuple[str, object]] = []
     for var in adj.args:
         ctype = _Var.type_to_ctype(var.type)
         kind = _classify_ctype(ctype)
@@ -5734,6 +5760,21 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
                     ensure_vec_def(unit, elem)
                 elif _RE_GEN_MAT.match(elem):
                     ensure_mat_def(unit, elem)
+                elif _type_is_struct(var.type.dtype):
+                    # struct-typed array element (viewer GL RenderVertex /
+                    # LineVertex — first Newton path with a struct array
+                    # param): the MSL struct def must exist before the
+                    # param binding and wp_address spell the mangled name.
+                    # DEFERRED, not emitted here: a transitive @wp.func may
+                    # carry the same struct as a value param and emit the
+                    # def itself (Newton Gaussian.Data in compute_shape_
+                    # local_bounds — the func-path emission registers
+                    # struct_array_fields, which the kernel body's element
+                    # reference resolution depends on; an early emission
+                    # would poison that via the unit.structs dedup). The
+                    # pending types are emitted after the body if nobody
+                    # claimed them (see the tail of translate_kernel).
+                    pending_elem_structs.append((elem, var.type.dtype))
 
     # ---- transitive user functions, callees first ----
     user_funcs: dict[str, MSLFunction] = {}
@@ -5831,6 +5872,17 @@ def translate_kernel(kernel, options=None) -> KernelUnit:
         # preamble must define it (kernel_src checks this exact flag)
         unit.callee_needs_live = True
     unit.kernel.lines = bindings + tr.hoisted + body
+
+    # struct-typed array element defs nobody claimed: a transitive @wp.func
+    # carrying the same struct as a value param has emitted the def itself
+    # (with split_arrays context — Gaussian.Data / compute_shape_local_
+    # bounds); only still-missing types emit here (viewer GL RenderVertex /
+    # LineVertex, which no function ever names). value_arrays=True: array
+    # fields ride inline as wp_val_array pairs, the only legal value-form.
+    for elem, dtype in pending_elem_structs:
+        if elem in unit.structs or elem in unit.struct_array_fields:
+            continue
+        _emit_struct_def(dtype, unit, _codegen, value_arrays=True)
     return unit
 
 
