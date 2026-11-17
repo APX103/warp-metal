@@ -106,6 +106,7 @@ import importlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -115,10 +116,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # for paths.py
 import paths  # noqa: E402
 
-DEFAULT_OUT = (
-    str(paths.newton_repo() / "keps/")
-    + "0001-standalone-warp-metal-library-with-msl-backend-for-newton-on-apple-silicon/phase2-bench.md"
-)
+DEFAULT_OUT = paths.newton_repo() / "keps" / "0001-standalone-warp-metal-library-with-msl-backend-for-newton-on-apple-silicon" / "phase2-bench.md"
 
 WARP_METAL_REPO = str(Path(__file__).resolve().parent.parent)
 
@@ -246,6 +244,8 @@ SCENES: dict[str, SceneSpec] = {
 
 RESULT_PREFIX = "phase2-bench"
 
+_RE_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+
 
 # --------------------------------------------------------------------------------------
 # Environment header (fail loud; nothing is invented)
@@ -253,19 +253,55 @@ RESULT_PREFIX = "phase2-bench"
 
 
 def _git_sha(repo_hint: Path) -> str:
-    """Return the HEAD sha of the git repo containing *repo_hint*."""
+    """Return the HEAD sha of the git repo containing *repo_hint*.
+
+    Falls back to reading ``.git/HEAD`` + the pointed ref directly when the
+    git binary itself cannot run (macOS removable-volume TCC has been
+    observed denying /usr/bin/git while ordinary file reads succeed —
+    2026-11-17 session). The fallback reads the same commit the git binary
+    would report; no invented values.
+    """
     probe = subprocess.run(
         ["git", "-C", str(repo_hint), "rev-parse", "HEAD"],
         capture_output=True,
         text=True,
         check=False,
     )
-    if probe.returncode != 0 or not probe.stdout.strip():
-        raise RuntimeError(
-            f"Cannot determine git HEAD for {repo_hint}: {probe.stderr.strip() or 'empty output'}. "
-            "The report header must record real commit shas."
-        )
-    return probe.stdout.strip()
+    if probe.returncode == 0 and probe.stdout.strip():
+        return probe.stdout.strip()
+
+    # file-read fallback: walk up to the repo root, then .git/HEAD -> ref
+    # name -> loose ref or packed-refs (git rev-parse walks up the same way)
+    git_dir = None
+    probe_dir = repo_hint
+    for _ in range(8):  # bounded: bench layouts never nest deeper
+        candidate = probe_dir / ".git"
+        if candidate.is_dir():
+            git_dir = candidate
+            break
+        if probe_dir.parent == probe_dir:
+            break
+        probe_dir = probe_dir.parent
+    if git_dir is not None:
+        head = (git_dir / "HEAD").read_text().strip()
+        if head.startswith("ref: "):
+            ref = head[len("ref: "):]
+            loose = git_dir / ref
+            if loose.is_file():
+                sha = loose.read_text().strip()
+                if sha:
+                    return sha
+            packed = (git_dir / "packed-refs").read_text().splitlines()
+            for line in packed:
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == ref:
+                    return parts[0]
+        elif _RE_FULL_SHA.fullmatch(head):
+            return head  # detached HEAD
+    raise RuntimeError(
+        f"Cannot determine git HEAD for {repo_hint}: {probe.stderr.strip() or 'empty output'}. "
+        "The report header must record real commit shas."
+    )
 
 
 def _assert_backend(device: str, wp) -> None:
