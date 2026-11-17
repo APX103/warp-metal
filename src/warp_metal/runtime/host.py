@@ -284,6 +284,9 @@ class _CallableArray(np.ndarray):
     def __call__(self):
         return self
 
+    def numpy(self):
+        return self
+
 
 class WarpArray:
     """MTLBuffer-backed array with a zero-copy numpy view.
@@ -963,9 +966,14 @@ class WarpArray:
                 raise IndexError(f"invalid array slice [{start}:{stop}] for shape {self.shape}")
             return self._slice_view(start, stop - start)
         if isinstance(key, tuple):
-            if any(isinstance(k, slice) for k in key):
+            # upstream __getitem__ (warp/_src/types.py:4278): int keys drop
+            # their dimension and missing trailing keys pad with full slices
+            # (len(key) < ndim → view, Newton's [0, 0] on 3-D attribute
+            # arrays); slices select ranges. Only all-int len==ndim keys are
+            # element reads — upstream forbids those on wp.array, the shim
+            # keeps the historical numpy element read (host convenience).
+            if any(isinstance(k, slice) for k in key) or len(key) < len(self.shape):
                 return self._tuple_slice_view(key)
-            # all-int key: multi-dim element read (host copy via the numpy view)
             return self.numpy_view()[key]
         if isinstance(key, (int, np.integer)):
             if len(self.shape) == 0:
@@ -2227,6 +2235,17 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None, tiled: bool =
     dims = tuple(int(d) for d in dims)
     if any(d < 0 for d in dims):
         raise ValueError("Launch dimensions must be non-negative")
+    # upstream plain-launch-with-block_dim semantics (context.py launch: CPU
+    # invoke_cpu_blocks / CUDA blockDim.x): the trailing launch dim is the
+    # block axis — mujoco_warp's sparse JTDAJ launches
+    # dim=(nworld, groups, threads_per_group) with block_dim ==
+    # threads_per_group. Keep the dims UNCHANGED (the tid helpers read the
+    # trailing coordinate as the tile lane off _dims, so the mapping equals
+    # upstream's exactly) and only switch the lowering/dispatch to the
+    # blocked launch_tiled form keyed by block_dim.
+    blocked = (
+        not tiled and block_dim is not None and block_dim > 1 and bool(dims) and dims[-1] == block_dim
+    )
     if tiled:
         dims = dims + (block_dim,)
     threads = 1
@@ -2235,12 +2254,13 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None, tiled: bool =
     if threads == 0:
         # upstream launch() skips entirely when total_dim_size == 0
         return
-    # translation key: plain launches lower every tile per-thread scalar
-    # (one-lane blocks — the CPU-golden semantics upstream forces on the
-    # CPU path), so their MSL does not depend on the requested block_dim at
-    # all; only launch_tiled bakes the per-block shared lowering keyed by
-    # block_dim
-    pso, unit = _unit_for(kernel, block_dim if tiled else None)
+    # translation key: plain launches without a block_dim kwarg lower every
+    # tile per-thread scalar (one-lane blocks — the CPU-golden semantics
+    # upstream forces on the CPU path), so their MSL does not depend on the
+    # requested block_dim at all; launch_tiled AND the blocked plain launch
+    # (trailing dim == block_dim, above) bake the per-block shared lowering
+    # keyed by block_dim
+    pso, unit = _unit_for(kernel, block_dim if (tiled or blocked) else None)
     Params = _params_struct(unit)
 
     handles: list[int] = []
@@ -2354,7 +2374,7 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None, tiled: bool =
             if arena_handle is not None:
                 owned.append(arena_handle)
             _CAPTURE_RECORDS.append(
-                ("metal", pso, list(handles), threads, block_dim, owned, array_refs, tiled)
+                ("metal", pso, list(handles), threads, block_dim, owned, array_refs, tiled or blocked)
             )
             return
         import os as _os
@@ -2366,7 +2386,7 @@ def _launch_ssa(kernel, dim, merged, block_dim: int | None = None, tiled: bool =
                 f"mesh={getattr(unit, 'needs_mesh', False)}",
                 flush=True,
             )
-        if tiled:
+        if tiled or blocked:
             _mm.dispatch_tiled(pso, handles, threads, block_dim)
         else:
             # tg 0 = native auto threadgroup size. Plain launches never bake

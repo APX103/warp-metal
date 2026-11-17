@@ -620,25 +620,42 @@ class TestTileModelPins(unittest.TestCase):
         self.assertNotIn("threadgroup_barrier", _src_without_tile_sync_define(src))
 
     def test_plain_block_dim_also_scalar(self):
-        # round-5 single rule: ANY plain launch (block_dim supplied or not)
-        # lowers tiles per-thread scalar — only launch_tiled gets the
-        # threadgroup-backed per-block model. Upstream's CPU path forces
-        # block_dim=1 on plain launches (_resolve_launch_block_dim), so the
-        # goldens are per-work-item degenerate and a baked block layout
-        # could never match them. The host enforces this by dropping
-        # block_dim for plain launches before translation (only launch_tiled
-        # reaches the translator with one) — pinned here at the routing
-        # site, since invoking _unit_for directly would compile a Metal
-        # library.
+        # plain launches WITHOUT a block_dim kwarg lower tiles per-thread
+        # scalar — only launch_tiled (and the blocked plain launch, below)
+        # get the threadgroup-backed per-block model. Upstream's CPU path
+        # forces block_dim=1 on block_dim-less plain launches
+        # (_resolve_launch_block_dim), so the goldens are per-work-item
+        # degenerate and a baked block layout could never match them. The
+        # host enforces this by dropping block_dim for those launches before
+        # translation — pinned here at the routing site, since invoking
+        # _unit_for directly would compile a Metal library.
         import inspect
 
         from warp_metal.runtime import host as _host
 
         launch_src = inspect.getsource(_host._launch_ssa)
-        self.assertIn("_unit_for(kernel, block_dim if tiled else None)", launch_src)
+        self.assertIn("_unit_for(kernel, block_dim if (tiled or blocked) else None)", launch_src)
         # and the plain dispatch hands the native auto threadgroup size,
         # since plain MSL carries no block layout at all
         self.assertIn("_mm.dispatch(pso, handles, threads, 0)", launch_src)
+
+    def test_plain_launch_block_dim_blocked_route(self):
+        # plain wp.launch WITH an explicit block_dim == trailing launch dim
+        # (upstream context.py launch: CPU invoke_cpu_blocks / CUDA
+        # blockDim.x — mujoco_warp's sparse JTDAJ spells
+        # dim=(nworld, groups, threads_per_group) with block_dim ==
+        # threads_per_group) routes to the blocked launch_tiled-style
+        # lowering: the dims pass through UNCHANGED (the tid helpers read
+        # the trailing coordinate as the tile lane) and the dispatch uses
+        # the baked block layout. Pinned at the routing site.
+        import inspect
+
+        from warp_metal.runtime import host as _host
+
+        launch_src = inspect.getsource(_host._launch_ssa)
+        self.assertIn("dims[-1] == block_dim", launch_src)
+        self.assertIn("_mm.dispatch_tiled(pso, handles, threads, block_dim)", launch_src)
+        self.assertIn("tiled or blocked", launch_src)
 
     def test_plain_cooperative_ops_degenerate(self):
         # cooperative ops on a plain launch collapse to per-thread identity:
